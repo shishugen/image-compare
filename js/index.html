@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>图片对比</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <div id="app">
+      <!-- 工具栏 -->
+      <header class="toolbar">
+        <div class="tb-group">
+          <button id="btn-open-a" class="btn" title="载入图片到 A 窗">打开 A</button>
+          <button id="btn-open-b" class="btn" title="载入图片到 B 窗">打开 B</button>
+          <button id="btn-open-c" class="btn only-grid" title="载入图片到 C 窗">打开 C</button>
+          <button id="btn-open-d" class="btn only-grid" title="载入图片到 D 窗">打开 D</button>
+          <button id="btn-open-pair" class="btn btn-primary" title="一次选择多张图（⌘O）">打开对比</button>
+        </div>
+
+        <div class="tb-sep"></div>
+
+        <div class="tb-group layout-group">
+          <button id="btn-layout-2" class="btn btn-toggle is-active" title="两图并排（快捷键 2）">2 图</button>
+          <button id="btn-layout-4" class="btn btn-toggle" title="四图 2×2 网格（快捷键 4）">4 图</button>
+        </div>
+
+        <div class="tb-sep"></div>
+
+        <div class="tb-group">
+          <button id="btn-fit" class="btn" title="两图同时适应窗口（0 / F）">适应窗口</button>
+          <button id="btn-actual" class="btn" title="恢复原始像素（1）">1:1</button>
+        </div>
+
+        <div class="tb-sep"></div>
+
+        <div class="tb-group zoom-group">
+          <button id="btn-zoom-out" class="btn btn-icon" title="缩小（-）">−</button>
+          <input id="zoom-slider" class="slider" type="range" min="25" max="800" step="1" value="100" />
+          <span id="zoom-label" class="zoom-label">100%</span>
+          <button id="btn-zoom-in" class="btn btn-icon" title="放大（+）">+</button>
+        </div>
+
+        <div class="tb-sep"></div>
+
+        <div class="tb-group">
+          <label class="switch" title="开启后所有可见窗的缩放平移保持一致">
+            <input id="chk-sync" type="checkbox" checked />
+            <span class="switch-track"><span class="switch-thumb"></span></span>
+            <span class="switch-text">同步</span>
+          </label>
+
+          <select id="sel-wheel" class="select" title="滚轮 / 触控板双指滚动的行为">
+            <option value="zoom">滚轮缩放</option>
+            <option value="pan">滚轮平移</option>
+          </select>
+        </div>
+
+        <div class="tb-spacer"></div>
+
+        <div class="tb-group">
+          <button id="btn-clear" class="btn btn-ghost" title="清空所有图窗">清空</button>
+        </div>
+      </header>
+
+      <!-- 对比主区 -->
+      <main class="stage">
+        <section class="pane" id="pane-a" data-pane="a">
+          <div class="viewport">
+            <div class="layer"><img class="canvas" alt="" draggable="false" /></div>
+            <div class="empty">
+              <div class="empty-icon">A</div>
+              <p>单击选择图片，或拖拽图片到此窗口</p>
+            </div>
+          </div>
+          <div class="pane-tag">
+            <span class="tag-dot"></span>
+            <span class="tag-name">A</span>
+            <button class="tag-close" data-close="a" title="关闭图片">×</button>
+          </div>
+        </section>
+
+        <div class="splitter" id="splitter" title="拖动调整两窗宽度"><span></span></div>
+
+        <section class="pane" id="pane-b" data-pane="b">
+          <div class="viewport">
+            <div class="layer"><img class="canvas" alt="" draggable="false" /></div>
+            <div class="empty">
+              <div class="empty-icon">B</div>
+              <p>单击选择图片，或拖拽图片到此窗口</p>
+            </div>
+          </div>
+          <div class="pane-tag">
+            <span class="tag-dot"></span>
+            <span class="tag-name">B</span>
+            <button class="tag-close" data-close="b" title="关闭图片">×</button>
+          </div>
+        </section>
+
+        <section class="pane only-grid" id="pane-c" data-pane="c">
+          <div class="viewport">
+            <div class="layer"><img class="canvas" alt="" draggable="false" /></div>
+            <div class="empty">
+              <div class="empty-icon">C</div>
+              <p>单击选择图片，或拖拽图片到此窗口</p>
+            </div>
+          </div>
+          <div class="pane-tag">
+            <span class="tag-dot"></span>
+            <span class="tag-name">C</span>
+            <button class="tag-close" data-close="c" title="关闭图片">×</button>
+          </div>
+        </section>
+
+        <section class="pane only-grid" id="pane-d" data-pane="d">
+          <div class="viewport">
+            <div class="layer"><img class="canvas" alt="" draggable="false" /></div>
+            <div class="empty">
+              <div class="empty-icon">D</div>
+              <p>单击选择图片，或拖拽图片到此窗口</p>
+            </div>
+          </div>
+          <div class="pane-tag">
+            <span class="tag-dot"></span>
+            <span class="tag-name">D</span>
+            <button class="tag-close" data-close="d" title="关闭图片">×</button>
+          </div>
+        </section>
+      </main>
+
+      <!-- 状态栏 -->
+      <footer class="statusbar">
+        <span id="st-zoom" class="st-item">100%</span>
+        <span id="st-pos" class="st-item">—</span>
+        <span class="st-spacer"></span>
+        <span id="st-info-a" class="st-item st-file">A: 未载入</span>
+        <span id="st-info-b" class="st-item st-file">B: 未载入</span>
+        <span id="st-info-c" class="st-item st-file only-grid">C: 未载入</span>
+        <span id="st-info-d" class="st-item st-file only-grid">D: 未载入</span>
+      </footer>
+    </div>
+
+    <input id="file-picker" type="file" accept="image/*" multiple hidden />
+
+    <!-- module 作用域：顶层声明不再落到 window，避免与 Tauri 注入的全局（isTauri 等）撞名 -->
+    <script type="module" src="main.js"></script>
+  </body>
+</html>
