@@ -27,7 +27,7 @@ body {
 
 #app {
   display: flex;
-  flex-direction: column;
+  flex-direction: row; /* 左侧导航 + 右边（视图区 + 状态栏） */
   height: 100vh;
 }
 
@@ -469,4 +469,581 @@ body.grid-mode .pane {
 /* 四行文件信息平铺，不然会超出状态栏宽度 */
 body.grid-mode .st-file {
   max-width: 21%;
+}
+
+/* ==========================================================================
+ * 多视图外壳：左侧导航 + 视图容器 + 共用状态栏
+ *
+ * 显隐只由 body[data-view] 决定，与上面 .grid-mode 那套互不干扰；
+ * 视图隐藏时内部尺寸全为 0，所以 view-compare.js 的 fit() 必须跳过隐藏态。
+ * ========================================================================== */
+
+.nav {
+  flex: 0 0 48px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 8px 0;
+  background: var(--bg-panel);
+  border-right: 1px solid var(--border);
+}
+
+.nav-btn {
+  width: 40px;
+  height: 40px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.nav-btn:hover {
+  background: #2b2f38;
+  color: var(--text);
+}
+
+.nav-btn.is-active {
+  background: #2f3846;
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.nav-ico {
+  font-size: 15px;
+  line-height: 1;
+}
+
+.nav-txt {
+  font-size: 10px;
+}
+
+.workspace {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.views {
+  flex: 1 1 auto;
+  display: flex;
+  min-height: 0;
+}
+
+.view {
+  flex: 1 1 auto;
+  display: none;
+  flex-direction: column;
+  min-width: 0;
+}
+
+body[data-view="compare"] .view-compare,
+body[data-view="transfer"] .view-transfer,
+body[data-view="fav"] .view-fav {
+  display: flex;
+}
+
+/* 状态栏按视图切换内容：#st-msg 三个视图共用 */
+.st-only {
+  display: none;
+  align-items: center;
+  gap: 16px;
+  min-width: 0;
+}
+
+body[data-view="compare"] .st-only {
+  display: flex;
+}
+
+.st-msg {
+  max-width: 52%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.st-msg.is-error {
+  color: #e88d8d;
+}
+
+/* 通用件：输入框、链接式按钮、状态点、抽屉 */
+[hidden] {
+  display: none !important;
+}
+
+.input {
+  min-width: 0;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: #1b1e24;
+  color: var(--text);
+  font: inherit;
+}
+
+.input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+textarea.input {
+  resize: vertical;
+  min-height: 32px;
+  line-height: 1.5;
+}
+
+.link-btn {
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--accent);
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.link-btn:hover {
+  text-decoration: underline;
+}
+
+.danger {
+  color: #e88d8d;
+}
+
+.dim {
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.dot {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #5a616e;
+}
+
+.dot-on {
+  background: #3ecf8e;
+  box-shadow: 0 0 6px rgba(62, 207, 142, 0.5);
+}
+
+.dot-off {
+  background: #e05b5b;
+}
+
+.dot-warn {
+  background: #e6b450;
+}
+
+.panel-body {
+  position: relative;
+  flex: 1 1 auto;
+  display: flex;
+  min-height: 0;
+}
+
+.drawer {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 320px;
+  display: none;
+  flex-direction: column;
+  background: var(--bg-panel);
+  border-left: 1px solid var(--border);
+  box-shadow: -8px 0 24px rgba(0, 0, 0, 0.35);
+  z-index: 5;
+}
+
+.drawer.is-open {
+  display: flex;
+}
+
+.drawer-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.drawer-body {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow: auto;
+  padding: 12px;
+}
+
+.drawer-acts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.field > span {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.field-grow {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.hint {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--text-dim);
+}
+
+/* 全局 user-select:none 是为了拖拽平移时不选中一堆文字，
+   但传输/收藏视图的正文必须能选中，否则复制无从下手 */
+.input,
+textarea,
+.msg-text,
+.file-name,
+.tree-name,
+.fav-row,
+.drawer-body {
+  user-select: text;
+}
+
+/* ==========================================================================
+ * 视图二：局域网传输
+ * ========================================================================== */
+
+.peer-box {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  max-width: 52vw;
+  color: var(--text);
+}
+
+.peer-box b {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.peer-sub {
+  font-size: 12px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.stream {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow: auto;
+  padding: 14px 16px;
+}
+
+.stream-empty,
+.list-empty {
+  margin: auto;
+  padding: 24px;
+  color: var(--text-dim);
+  text-align: center;
+}
+
+.compose {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  padding: 10px 16px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-panel);
+}
+
+.compose-input {
+  flex: 1 1 auto;
+  max-height: 160px;
+}
+
+.msg {
+  display: flex;
+  flex-direction: column;
+  max-width: min(72%, 720px);
+}
+
+.msg-in {
+  align-self: flex-start;
+}
+
+.msg-out {
+  align-self: flex-end;
+  align-items: flex-end;
+}
+
+.msg-meta {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.msg.is-sending .msg-meta {
+  color: var(--accent);
+}
+
+.bubble {
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #262a33;
+}
+
+.msg-out .bubble {
+  background: #2b3a55;
+  border-color: #38507a;
+}
+
+.msg.is-failed .bubble {
+  border-color: #a34b4b;
+}
+
+.msg-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.file-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.file-ico {
+  color: var(--text-dim);
+}
+
+.file-name {
+  max-width: 360px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+
+.file-size {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.bar {
+  height: 4px;
+  margin: 8px 0 2px;
+  border-radius: 2px;
+  overflow: hidden;
+  background: #3a3f4a;
+}
+
+.bar i {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.2s;
+}
+
+.msg-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 6px;
+}
+
+.cand-box {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.cand {
+  padding: 3px 9px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: #2b2f38;
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.cand:hover {
+  border-color: var(--accent);
+}
+
+/* ==========================================================================
+ * 视图三：文字收藏（左三级树 + 右列表）
+ * ========================================================================== */
+
+.fav-search {
+  width: 260px;
+}
+
+.tree {
+  flex: 0 0 232px;
+  overflow: auto;
+  padding: 8px 6px;
+  border-right: 1px solid var(--border);
+  background: var(--bg-panel);
+}
+
+.tree-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 6px 3px calc(6px + var(--depth, 0) * 12px);
+  border-radius: var(--radius);
+  cursor: pointer;
+}
+
+.tree-row:hover {
+  background: #2b2f38;
+}
+
+.tree-row.is-sel {
+  background: #2f3846;
+}
+
+.tree-twist {
+  width: 12px;
+  font-size: 10px;
+  color: var(--text-dim);
+  text-align: center;
+}
+
+.tree-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tree-num {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.tree-add {
+  padding: 0 2px;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 11px;
+  cursor: pointer;
+  opacity: 0;
+}
+
+.tree-row:hover .tree-add,
+.tree-row.is-sel .tree-add {
+  opacity: 1;
+}
+
+.tree-add:hover {
+  color: var(--accent);
+}
+
+.fav-list {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow: auto;
+  padding: 10px 12px;
+}
+
+.fav-row {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-panel);
+  cursor: pointer;
+}
+
+.fav-row:hover {
+  border-color: #414855;
+}
+
+.fav-row-main {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.fav-row-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+
+.fav-row-sum {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.fav-row-side {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+}
+
+.fav-row-time {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.fav-row-acts {
+  display: flex;
+  gap: 8px;
+  opacity: 0;
+}
+
+.fav-row:hover .fav-row-acts {
+  opacity: 1;
+}
+
+.fav-body-input {
+  flex: 1 1 auto;
+  min-height: 120px;
 }

@@ -1,0 +1,371 @@
+//! 局域网发送端与在线心跳。
+//!
+//! /ping 返回 200 即代表对端与本机口令一致（口令不同会被对端拒成 403），
+//! 因此发现线程看到一个能通过 /ping 的设备就直接自动绑定，无需手动配对。
+
+use super::Hub;
+use crate::http;
+use crate::store::{self, Message, Peer};
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::Duration;
+
+const HEARTBEAT_MS: u64 = 1000;
+const OFFLINE_THRESHOLD: u32 = 3;
+
+#[derive(serde::Deserialize)]
+struct PingResp {
+    ok: bool,
+    device_id: String,
+    name: String,
+    #[serde(default)]
+    app: String,
+}
+
+pub fn signed_headers(hub: &Hub, digest: &str) -> Vec<(String, String)> {
+    let d = hub.device_snapshot();
+    let ts = store::now_ms();
+    vec![
+        ("X-Device".into(), d.id.clone()),
+        ("X-Ts".into(), ts.to_string()),
+        ("X-Sig".into(), store::sign(&d.passphrase, &d.id, ts, digest)),
+    ]
+}
+
+/// 探测一台设备。Ok(Peer) 表示口令一致且在线。
+pub fn ping(hub: &Hub, host: &str, port: u16) -> Result<Peer, String> {
+    let d = hub.device_snapshot();
+    if d.passphrase.is_empty() {
+        return Err("本机还没设置配对口令，无法与对端互认".into());
+    }
+    let headers = signed_headers(hub, &store::sha256_hex(b""));
+    let resp = http::request_small(host, port, "GET", "/ping", &headers, b"", Duration::from_secs(3))?;
+    if resp.status == 403 {
+        return Err("对端拒绝：配对口令与本机不一致".into());
+    }
+    if !resp.ok() {
+        return Err(format!("对端返回异常状态 {}", resp.status));
+    }
+    let parsed: PingResp =
+        serde_json::from_slice(&resp.body).map_err(|e| format!("对端 /ping 响应无法解析: {e}"))?;
+    if !parsed.ok {
+        return Err("对端 /ping 明确返回失败".into());
+    }
+    if parsed.app != super::server::APP_TAG {
+        return Err(format!("对端不是本应用（app={}）", parsed.app));
+    }
+    if parsed.device_id == d.id {
+        return Err("探测到的是本机自己，已忽略".into());
+    }
+    Ok(Peer {
+        id: parsed.device_id,
+        name: parsed.name,
+        host: host.to_string(),
+        port,
+        online: true,
+        last_seen: store::now_ms(),
+    })
+}
+
+/// 口令不一致／不是本应用／是自己，这类结果不会因为重试而改变
+fn is_hard_mismatch(err: &str) -> bool {
+    err.contains("口令") || err.contains("不是本应用") || err.contains("本机自己")
+}
+
+/// 心跳线程：维持在线状态，并在还没有对端时尝试绑定第一个可用设备。
+pub fn spawn_heartbeat(hub: Arc<Hub>) {
+    std::thread::spawn(move || {
+        let mut fails = 0u32;
+        // 候选设备的连续失败次数：超时不能当成“不是我的对端”，否则网络抖一下就丢设备
+        let mut miss: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        loop {
+            if hub.stop.load(Ordering::Relaxed) {
+                break;
+            }
+            if hub.device_snapshot().passphrase.is_empty() {
+                // 本机还没口令，任何 ping 都只会拿到「无法互认」，不该因此踢掉发现的设备
+                std::thread::sleep(Duration::from_millis(HEARTBEAT_MS));
+                continue;
+            }
+            // 还没有绑定：从已发现列表里挑一台能 ping 通的自动绑定
+            if hub.peer_snapshot().is_none() {
+                let candidates: Vec<_> = hub.discovered_snapshot();
+                for c in candidates {
+                    match ping(&hub, &c.host, c.port) {
+                        Ok(peer) => {
+                            hub.bind_peer(peer.clone());
+                            eprintln!("[net] 已自动绑定对端 {} ({}:{})", peer.name, peer.host, peer.port);
+                            fails = 0;
+                            break;
+                        }
+                        Err(e) => {
+                            let hard = is_hard_mismatch(&e);
+                            let n = miss.entry(c.id.clone()).or_insert(0);
+                            *n += 1;
+                            // 只在第一次与确定不匹配时记日志，否则每秒一条会刷满控制台
+                            if hard || *n == 1 {
+                                eprintln!("[net] 绑定 {}:{} 失败: {e}", c.host, c.port);
+                            }
+                            if hard || *n >= OFFLINE_THRESHOLD {
+                                miss.remove(&c.id);
+                                hub.remove_discovered(&c.id);
+                            }
+                        }
+                    }
+                }
+            } else if let Some(peer) = hub.peer_snapshot() {
+                match ping(&hub, &peer.host, peer.port) {
+                    Ok(fresh) => {
+                        if !peer.online {
+                            hub.set_peer_online(true);
+                        } else {
+                            hub.touch_peer(fresh.last_seen, &fresh.host, fresh.port);
+                        }
+                        fails = 0;
+                    }
+                    Err(e) => {
+                        fails += 1;
+                        if fails >= OFFLINE_THRESHOLD && peer.online {
+                            hub.set_peer_online(false);
+                            eprintln!("[net] 对端连续 {fails} 次探测失败，判为离线: {e}");
+                        }
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(HEARTBEAT_MS));
+        }
+    });
+}
+
+pub fn send_text(hub: &Arc<Hub>, peer: &Peer, text: String) -> Result<Message, String> {
+    let msg = Message {
+        id: uuid::Uuid::new_v4().simple().to_string(),
+        dir: "out".into(),
+        kind: "text".into(),
+        text: Some(text.clone()),
+        name: None,
+        size: None,
+        path: None,
+        state: "sending".into(),
+        ts: store::now_ms(),
+        peer: peer.id.clone(),
+    };
+    hub.store.append_message(&msg)?;
+    hub.emit("msg-updated", serde_json::json!({ "message": msg }));
+
+    let body = serde_json::json!({ "msg_id": msg.id, "ts": msg.ts, "text": text })
+        .to_string()
+        .into_bytes();
+    let headers = {
+        let mut h = signed_headers(hub, &store::sha256_hex(&body));
+        h.push(("Content-Type".into(), "application/json".into()));
+        h
+    };
+    let resp = http::request_small(
+        &peer.host,
+        peer.port,
+        "POST",
+        "/msg",
+        &headers,
+        &body,
+        Duration::from_secs(10),
+    );
+    match resp {
+        Ok(r) if r.ok() => {
+            let done = Message {
+                state: "sent".into(),
+                ..msg.clone()
+            };
+            hub.store.append_message(&done)?;
+            hub.emit("msg-updated", serde_json::json!({ "message": done }));
+            Ok(done)
+        }
+        Ok(r) => Err(finalize_failed(hub, &msg, format!("对端返回 {}", r.status))),
+        Err(e) => Err(finalize_failed(hub, &msg, e)),
+    }
+}
+
+/// 失败也要留下记录：messages.jsonl 是追加式，同 ID 以最后一条为准
+fn finalize_failed(hub: &Arc<Hub>, msg: &Message, err: String) -> String {
+    let failed = Message {
+        state: "failed".into(),
+        ..msg.clone()
+    };
+    let _ = hub.store.append_message(&failed);
+    hub.emit("msg-updated", serde_json::json!({ "message": failed }));
+    err
+}
+
+/// 发送一批路径（文件或文件夹）。文件夹会递归成多个 PUT，共用一个气泡与 batch id。
+pub fn send_paths(hub: &Arc<Hub>, peer: &Peer, paths: Vec<String>) -> Result<Vec<Message>, String> {
+    let mut out = Vec::new();
+    for p in paths {
+        out.push(send_one(hub, peer, Path::new(&p))?);
+    }
+    Ok(out)
+}
+
+fn send_one(hub: &Arc<Hub>, peer: &Peer, path: &Path) -> Result<Message, String> {
+    let meta = fs::symlink_metadata(path).map_err(|e| format!("读不到 {} : {e}", path.display()))?;
+    if meta.file_type().is_symlink() {
+        return Err(format!("跳过符号链接: {}", path.display()));
+    }
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .ok_or_else(|| format!("{} 没有文件名", path.display()))?;
+    let is_dir = meta.is_dir();
+    let batch = uuid::Uuid::new_v4().simple().to_string();
+
+    // 先算总量，才能给出跨文件的累计进度
+    let items: Vec<(PathBuf, String)> = if is_dir {
+        let mut v = Vec::new();
+        collect_dir(path, Path::new(&name), &mut v)?;
+        v
+    } else {
+        vec![(path.to_path_buf(), name.clone())]
+    };
+    if items.is_empty() {
+        return Err(format!("{} 里没有任何文件", path.display()));
+    }
+    let total: u64 = items
+        .iter()
+        .map(|(f, _)| fs::metadata(f).map(|m| m.len()).unwrap_or(0))
+        .sum();
+
+    let msg = Message {
+        id: batch.clone(),
+        dir: "out".into(),
+        kind: if is_dir { "folder".into() } else { "file".into() },
+        text: None,
+        name: Some(name.clone()),
+        size: Some(total),
+        path: Some(path.to_string_lossy().to_string()),
+        state: "sending".into(),
+        ts: store::now_ms(),
+        peer: peer.id.clone(),
+    };
+    hub.store.append_message(&msg)?;
+    hub.emit("msg-updated", serde_json::json!({ "message": msg }));
+
+    let mut sent_acc: u64 = 0;
+    let mut last_emit = 0i64;
+    for (idx, (file, rel)) in items.iter().enumerate() {
+        let is_last = idx + 1 == items.len();
+        let res = put_file(
+            hub,
+            peer,
+            file,
+            rel,
+            &name,
+            &batch,
+            is_last,
+            &mut |sent: u64, _one: u64| {
+                let now = store::now_ms();
+                let acc = sent_acc + sent;
+                if is_last || now - last_emit > 200 {
+                    last_emit = now;
+                    hub.emit(
+                        "xfer-progress",
+                        serde_json::json!({
+                            "msg_id": batch, "dir": "out",
+                            "sent": acc.min(total), "total": total, "name": rel
+                        }),
+                    );
+                }
+            },
+        );
+        match res {
+            Ok(n) => sent_acc += n,
+            Err(e) => {
+                return Err(finalize_failed(hub, &msg, format!("发送 {rel} 失败: {e}")));
+            }
+        }
+    }
+
+    let done = Message {
+        state: "sent".into(),
+        ..msg.clone()
+    };
+    hub.store.append_message(&done)?;
+    hub.emit("xfer-done", serde_json::json!({ "message": done }));
+    Ok(done)
+}
+
+fn put_file<F: FnMut(u64, u64)>(
+    hub: &Hub,
+    peer: &Peer,
+    file: &Path,
+    rel: &str,
+    top_name: &str,
+    batch: &str,
+    is_last: bool,
+    on_progress: F,
+) -> Result<u64, String> {
+    let size = fs::metadata(file).map_err(|e| format!("读 {} 失败: {e}", file.display()))?.len();
+    let sha = hash_file(file)?;
+    let mut f = fs::File::open(file).map_err(|e| format!("打开 {} 失败: {e}", file.display()))?;
+    let headers = {
+        let mut h = signed_headers(hub, &sha);
+        h.push(("X-Sha256".into(), sha));
+        h.push(("X-Size".into(), size.to_string()));
+        h.push(("X-Name".into(), store::hdr_encode(top_name)));
+        // 头值只能 ASCII，中文路径必须 base64（见 store::hdr_encode）
+        h.push(("X-Rel-Path".into(), store::hdr_encode(rel)));
+        h.push(("X-Batch".into(), batch.to_string()));
+        h.push(("X-Last".into(), if is_last { "1".into() } else { "0".into() }));
+        h
+    };
+    let resp = http::put_stream(&peer.host, peer.port, "/file", &headers, &mut f, size, on_progress)?;
+    if !resp.ok() {
+        return Err(format!("对端返回 {}：{}", resp.status, resp.body_str()));
+    }
+    Ok(size)
+}
+
+fn hash_file(path: &Path) -> Result<String, String> {
+    use crate::store::HashWriter;
+    let mut f = fs::File::open(path).map_err(|e| format!("打开 {} 失败: {e}", path.display()))?;
+    let mut sink = HashWriter::new(std::io::sink());
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        use std::io::Read;
+        let n = f
+            .read(&mut buf)
+            .map_err(|e| format!("读 {} 失败: {e}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        sink.write_all(&buf[..n])
+            .map_err(|e| format!("计算哈希失败: {e}"))?;
+    }
+    let (hex, _) = sink.finish();
+    Ok(hex)
+}
+
+/// 递归收集目录下的普通文件，rel 始终以目录自身名开头，保证对端还原出同名根目录。
+fn collect_dir(dir: &Path, prefix: &Path, out: &mut Vec<(PathBuf, String)>) -> Result<(), String> {
+    let entries = fs::read_dir(dir).map_err(|e| format!("读目录 {} 失败: {e}", dir.display()))?;
+    for e in entries {
+        let e = e.map_err(|e| format!("遍历 {} 失败: {e}", dir.display()))?;
+        let p = e.path();
+        let ft = e
+            .file_type()
+            .map_err(|er| format!("取 {} 类型失败: {er}", p.display()))?;
+        if ft.is_symlink() {
+            eprintln!("[net] 跳过符号链接 {}", p.display());
+            continue;
+        }
+        let name = e.file_name().to_string_lossy().to_string();
+        let next = prefix.join(&name);
+        if ft.is_dir() {
+            collect_dir(&p, &next, out)?;
+        } else if ft.is_file() {
+            out.push((p, next.to_string_lossy().replace('\\', "/")));
+        }
+    }
+    Ok(())
+}

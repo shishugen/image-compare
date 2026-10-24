@@ -6,138 +6,291 @@
     <title>图片对比</title>
     <link rel="stylesheet" href="style.css" />
   </head>
-  <body>
+  <!-- data-view 决定哪个视图可见，也决定拖进来的文件归谁处理（见 js/api.js） -->
+  <body data-view="compare">
     <div id="app">
-      <!-- 工具栏 -->
-      <header class="toolbar">
-        <div class="tb-group">
-          <button id="btn-open-a" class="btn" title="载入图片到 A 窗">打开 A</button>
-          <button id="btn-open-b" class="btn" title="载入图片到 B 窗">打开 B</button>
-          <button id="btn-open-c" class="btn only-grid" title="载入图片到 C 窗">打开 C</button>
-          <button id="btn-open-d" class="btn only-grid" title="载入图片到 D 窗">打开 D</button>
-          <button id="btn-open-pair" class="btn btn-primary" title="一次选择多张图（⌘O）">打开对比</button>
-        </div>
+      <!-- 左侧竖排导航：三个视图共用一条状态栏 -->
+      <nav class="nav">
+        <button class="nav-btn is-active" data-goto="compare" title="图片对比（⌘1）">
+          <span class="nav-ico">▣</span><span class="nav-txt">对比</span>
+        </button>
+        <button class="nav-btn" data-goto="transfer" title="局域网传输（⌘2）">
+          <span class="nav-ico">⇄</span><span class="nav-txt">传输</span>
+        </button>
+        <button class="nav-btn" data-goto="fav" title="文字收藏（⌘3）">
+          <span class="nav-ico">☆</span><span class="nav-txt">收藏</span>
+        </button>
+      </nav>
 
-        <div class="tb-sep"></div>
+      <div class="workspace">
+        <div class="views">
+          <!-- ================= 视图一：图片对比 ================= -->
+          <section class="view view-compare" id="view-compare">
+            <header class="toolbar">
+              <div class="tb-group">
+                <button id="btn-open-a" class="btn" title="载入图片到 A 窗">打开 A</button>
+                <button id="btn-open-b" class="btn" title="载入图片到 B 窗">打开 B</button>
+                <button id="btn-open-c" class="btn only-grid" title="载入图片到 C 窗">打开 C</button>
+                <button id="btn-open-d" class="btn only-grid" title="载入图片到 D 窗">打开 D</button>
+                <button id="btn-open-pair" class="btn btn-primary" title="一次选择多张图（⌘O）">打开对比</button>
+              </div>
 
-        <div class="tb-group layout-group">
-          <button id="btn-layout-2" class="btn btn-toggle is-active" title="两图并排（快捷键 2）">2 图</button>
-          <button id="btn-layout-4" class="btn btn-toggle" title="四图 2×2 网格（快捷键 4）">4 图</button>
-        </div>
+              <div class="tb-sep"></div>
 
-        <div class="tb-sep"></div>
+              <div class="tb-group layout-group">
+                <button id="btn-layout-2" class="btn btn-toggle is-active" title="两图并排（快捷键 2）">2 图</button>
+                <button id="btn-layout-4" class="btn btn-toggle" title="四图 2×2 网格（快捷键 4）">4 图</button>
+              </div>
 
-        <div class="tb-group">
-          <button id="btn-fit" class="btn" title="两图同时适应窗口（0 / F）">适应窗口</button>
-          <button id="btn-actual" class="btn" title="恢复原始像素（1）">1:1</button>
-        </div>
+              <div class="tb-sep"></div>
 
-        <div class="tb-sep"></div>
+              <div class="tb-group">
+                <button id="btn-fit" class="btn" title="两图同时适应窗口（0 / F）">适应窗口</button>
+                <button id="btn-actual" class="btn" title="恢复原始像素（1）">1:1</button>
+              </div>
 
-        <div class="tb-group zoom-group">
-          <button id="btn-zoom-out" class="btn btn-icon" title="缩小（-）">−</button>
-          <input id="zoom-slider" class="slider" type="range" min="25" max="800" step="1" value="100" />
-          <span id="zoom-label" class="zoom-label">100%</span>
-          <button id="btn-zoom-in" class="btn btn-icon" title="放大（+）">+</button>
-        </div>
+              <div class="tb-sep"></div>
 
-        <div class="tb-sep"></div>
+              <div class="tb-group zoom-group">
+                <button id="btn-zoom-out" class="btn btn-icon" title="缩小（-）">−</button>
+                <input id="zoom-slider" class="slider" type="range" min="25" max="800" step="1" value="100" />
+                <span id="zoom-label" class="zoom-label">100%</span>
+                <button id="btn-zoom-in" class="btn btn-icon" title="放大（+）">+</button>
+              </div>
 
-        <div class="tb-group">
-          <label class="switch" title="开启后所有可见窗的缩放平移保持一致">
-            <input id="chk-sync" type="checkbox" checked />
-            <span class="switch-track"><span class="switch-thumb"></span></span>
-            <span class="switch-text">同步</span>
-          </label>
+              <div class="tb-sep"></div>
 
-          <select id="sel-wheel" class="select" title="滚轮 / 触控板双指滚动的行为">
-            <option value="zoom">滚轮缩放</option>
-            <option value="pan">滚轮平移</option>
-          </select>
-        </div>
+              <div class="tb-group">
+                <label class="switch" title="开启后所有可见窗的缩放平移保持一致">
+                  <input id="chk-sync" type="checkbox" checked />
+                  <span class="switch-track"><span class="switch-thumb"></span></span>
+                  <span class="switch-text">同步</span>
+                </label>
 
-        <div class="tb-spacer"></div>
+                <select id="sel-wheel" class="select" title="滚轮 / 触控板双指滚动的行为">
+                  <option value="zoom">滚轮缩放</option>
+                  <option value="pan">滚轮平移</option>
+                </select>
+              </div>
 
-        <div class="tb-group">
-          <button id="btn-clear" class="btn btn-ghost" title="清空所有图窗">清空</button>
-        </div>
-      </header>
+              <div class="tb-spacer"></div>
 
-      <!-- 对比主区 -->
-      <main class="stage">
-        <section class="pane" id="pane-a" data-pane="a">
-          <div class="viewport">
-            <div class="layer"><img class="canvas" alt="" draggable="false" /></div>
-            <div class="empty">
-              <div class="empty-icon">A</div>
-              <p>单击选择图片，或拖拽图片到此窗口</p>
+              <div class="tb-group">
+                <button id="btn-clear" class="btn btn-ghost" title="清空所有图窗">清空</button>
+              </div>
+            </header>
+
+            <!-- 对比主区 -->
+            <main class="stage" id="stage">
+              <section class="pane" id="pane-a" data-pane="a">
+                <div class="viewport">
+                  <div class="layer"><img class="canvas" alt="" draggable="false" /></div>
+                  <div class="empty">
+                    <div class="empty-icon">A</div>
+                    <p>单击选择图片，或拖拽图片到此窗口</p>
+                  </div>
+                </div>
+                <div class="pane-tag">
+                  <span class="tag-dot"></span>
+                  <span class="tag-name">A</span>
+                  <button class="tag-close" data-close="a" title="关闭图片">×</button>
+                </div>
+              </section>
+
+              <div class="splitter" id="splitter" title="拖动调整两窗宽度"><span></span></div>
+
+              <section class="pane" id="pane-b" data-pane="b">
+                <div class="viewport">
+                  <div class="layer"><img class="canvas" alt="" draggable="false" /></div>
+                  <div class="empty">
+                    <div class="empty-icon">B</div>
+                    <p>单击选择图片，或拖拽图片到此窗口</p>
+                  </div>
+                </div>
+                <div class="pane-tag">
+                  <span class="tag-dot"></span>
+                  <span class="tag-name">B</span>
+                  <button class="tag-close" data-close="b" title="关闭图片">×</button>
+                </div>
+              </section>
+
+              <section class="pane only-grid" id="pane-c" data-pane="c">
+                <div class="viewport">
+                  <div class="layer"><img class="canvas" alt="" draggable="false" /></div>
+                  <div class="empty">
+                    <div class="empty-icon">C</div>
+                    <p>单击选择图片，或拖拽图片到此窗口</p>
+                  </div>
+                </div>
+                <div class="pane-tag">
+                  <span class="tag-dot"></span>
+                  <span class="tag-name">C</span>
+                  <button class="tag-close" data-close="c" title="关闭图片">×</button>
+                </div>
+              </section>
+
+              <section class="pane only-grid" id="pane-d" data-pane="d">
+                <div class="viewport">
+                  <div class="layer"><img class="canvas" alt="" draggable="false" /></div>
+                  <div class="empty">
+                    <div class="empty-icon">D</div>
+                    <p>单击选择图片，或拖拽图片到此窗口</p>
+                  </div>
+                </div>
+                <div class="pane-tag">
+                  <span class="tag-dot"></span>
+                  <span class="tag-name">D</span>
+                  <button class="tag-close" data-close="d" title="关闭图片">×</button>
+                </div>
+              </section>
+            </main>
+          </section>
+
+          <!-- ================= 视图二：局域网传输 ================= -->
+          <section class="view view-transfer" id="view-transfer">
+            <header class="toolbar">
+              <div class="peer-box" id="xfer-peer">
+                <span class="dot dot-off"></span><b>读取连接状态中…</b>
+              </div>
+
+              <div class="tb-sep"></div>
+
+              <div class="tb-group">
+                <button id="btn-xfer-file" class="btn" disabled title="选择一个或多个文件发送">发送文件</button>
+                <button id="btn-xfer-folder" class="btn" disabled title="整个文件夹递归成逐文件发送，保留目录结构">发送文件夹</button>
+              </div>
+
+              <div class="tb-spacer"></div>
+
+              <div class="tb-group">
+                <button id="btn-xfer-settings" class="btn btn-ghost" title="配对口令 / 设备发现 / 手动 IP">配对设置</button>
+              </div>
+            </header>
+
+            <div class="panel-body">
+              <!-- 消息流：文字气泡 + 文件/文件夹气泡（名称、大小、进度、打开位置） -->
+              <div class="stream" id="xfer-stream"></div>
+
+              <div class="compose">
+                <textarea
+                  id="xfer-input"
+                  class="input compose-input"
+                  rows="1"
+                  placeholder="写点什么，Enter 发送、Shift+Enter 换行；把文件拖进窗口即发送"
+                ></textarea>
+                <button id="btn-xfer-send" class="btn btn-primary" disabled title="对端离线时不可发送">发送</button>
+              </div>
+
+              <!-- 配对设置抽屉 -->
+              <aside class="drawer" id="xfer-settings">
+                <div class="drawer-head">
+                  <b>配对设置</b>
+                  <button class="link-btn" data-close-drawer="xfer-settings">收起</button>
+                </div>
+                <div class="drawer-body">
+                  <label class="field">
+                    <span>本机设备名</span>
+                    <input id="inp-device-name" class="input" placeholder="对端看到的名字" />
+                  </label>
+                  <label class="field">
+                    <span>配对口令</span>
+                    <input id="inp-passphrase" class="input" type="password" autocomplete="off" placeholder="≥4 个字符，两台填一样" />
+                  </label>
+                  <button id="btn-pair-save" class="btn btn-primary">保存口令与设备名</button>
+                  <p class="hint">口令只存本机，用于互认与请求签名。局域网内是明文传输，别用来传敏感文件。</p>
+
+                  <div class="cand-box" id="xfer-candidates"></div>
+
+                  <label class="field">
+                    <span>对端 IP:端口</span>
+                    <input id="inp-manual-addr" class="input" placeholder="192.168.1.23 或 192.168.1.23:45790" />
+                  </label>
+                  <button id="btn-bind-addr" class="btn">手动绑定对端</button>
+                  <p class="hint">mDNS 被网络策略屏蔽时的兜底；端口留空会从 45789 起逐个试探。</p>
+
+                  <div class="drawer-acts">
+                    <button id="btn-reprobe" class="btn btn-ghost">重新探测在线</button>
+                    <button id="btn-unbind" class="btn btn-ghost danger">解绑对端</button>
+                  </div>
+                  <p class="hint">Windows 首次监听会弹防火墙提示，必须勾「允许访问（私有网络）」。</p>
+                </div>
+              </aside>
             </div>
-          </div>
-          <div class="pane-tag">
-            <span class="tag-dot"></span>
-            <span class="tag-name">A</span>
-            <button class="tag-close" data-close="a" title="关闭图片">×</button>
-          </div>
-        </section>
+          </section>
 
-        <div class="splitter" id="splitter" title="拖动调整两窗宽度"><span></span></div>
+          <!-- ================= 视图三：文字收藏 ================= -->
+          <section class="view view-fav" id="view-fav">
+            <header class="toolbar">
+              <div class="tb-group">
+                <button id="btn-fav-new-cat" class="btn" title="在选中分类下新建子分类（最多三级）">新建分类</button>
+                <button id="btn-fav-new-item" class="btn btn-primary" title="在选中分类下新建收藏">新建收藏</button>
+              </div>
 
-        <section class="pane" id="pane-b" data-pane="b">
-          <div class="viewport">
-            <div class="layer"><img class="canvas" alt="" draggable="false" /></div>
-            <div class="empty">
-              <div class="empty-icon">B</div>
-              <p>单击选择图片，或拖拽图片到此窗口</p>
+              <div class="tb-sep"></div>
+
+              <div class="tb-group">
+                <input id="inp-fav-search" class="input fav-search" placeholder="搜索标题与正文（Esc 清空）" />
+              </div>
+
+              <div class="tb-spacer"></div>
+
+              <div class="tb-group">
+                <span id="fav-count" class="dim">条目 0 · 分类 0</span>
+              </div>
+            </header>
+
+            <div class="panel-body">
+              <div class="tree" id="fav-tree"></div>
+              <div class="fav-list" id="fav-list"></div>
+
+              <!-- 详情编辑抽屉 -->
+              <aside class="drawer" id="fav-editor">
+                <div class="drawer-head">
+                  <b id="fav-editor-heading">新建收藏</b>
+                  <button class="link-btn" id="btn-fav-cancel">取消</button>
+                </div>
+                <div class="drawer-body">
+                  <label class="field">
+                    <span>标题</span>
+                    <input id="inp-fav-title" class="input" placeholder="给这条收藏起个名" />
+                  </label>
+                  <label class="field">
+                    <span>分类</span>
+                    <select id="sel-fav-parent" class="select"></select>
+                  </label>
+                  <label class="field field-grow">
+                    <span>正文</span>
+                    <textarea id="inp-fav-body" class="input fav-body-input" placeholder="一行一个内容；图片绝对路径可以直接粘贴进来"></textarea>
+                  </label>
+                  <div class="drawer-acts">
+                    <button id="btn-fav-save" class="btn btn-primary">保存</button>
+                    <button id="btn-fav-copy" class="btn btn-ghost">复制全文</button>
+                    <button id="btn-fav-send" class="btn btn-ghost">发送到对端</button>
+                    <button id="btn-fav-open" class="btn btn-ghost">在对比中打开</button>
+                    <button id="btn-fav-delete" class="btn btn-ghost danger">删除</button>
+                  </div>
+                </div>
+              </aside>
             </div>
-          </div>
-          <div class="pane-tag">
-            <span class="tag-dot"></span>
-            <span class="tag-name">B</span>
-            <button class="tag-close" data-close="b" title="关闭图片">×</button>
-          </div>
-        </section>
+          </section>
+        </div>
 
-        <section class="pane only-grid" id="pane-c" data-pane="c">
-          <div class="viewport">
-            <div class="layer"><img class="canvas" alt="" draggable="false" /></div>
-            <div class="empty">
-              <div class="empty-icon">C</div>
-              <p>单击选择图片，或拖拽图片到此窗口</p>
-            </div>
-          </div>
-          <div class="pane-tag">
-            <span class="tag-dot"></span>
-            <span class="tag-name">C</span>
-            <button class="tag-close" data-close="c" title="关闭图片">×</button>
-          </div>
-        </section>
-
-        <section class="pane only-grid" id="pane-d" data-pane="d">
-          <div class="viewport">
-            <div class="layer"><img class="canvas" alt="" draggable="false" /></div>
-            <div class="empty">
-              <div class="empty-icon">D</div>
-              <p>单击选择图片，或拖拽图片到此窗口</p>
-            </div>
-          </div>
-          <div class="pane-tag">
-            <span class="tag-dot"></span>
-            <span class="tag-name">D</span>
-            <button class="tag-close" data-close="d" title="关闭图片">×</button>
-          </div>
-        </section>
-      </main>
-
-      <!-- 状态栏 -->
-      <footer class="statusbar">
-        <span id="st-zoom" class="st-item">100%</span>
-        <span id="st-pos" class="st-item">—</span>
-        <span class="st-spacer"></span>
-        <span id="st-info-a" class="st-item st-file">A: 未载入</span>
-        <span id="st-info-b" class="st-item st-file">B: 未载入</span>
-        <span id="st-info-c" class="st-item st-file only-grid">C: 未载入</span>
-        <span id="st-info-d" class="st-item st-file only-grid">D: 未载入</span>
-      </footer>
+        <!-- 状态栏：三个视图共用，按当前视图切换内容 -->
+        <footer class="statusbar">
+          <span class="st-only" data-for="compare">
+            <span id="st-zoom" class="st-item">100%</span>
+            <span id="st-pos" class="st-item">—</span>
+          </span>
+          <span id="st-msg" class="st-item st-msg"></span>
+          <span class="st-spacer"></span>
+          <span class="st-only" data-for="compare">
+            <span id="st-info-a" class="st-item st-file">A: 未载入</span>
+            <span id="st-info-b" class="st-item st-file">B: 未载入</span>
+            <span id="st-info-c" class="st-item st-file only-grid">C: 未载入</span>
+            <span id="st-info-d" class="st-item st-file only-grid">D: 未载入</span>
+          </span>
+        </footer>
+      </div>
     </div>
 
     <input id="file-picker" type="file" accept="image/*" multiple hidden />

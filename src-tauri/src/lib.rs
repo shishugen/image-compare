@@ -1,8 +1,15 @@
 use base64::{engine::general_purpose::STANDARD, Engine};
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 use tauri::{Emitter, Manager};
 use tauri_plugin_dialog::DialogExt;
+
+mod favorites;
+mod http;
+mod net;
+mod pair;
+mod store;
 
 /// 图片文件选择，最多返回 4 个路径，按选择顺序依次填入图窗。
 /// 必须走 Rust：WKWebView 的 input[type=file] 递出的 File 是 0 字节（只能拿到名字/类型），
@@ -67,6 +74,16 @@ fn mime_of(ext: Option<&str>) -> &'static str {
         Some(x) if x == "svg" => "image/svg+xml",
         _ => "application/octet-stream",
     }
+}
+
+/// 写入系统剪贴板。前端已依次试过 navigator.clipboard 与 execCommand，
+/// 两者都被 WebView 拦下时退到这里（不引入 clipboard 插件，也就不新增 capability 权限）
+#[tauri::command]
+fn copy_text(text: String) -> Result<(), String> {
+    let mut board = arboard::Clipboard::new().map_err(|e| format!("打开系统剪贴板失败: {e}"))?;
+    board
+        .set_text(text)
+        .map_err(|e| format!("写入剪贴板失败: {e}"))
 }
 
 // 不加 rename_all：保持 snake_case，与前端 payload.data_url 的读法一致
@@ -145,12 +162,35 @@ pub fn run() {
                 .filter(|a| PathBuf::from(a).is_file())
                 .collect();
             push_opens(&app.handle().clone(), from_args);
+
+            // 局域网收发 + 收藏：状态放 Arc 里，后台线程与命令共享同一份
+            let store = net::prepare_store(&app.handle().clone())?;
+            let hub = net::start(&app.handle().clone(), store.clone())?;
+            app.manage(store);
+            app.manage(hub);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             pick_images,
             read_image,
-            take_pending_paths
+            take_pending_paths,
+            copy_text,
+            net::net_status,
+            net::send_text,
+            net::send_paths,
+            net::msg_history,
+            net::reveal_in_folder,
+            net::pick_folder,
+            net::pick_send_files,
+            pair::list_peers,
+            pair::set_pair_config,
+            pair::bind_peer_addr,
+            pair::unbind_peer,
+            pair::reprobe_peer,
+            favorites::fav_list,
+            favorites::fav_upsert,
+            favorites::fav_delete,
+            favorites::fav_move
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
@@ -165,6 +205,15 @@ pub fn run() {
                 .map(|p| p.to_string_lossy().to_string())
                 .collect();
             push_opens(app_handle, paths);
+        }
+        // 退出前把后台线程收下来，否则心跳会在最后一个窗口销毁后继续探测
+        if matches!(
+            event,
+            tauri::RunEvent::Exit | tauri::RunEvent::ExitRequested { .. }
+        ) {
+            if let Some(hub) = app_handle.try_state::<std::sync::Arc<net::Hub>>() {
+                hub.stop.store(true, Ordering::Relaxed);
+            }
         }
         #[cfg(not(target_os = "macos"))]
         let _ = (&app_handle, &event); // 非 macOS 无 Opened 变体，避免未使用告警
