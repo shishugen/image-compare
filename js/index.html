@@ -181,6 +181,14 @@
                 <button id="btn-xfer-send" class="btn btn-primary" disabled title="对端离线时不可发送">发送</button>
               </div>
 
+              <!-- 拖拽悬停遮罩：像微信那样，看到提示就可以松手 -->
+              <div class="drop-hint" id="xfer-drop-hint" hidden>
+                <div class="drop-hint-inner">
+                  <b id="xfer-drop-text">松开即发送</b>
+                  <span>支持一次拖多个，文件、图片、文件夹都行</span>
+                </div>
+              </div>
+
               <!-- 配对设置抽屉 -->
               <aside class="drawer" id="xfer-settings">
                 <div class="drawer-head">
@@ -294,6 +302,13 @@
     </div>
 
     <input id="file-picker" type="file" accept="image/*" multiple hidden />
+
+    <!-- 聊天缩略图点开的放大层：复用同一份 data URL，不再走一次磁盘读取 -->
+    <div class="lightbox" id="img-lightbox" hidden>
+      <button class="lb-close" id="lightbox-close" title="关闭（Esc）">×</button>
+      <img id="lightbox-img" alt="" />
+      <div class="lb-cap" id="lightbox-cap"></div>
+    </div>
 
     <!-- module 作用域：顶层声明不再落到 window，避免与 Tauri 注入的全局（isTauri 等）撞名 -->
     <script type="module" src="main.js"></script>

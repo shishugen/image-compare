@@ -18,6 +18,7 @@ import {
   registerDropHandler,
   registerOpenHandler,
   routeDrop,
+  routeDropHover,
   setStatus,
 } from "./api.js";
 
@@ -514,6 +515,8 @@ if (isTauriRuntime) {
       const p = event.payload;
       // 先按视图分流：传输/收藏视图下绝不能进图窗命中，否则拖文件会莫名变成载入对比
       if (currentView() !== "compare") {
+        // 悬停阶段也要分流出去，那边的视图要靠遮罩提示「松开即发送」
+        routeDropHover(p.type);
         if (p.type === "drop" && p.paths?.length) {
           routeDrop(p.paths);
         }

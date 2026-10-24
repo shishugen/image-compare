@@ -39,6 +39,7 @@ export function listen(event, handler) {
 export const VIEWS = ["compare", "transfer", "fav"];
 const viewListeners = [];
 const dropHandlers = {}; // 视图名 -> (paths) => void
+const hoverHandlers = {}; // 视图名 -> (phase) => void，拖拽悬停阶段 enter/over/leave/drop
 const openHandlers = {}; // 视图名 -> (paths) => void，供别的视图请求「在对比里打开」
 
 export function currentView() {
@@ -78,6 +79,22 @@ export function routeDrop(paths, paneKey) {
 
 export function registerDropHandler(viewName, fn) {
   dropHandlers[viewName] = fn;
+}
+
+/** 拖拽悬停同样按视图分流：传输/收藏视图要靠遮罩提示「松开即发送」 */
+export function routeDropHover(phase) {
+  const fn = hoverHandlers[currentView()];
+  if (!fn) return false;
+  try {
+    fn(phase);
+  } catch (err) {
+    console.error("[view] 悬停回调失败:", err);
+  }
+  return true;
+}
+
+export function registerDropHoverHandler(viewName, fn) {
+  hoverHandlers[viewName] = fn;
 }
 
 /** 跨视图「用图片对比打开这组文件」 */

@@ -263,6 +263,7 @@ fn send_one(hub: &Arc<Hub>, peer: &Peer, path: &Path) -> Result<Message, String>
             &name,
             &batch,
             is_last,
+            total,
             &mut |sent: u64, _one: u64| {
                 let now = store::now_ms();
                 let acc = sent_acc + sent;
@@ -303,6 +304,7 @@ fn put_file<F: FnMut(u64, u64)>(
     top_name: &str,
     batch: &str,
     is_last: bool,
+    batch_total: u64,
     on_progress: F,
 ) -> Result<u64, String> {
     let size = fs::metadata(file).map_err(|e| format!("读 {} 失败: {e}", file.display()))?.len();
@@ -316,6 +318,8 @@ fn put_file<F: FnMut(u64, u64)>(
         // 头值只能 ASCII，中文路径必须 base64（见 store::hdr_encode）
         h.push(("X-Rel-Path".into(), store::hdr_encode(rel)));
         h.push(("X-Batch".into(), batch.to_string()));
+        // 整批总大小：接收端据此把文件夹气泡的大小与进度算对（旧版本不发，接收端会退回单文件口径）
+        h.push(("X-Batch-Size".into(), batch_total.to_string()));
         h.push(("X-Last".into(), if is_last { "1".into() } else { "0".into() }));
         h
     };

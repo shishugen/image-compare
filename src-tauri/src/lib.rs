@@ -54,7 +54,10 @@ async fn read_image(path: String) -> Result<ImagePayload, String> {
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| path.clone());
-    let mime = mime_of(buf.extension().and_then(|e| e.to_str()));
+    let mime = mime_of(buf.extension().and_then(|e| e.to_str()))
+        // 收件箱里的名字可能被截断过、也可能本来就没扩展名，这时候只能看文件头
+        .or_else(|| sniff_mime(&bytes))
+        .unwrap_or("application/octet-stream");
     Ok(ImagePayload {
         path,
         name,
@@ -63,17 +66,48 @@ async fn read_image(path: String) -> Result<ImagePayload, String> {
     })
 }
 
-fn mime_of(ext: Option<&str>) -> &'static str {
+fn mime_of(ext: Option<&str>) -> Option<&'static str> {
     match ext.map(|e| e.to_ascii_lowercase()) {
-        Some(x) if x == "png" => "image/png",
-        Some(x) if x == "jpg" || x == "jpeg" => "image/jpeg",
-        Some(x) if x == "webp" => "image/webp",
-        Some(x) if x == "gif" => "image/gif",
-        Some(x) if x == "bmp" => "image/bmp",
-        Some(x) if x == "avif" => "image/avif",
-        Some(x) if x == "svg" => "image/svg+xml",
-        _ => "application/octet-stream",
+        Some(x) if x == "png" => Some("image/png"),
+        Some(x) if x == "jpg" || x == "jpeg" => Some("image/jpeg"),
+        Some(x) if x == "webp" => Some("image/webp"),
+        Some(x) if x == "gif" => Some("image/gif"),
+        Some(x) if x == "bmp" => Some("image/bmp"),
+        Some(x) if x == "avif" => Some("image/avif"),
+        Some(x) if x == "svg" => Some("image/svg+xml"),
+        _ => None,
     }
+}
+
+/// 靠魔数认图片：聊天缩略图走 data URL，mime 猜错就整张画不出来，
+/// 所以扩展名缺失/被截断时必须有这一步兜底
+fn sniff_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.get(..4) == Some(b"\x89PNG") {
+        return Some("image/png");
+    }
+    if bytes.starts_with(b"\xFF\xD8\xFF") {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF8") {
+        return Some("image/gif");
+    }
+    if bytes.starts_with(b"BM") {
+        return Some("image/bmp");
+    }
+    if bytes.get(..4) == Some(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        return Some("image/webp");
+    }
+    if bytes.get(4..8) == Some(b"ftyp")
+        && matches!(bytes.get(8..12), Some(b"avif") | Some(b"avis"))
+    {
+        return Some("image/avif");
+    }
+    // svg 是文本，只看开头一小段，避免为一个矢量图扫全文
+    let head = &bytes[..bytes.len().min(512)];
+    if head.starts_with(b"<svg") || (head.starts_with(b"<?xml") && head.windows(4).any(|w| w == b"<svg")) {
+        return Some("image/svg+xml");
+    }
+    None
 }
 
 /// 写入系统剪贴板。前端已依次试过 navigator.clipboard 与 execCommand，
@@ -180,6 +214,7 @@ pub fn run() {
             net::send_paths,
             net::msg_history,
             net::reveal_in_folder,
+            net::save_path_as,
             net::pick_folder,
             net::pick_send_files,
             pair::list_peers,

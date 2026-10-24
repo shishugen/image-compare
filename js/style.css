@@ -651,6 +651,12 @@ textarea.input {
   min-height: 0;
 }
 
+/* 传输视图是聊天式布局：消息流在上、输入区在下，所以必须纵向排。
+   收藏视图共用 .panel-body 但要横向（树 | 列表），故只限定在传输视图。 */
+.view-transfer .panel-body {
+  flex-direction: column;
+}
+
 .drawer {
   position: absolute;
   top: 0;
@@ -759,6 +765,7 @@ textarea,
 .stream {
   flex: 1 1 auto;
   min-width: 0;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   gap: 10px;
@@ -1046,4 +1053,121 @@ textarea,
 .fav-body-input {
   flex: 1 1 auto;
   min-height: 120px;
+}
+
+/* ==========================================================================
+ * 聊天里的图片预览、放大层与拖拽悬停遮罩
+ * ========================================================================== */
+
+.thumb-box {
+  margin: 6px 0 2px;
+}
+
+/* 占位与失败态用虚线框，尺寸固定以免图加载完把气泡顶得一跳一跳 */
+.thumb-box.thumb-loading,
+.thumb-box.thumb-fail {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 160px;
+  min-height: 104px;
+  padding: 8px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+  color: var(--text-dim);
+  font-size: 12px;
+  text-align: center;
+}
+
+.thumb-box.thumb-ready {
+  cursor: zoom-in;
+}
+
+.thumb {
+  display: block;
+  max-width: 260px;
+  max-height: 260px;
+  border-radius: var(--radius);
+  background: var(--bg-pane);
+}
+
+.lightbox {
+  position: fixed;
+  inset: 0;
+  /* 比抽屉(5)高就行，不要拿 9999 去压别的东西 */
+  z-index: 900;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  background: rgba(8, 9, 12, 0.86);
+  cursor: zoom-out;
+}
+
+.lightbox img {
+  max-width: 92vw;
+  max-height: 84vh;
+  object-fit: contain;
+  border-radius: var(--radius);
+  cursor: default;
+}
+
+.lb-cap {
+  max-width: 90vw;
+  color: var(--text-dim);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lb-close {
+  position: absolute;
+  top: 10px;
+  right: 14px;
+  width: 30px;
+  height: 30px;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: rgba(34, 37, 45, 0.8);
+  color: var(--text);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+/* pointer-events: none 是必须的——遮罩一旦吃掉鼠标事件，Tauri 的原生拖拽就收不到 drop 了 */
+.drop-hint {
+  position: absolute;
+  inset: 8px;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 2px dashed var(--accent);
+  border-radius: 10px;
+  background: rgba(76, 141, 255, 0.12);
+  pointer-events: none;
+}
+
+.drop-hint.is-blocked {
+  border-color: #b45252;
+  background: rgba(180, 82, 82, 0.14);
+}
+
+.drop-hint-inner {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  text-align: center;
+}
+
+.drop-hint-inner b {
+  font-size: 15px;
+}
+
+.drop-hint-inner span {
+  color: var(--text-dim);
+  font-size: 12px;
 }

@@ -33,6 +33,30 @@ pub struct Discovered {
     pub seen: i64,
 }
 
+/// 一批传输（同一个 batch id，文件夹会拆成多个 PUT）在接收端的累计状态。
+/// 没有它，文件夹气泡只能拿到「最后一个文件的大小」，进度条也只能按单件算。
+#[derive(Clone, Copy)]
+pub struct BatchAcc {
+    /// 已完整收到的字节数，作为下一个文件的进度基准
+    pub written: u64,
+    /// 发送端通过 X-Batch-Size 告知的整批总大小，0 表示对方没告知
+    pub total: u64,
+    /// 已收到的文件个数
+    pub files: u64,
+    pub seen: i64,
+}
+
+impl Default for BatchAcc {
+    fn default() -> Self {
+        Self {
+            written: 0,
+            total: 0,
+            files: 0,
+            seen: 0,
+        }
+    }
+}
+
 pub struct Hub {
     pub app: AppHandle,
     pub store: Arc<Store>,
@@ -41,6 +65,8 @@ pub struct Hub {
     pub port: Mutex<u16>,
     peer: Mutex<Option<Peer>>,
     discovered: Mutex<HashMap<String, Discovered>>,
+    /// 接收中的批次累计，收完（X-Last）就取走
+    batches: Mutex<HashMap<String, BatchAcc>>,
     /// 接收服务起不来之类的错误，原样显示给用户
     net_error: Mutex<Option<String>>,
     pub stop: AtomicBool,
@@ -60,6 +86,7 @@ impl Hub {
             port: Mutex::new(0),
             peer: Mutex::new(peer),
             discovered: Mutex::new(HashMap::new()),
+            batches: Mutex::new(HashMap::new()),
             net_error: Mutex::new(None),
             stop: AtomicBool::new(false),
         }))
@@ -171,6 +198,44 @@ impl Hub {
     pub fn set_net_error(&self, msg: String) {
         *self.net_error.lock().expect("net_error 锁中毒") = Some(msg);
         self.emit_peers_changed();
+    }
+
+    /// 开始收一个文件：登记整批总大小并返回此前的累计快照（进度基准）
+    pub fn batch_touch(&self, id: &str, declared_total: u64) -> BatchAcc {
+        let mut g = self.batches.lock().expect("batches 锁中毒");
+        // 对端中途掉线不会再发 X-Last，不清会无限增长，留 32 批够并发余量
+        if g.len() > 32 {
+            let mut old: Vec<(i64, String)> = g.iter().map(|(k, v)| (v.seen, k.clone())).collect();
+            old.sort_by(|a, b| a.0.cmp(&b.0));
+            for (_, k) in old.iter().take(g.len() - 32) {
+                g.remove(k);
+            }
+        }
+        let e = g.entry(id.to_string()).or_default();
+        if declared_total > e.total {
+            e.total = declared_total;
+        }
+        e.seen = store::now_ms();
+        *e
+    }
+
+    /// 一个文件写完后累加
+    pub fn batch_add_file(&self, id: &str, size: u64) -> BatchAcc {
+        let mut g = self.batches.lock().expect("batches 锁中毒");
+        let e = g.entry(id.to_string()).or_default();
+        e.written += size;
+        e.files += 1;
+        e.seen = store::now_ms();
+        *e
+    }
+
+    /// 最后一个文件收完：取走累计并顺手清掉条目
+    pub fn batch_finish(&self, id: &str) -> BatchAcc {
+        self.batches
+            .lock()
+            .expect("batches 锁中毒")
+            .remove(id)
+            .unwrap_or_default()
     }
 
     pub fn emit(&self, event: &str, payload: Value) {
@@ -294,6 +359,99 @@ pub fn reveal_in_folder(path: String) -> Result<(), String> {
     };
     cmd.spawn()
         .map_err(|e| format!("调用系统文件管理器失败: {e}"))?;
+    Ok(())
+}
+
+/// 「下载 / 另存为」：收到的东西本来就落在本机收件箱，这里只是把它复制到用户选的位置。
+/// 单文件走保存对话框，目录走选目录 + 递归复制（跟微信的「另存为…」一致）。
+/// 返回 None 表示用户取消了，不当作错误。
+#[tauri::command]
+pub async fn save_path_as(app: tauri::AppHandle, src: String) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let from = PathBuf::from(&src);
+    let meta = std::fs::symlink_metadata(&from).map_err(|e| format!("读不到 {src}: {e}"))?;
+    if meta.file_type().is_symlink() {
+        return Err("符号链接不提供另存为".into());
+    }
+    let name = from
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .ok_or_else(|| format!("{src} 没有文件名"))?;
+
+    let target = if meta.is_dir() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<Option<tauri_plugin_dialog::FilePath>>();
+        app.dialog()
+            .file()
+            .set_title(format!("把文件夹「{name}」复制到哪个目录"))
+            .pick_folder(move |dir| {
+                let _ = tx.send(dir);
+            });
+        let parent = rx
+            .await
+            .map_err(|e| format!("目录对话框异常: {e}"))?
+            .and_then(|f| f.into_path().ok());
+        match parent {
+            // 原地另存为（选了自己）直接当作取消，不制造 xxx(1)
+            Some(p) if p == from.parent().unwrap_or(&p) => return Ok(None),
+            Some(p) => p.join(&name),
+            None => return Ok(None),
+        }
+    } else {
+        let (tx, rx) = tokio::sync::oneshot::channel::<Option<tauri_plugin_dialog::FilePath>>();
+        app.dialog()
+            .file()
+            .set_title("另存为")
+            .set_file_name(&name)
+            .save_file(move |path| {
+                let _ = tx.send(path);
+            });
+        match rx
+            .await
+            .map_err(|e| format!("保存对话框异常: {e}"))?
+            .and_then(|f| f.into_path().ok())
+        {
+            // 存回原路径等于没动，不浪费一次整文件读写
+            Some(p) if p == from => return Ok(None),
+            Some(p) => p,
+            None => return Ok(None),
+        }
+    };
+
+    let out = tauri::async_runtime::spawn_blocking(move || -> Result<PathBuf, String> {
+        if from.is_dir() {
+            copy_tree(&from, &target)?;
+        } else {
+            if let Some(p) = target.parent() {
+                std::fs::create_dir_all(p).map_err(|e| format!("创建 {} 失败: {e}", p.display()))?;
+            }
+            std::fs::copy(&from, &target)
+                .map_err(|e| format!("复制到 {} 失败: {e}", target.display()))?;
+        }
+        Ok(target)
+    })
+    .await
+    .map_err(|e| format!("复制任务被中断: {e}"))??;
+    Ok(Some(out.to_string_lossy().to_string()))
+}
+
+/// 递归复制目录。拒符号链接，否则可能把目标目录外的文件也拖进来。
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(to).map_err(|e| format!("创建 {} 失败: {e}", to.display()))?;
+    for entry in std::fs::read_dir(from).map_err(|e| format!("读 {} 失败: {e}", from.display()))? {
+        let entry = entry.map_err(|e| format!("遍历 {} 失败: {e}", from.display()))?;
+        let src = entry.path();
+        let ft = entry
+            .file_type()
+            .map_err(|e| format!("取 {} 类型失败: {e}", src.display()))?;
+        let dst = to.join(entry.file_name());
+        if ft.is_symlink() {
+            eprintln!("[net] 跳过符号链接: {}", src.display());
+        } else if ft.is_dir() {
+            copy_tree(&src, &dst)?;
+        } else {
+            std::fs::copy(&src, &dst).map_err(|e| format!("复制 {} 失败: {e}", src.display()))?;
+        }
+    }
     Ok(())
 }
 

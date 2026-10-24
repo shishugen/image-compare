@@ -16,6 +16,7 @@ import {
   listen,
   openInCompare,
   registerDropHandler,
+  registerDropHoverHandler,
   setStatus,
   toast,
 } from "./api.js";
@@ -37,6 +38,12 @@ const ui = {
   candidates: el("xfer-candidates"),
   settings: el("xfer-settings"),
   btnSettings: el("btn-xfer-settings"),
+  dropHint: el("xfer-drop-hint"),
+  dropText: el("xfer-drop-text"),
+  lightbox: el("img-lightbox"),
+  lightboxImg: el("lightbox-img"),
+  lightboxCap: el("lightbox-cap"),
+  lightboxClose: el("lightbox-close"),
 };
 
 const state = {
@@ -47,6 +54,12 @@ const state = {
 };
 
 const IMAGE_EXT = /\.(png|jpe?g|webp|gif|bmp|avif|svg)$/i;
+/** 缩略图自动读盘的上限：超过它就先占位，点一下才走 IPC，铺历史时不会一次拽几十张图 */
+const PREVIEW_AUTO_MAX = 4 * 1024 * 1024;
+/** 硬上限：再大就不在聊天里解图，引导用「在对比中打开」（对比视图本来就是为大图设计的） */
+const PREVIEW_HARD_MAX = 40 * 1024 * 1024;
+/** path -> data URL，缩略图与放大层共用同一份，一张图只读一次盘 */
+const imgCache = new Map();
 
 /* --------------------------------------------------------------------------
  * 连接状态
@@ -139,7 +152,18 @@ function buildBubble(m) {
   bubble.className = "bubble";
   wrap.appendChild(bubble);
 
-  const rec = { el: wrap, meta, bubble, bar: null, state: m.state, kind: m.kind };
+  const rec = {
+    el: wrap,
+    meta,
+    bubble,
+    bar: null,
+    state: m.state,
+    kind: m.kind,
+    thumbBox: null,
+    fileName: null,
+    fileSize: null,
+    actsBox: null,
+  };
 
   if (m.kind === "text") {
     const body = document.createElement("div");
@@ -159,6 +183,15 @@ function buildBubble(m) {
       <span class="file-name" title="${escapeHtml(m.path || "")}">${escapeHtml(m.name || "")}</span>
       <span class="file-size">${fmtSize(m.size || 0)}</span>`;
     bubble.appendChild(head);
+    rec.fileName = head.querySelector(".file-name");
+    rec.fileSize = head.querySelector(".file-size");
+
+    // 预览位先占好：接收中的占位气泡还没有 path，等 xfer-done 再填，顺序才不会跑到进度条后面
+    const thumbBox = document.createElement("div");
+    thumbBox.className = "thumb-box";
+    thumbBox.hidden = true;
+    bubble.appendChild(thumbBox);
+    rec.thumbBox = thumbBox;
 
     const bar = document.createElement("div");
     bar.className = "bar";
@@ -168,15 +201,11 @@ function buildBubble(m) {
     bubble.appendChild(bar);
     rec.bar = fill;
 
-    const acts = [];
-    if (m.path) {
-      acts.push(["打开位置", () => invoke("reveal_in_folder", { path: m.path }).catch((e) => toast(errText(e), "error"))]);
-      const isImage = m.kind === "file" && IMAGE_EXT.test(m.name || "");
-      if (isImage) {
-        acts.push(["在对比中打开", () => openInCompare([m.path])]);
-      }
-    }
-    bubble.appendChild(actions(acts));
+    const actsBox = document.createElement("div");
+    actsBox.className = "msg-actions";
+    bubble.appendChild(actsBox);
+    rec.actsBox = actsBox;
+    attachActions(rec, m);
   } else {
     const body = document.createElement("div");
     body.className = "msg-text";
@@ -186,9 +215,8 @@ function buildBubble(m) {
   return rec;
 }
 
-function actions(list) {
-  const box = document.createElement("div");
-  box.className = "msg-actions";
+function fillActions(box, list) {
+  box.textContent = "";
   for (const [label, fn] of list) {
     const b = document.createElement("button");
     b.className = "link-btn";
@@ -204,6 +232,126 @@ function actions(list) {
     box.appendChild(b);
   }
   return box;
+}
+
+function actions(list) {
+  const box = document.createElement("div");
+  box.className = "msg-actions";
+  return fillActions(box, list);
+}
+
+/** 操作区跟预览位一样要等 xfer-done 拿到路径才能补全，否则接收完的气泡一个按钮都没有 */
+function attachActions(rec, m) {
+  if (!rec.actsBox || !m.path) return;
+  if (rec.actsPath === m.path) return;
+  rec.actsPath = m.path;
+  const isImage = m.kind === "file" && IMAGE_EXT.test(m.name || "");
+  const list = [
+    ["另存为", () => saveAs(m.path)],
+    ["打开位置", () => invoke("reveal_in_folder", { path: m.path }).catch((e) => toast(errText(e), "error"))],
+  ];
+  if (isImage) list.push(["在对比中打开", () => openInCompare([m.path])]);
+  fillActions(rec.actsBox, list);
+}
+
+/* --------------------------------------------------------------------------
+ * 图片预览与另存为
+ *
+ * 图不走网络也不走 asset: 协议：直接复用对比视图已有的 read_image 命令拿 base64
+ * data URL，CSP 的 img-src 早就允许 data:，所以不用新增任何权限或改 CSP。
+ * ------------------------------------------------------------------------ */
+
+/** 只有带本机路径的图片才出预览；接收中的占位气泡没 path，等 xfer-done 补上再调一次 */
+function attachThumb(rec, m) {
+  if (!rec.thumbBox || rec.thumbLoaded) return;
+  if (!(m.kind === "file" && m.path && IMAGE_EXT.test(m.name || ""))) return;
+  Object.assign(rec, {
+    path: m.path,
+    size: m.size || rec.size || 0,
+    name: m.name || rec.name || "",
+  });
+  rec.thumbBox.hidden = false;
+  if (rec.size > PREVIEW_AUTO_MAX) renderThumbLazy(rec);
+  else loadThumb(rec);
+}
+
+/** 大图先占位，用户点了才读盘 */
+function renderThumbLazy(rec) {
+  rec.thumbBox.textContent = "";
+  const b = document.createElement("button");
+  b.className = "link-btn thumb-lazy";
+  b.textContent = `点我预览（${fmtSize(rec.size)}）`;
+  b.addEventListener("click", () => loadThumb(rec, true));
+  rec.thumbBox.appendChild(b);
+}
+
+async function loadThumb(rec, force = false) {
+  if (!rec.thumbBox || rec.thumbLoaded || !rec.path) return;
+  if (!force && rec.size > PREVIEW_AUTO_MAX) {
+    renderThumbLazy(rec);
+    return;
+  }
+  if (rec.size > PREVIEW_HARD_MAX) {
+    rec.thumbBox.className = "thumb-box thumb-fail";
+    rec.thumbBox.textContent = "图片过大，请用「在对比中打开」查看";
+    return;
+  }
+  const cached = imgCache.get(rec.path);
+  if (cached) {
+    paintThumb(rec, cached);
+    return;
+  }
+  rec.thumbBox.className = "thumb-box thumb-loading";
+  rec.thumbBox.textContent = "读取中…";
+  try {
+    const payload = await invoke("read_image", { path: rec.path });
+    imgCache.set(payload.path || rec.path, payload.data_url);
+    paintThumb(rec, payload.data_url);
+  } catch (err) {
+    // 文件被移走 / 解码失败都很常见，不能把整条消息弄成坏的
+    console.warn("[xfer] 缩略图读取失败:", rec.path, err);
+    rec.thumbBox.className = "thumb-box thumb-fail";
+    rec.thumbBox.textContent = "预览失败（文件可能被移动或删除）";
+  }
+}
+
+function paintThumb(rec, dataUrl) {
+  rec.thumbLoaded = true;
+  rec.thumbBox.className = "thumb-box thumb-ready";
+  rec.thumbBox.textContent = "";
+  const img = document.createElement("img");
+  img.className = "thumb";
+  img.src = dataUrl;
+  img.alt = rec.name;
+  img.title = "点击放大";
+  rec.thumbBox.appendChild(img);
+  rec.thumbBox.addEventListener("click", () => openLightbox(dataUrl, rec.name, rec.path));
+}
+
+function openLightbox(dataUrl, name, p) {
+  ui.lightboxImg.src = dataUrl;
+  ui.lightboxImg.alt = name || "";
+  ui.lightboxCap.textContent = [name, p].filter(Boolean).join(" · ");
+  ui.lightbox.hidden = false;
+}
+
+function closeLightbox() {
+  if (ui.lightbox.hidden) return;
+  ui.lightbox.hidden = true;
+  // 去掉 src 让 webview 立刻释放解码后的大图内存
+  ui.lightboxImg.removeAttribute("src");
+}
+
+/** 「下载」在这套架构里就是「把已落盘的东西复制到用户选的位置」：
+ *  收件箱里的原件不动，校过 sha256 的内容不会被二次改写 */
+async function saveAs(path) {
+  try {
+    const saved = await invoke("save_path_as", { src: path });
+    if (saved) toast(`已保存到 ${saved}`);
+  } catch (err) {
+    console.error("[xfer] 另存为失败:", err);
+    toast(errText(err), "error");
+  }
 }
 
 function paintMeta(rec, m) {
@@ -227,6 +375,14 @@ function upsertMessage(m) {
   }
   rec.state = m.state || rec.state;
   paintMeta(rec, m);
+  // 接收完成时才拿到落盘路径与真实名字/大小，逐块补上（已填过则内部直接返回）
+  if (rec.fileName && m.name) {
+    rec.fileName.textContent = m.name;
+    rec.fileName.title = m.path || "";
+  }
+  if (rec.fileSize && m.size) rec.fileSize.textContent = fmtSize(m.size);
+  attachThumb(rec, m);
+  attachActions(rec, m);
   if (rec.bar && m.size) {
     // 状态已终结时用满格，避免出现「已送达但进度条 98%」
     rec.bar.style.width = m.state === "sent" ? "100%" : rec.bar.style.width || "0%";
@@ -399,6 +555,35 @@ ui.btnFolder.addEventListener("click", async () => {
 
 // 拖文件进窗口即发送：注册给 api.js 的拖拽路由（对比视图不会走到这里）
 registerDropHandler("transfer", (paths) => sendPaths(paths));
+
+// 拖拽悬停遮罩：像微信那样先告诉用户「松开就发」，离线时也明确拦在那里
+registerDropHoverHandler("transfer", (phase) => {
+  if (!ui.dropHint) return;
+  if (phase === "drop" || phase === "leave") {
+    ui.dropHint.hidden = true;
+    return;
+  }
+  const peer = state.status?.peer;
+  const online = !!peer && peer.online;
+  ui.dropHint.hidden = false;
+  ui.dropHint.classList.toggle("is-blocked", !online);
+  ui.dropText.textContent = !state.status?.passphrase_set
+    ? "先在「配对设置」里填口令"
+    : online
+      ? `松开即发送给「${peer.name}」`
+      : `对端${peer ? `「${peer.name}」` : ""}离线，暂发不出去`;
+});
+
+// 放大层：点背景/关闭按钮/Esc 都能退出，只在有该 DOM 时绑定
+if (ui.lightbox && ui.lightboxClose) {
+  ui.lightboxClose.addEventListener("click", closeLightbox);
+  ui.lightbox.addEventListener("click", (ev) => {
+    if (ev.target === ui.lightbox) closeLightbox();
+  });
+  window.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape") closeLightbox();
+  });
+}
 
 ui.btnPair.addEventListener("click", savePairConfig);
 ui.btnManual.addEventListener("click", bindManual);

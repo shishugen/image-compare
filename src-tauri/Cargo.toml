@@ -1,6 +1,6 @@
 [package]
 name = "image-compare"
-version = "0.2.0"
+version = "0.2.1"
 description = "图片对比 + 局域网文件/文字传输 + 文字收藏"
 edition = "2021"
 
