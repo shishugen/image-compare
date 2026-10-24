@@ -259,6 +259,13 @@ impl Store {
         self.dir.join("inbox")
     }
 
+    /// 粘贴进来的图片/位图落在这里（它们本来没有“原文件”，必须造一个）。
+    /// 和 inbox 一样只增不删：聊天记录里的 path 指着它，自动清掉会让
+    /// 历史气泡的预览、另存为、复制同时失效。
+    pub fn pastebox_dir(&self) -> PathBuf {
+        self.dir.join("pastebox")
+    }
+
     /* ---- device ---- */
 
     pub fn load_or_create_device(&self) -> Result<Device, String> {
@@ -375,6 +382,68 @@ impl Store {
         merged
     }
 
+    /// 修历史坏数据：早期版本把收件箱消息的 `path` 按名字长度硬截过（还会削掉 `.jpg`），
+    /// 那种记录现在指向一个不存在的路径，前端只会反复报「缩略图读取失败」，
+    /// 而文件其实就躺在同一个目录里、名字更长。
+    ///
+    /// 只认这一种窄情形：名字够长（>=100 字符，短名字前缀撞车概率高，
+    /// 比如 `a.txt` 与 `a.txt (1)`）+ 同目录下**恰好只有一个**文件以它为前缀。
+    /// 找回就补写一条修正记录（JSONL 后写覆盖前写，见 read_messages），其余原样留着。
+    pub fn repair_inbox_paths(&self) -> usize {
+        let mut fixed = 0;
+        for m in self.read_messages(usize::MAX) {
+            if m.dir != "in" || m.kind != "file" {
+                continue;
+            }
+            let Some(p) = m.path.as_deref() else { continue };
+            let path = Path::new(p);
+            if path.exists() {
+                continue;
+            }
+            let Some(bad_name) = path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if bad_name.chars().count() < 100 {
+                continue;
+            }
+            let Some(parent) = path.parent() else { continue };
+            let Ok(entries) = fs::read_dir(parent) else {
+                continue;
+            };
+            let hits: Vec<PathBuf> = entries
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|e| {
+                    let Some(n) = e.file_name().and_then(|s| s.to_str()) else {
+                        return false;
+                    };
+                    n.chars().count() > bad_name.chars().count()
+                        && n.starts_with(bad_name)
+                        && e.is_file()
+                })
+                .collect();
+            if hits.len() != 1 {
+                continue;
+            }
+            let real = &hits[0];
+            let patched = Message {
+                path: Some(real.to_string_lossy().to_string()),
+                name: real
+                    .file_name()
+                    .map(|s| Some(s.to_string_lossy().to_string()))
+                    .unwrap_or_else(|| m.name.clone()),
+                ..m.clone()
+            };
+            match self.append_message(&patched) {
+                Ok(()) => {
+                    eprintln!("[store] 找回被截断的收件箱路径：{} -> {}", p, real.display());
+                    fixed += 1;
+                }
+                Err(e) => eprintln!("[store] 修正后的路径写回失败: {e}"),
+            }
+        }
+        fixed
+    }
+
     /* ---- favorites ---- */
 
     pub fn load_favs(&self) -> FavFile {
@@ -484,6 +553,62 @@ mod tests {
         let (hex, n) = w.finish();
         assert_eq!(n, 4);
         assert_eq!(hex, sha256_hex(b"abcd"));
+    }
+
+    #[test]
+    fn 被截断的收件箱路径能找回() {
+        let dir = std::env::temp_dir().join(format!("imgcmp-repair-{}", now_ms()));
+        let inbox = dir.join("inbox");
+        fs::create_dir_all(&inbox).unwrap();
+        let s = Store::new(dir.clone());
+
+        // 长名字：早期版本截出来的前缀 + 盘上真正的文件
+        let head = "x".repeat(120);
+        let real_name = format!("{head}_完整尾缀.jpg");
+        fs::write(inbox.join(&real_name), b"hi").unwrap();
+        // 短名字：前缀也能撞上，但旧版本不会截这么短，宁可不修也不能认错
+        fs::write(inbox.join("短文件.txt (1)"), b"hi").unwrap();
+
+        let base = Message {
+            id: "m1".into(),
+            dir: "in".into(),
+            kind: "file".into(),
+            text: None,
+            name: Some(head.clone()),
+            size: Some(2),
+            path: Some(inbox.join(&head).to_string_lossy().to_string()),
+            state: "sent".into(),
+            ts: 1,
+            peer: String::new(),
+        };
+        s.append_message(&base).unwrap();
+        s.append_message(&Message {
+            id: "m2".into(),
+            name: Some("短文件.txt".into()),
+            path: Some(inbox.join("短文件.txt").to_string_lossy().to_string()),
+            ..base.clone()
+        })
+        .unwrap();
+
+        assert_eq!(s.repair_inbox_paths(), 1, "只应修掉那条长名字的");
+        let msgs = s.read_messages(10);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(
+            msgs[0].path.as_deref().unwrap(),
+            inbox.join(&real_name).to_string_lossy(),
+            "长名字那条应指向盘上的真身"
+        );
+        assert_eq!(msgs[0].name.as_deref().unwrap(), real_name);
+        assert_eq!(
+            msgs[1].path.as_deref().unwrap(),
+            inbox.join("短文件.txt").to_string_lossy(),
+            "短名字那条必须原样留着"
+        );
+
+        // 幂等：路径已存在就不会再写，历史不会被重复修正堆长
+        assert_eq!(s.repair_inbox_paths(), 0);
+        assert_eq!(s.read_messages(10).len(), 2);
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

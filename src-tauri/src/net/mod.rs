@@ -20,8 +20,10 @@ use tauri::{AppHandle, Emitter, Manager, State};
 /// 默认监听端口，被占用时依次 +1 试探
 pub const DEFAULT_PORT: u16 = 45789;
 pub const PORT_TRIES: u16 = 10;
-/// 一次最多回给前端多少条历史（够铺满首屏，且不让 IPC 载荷过大）
+/// 一次最多回给前端多少条历史（翻页的上限，也是游标失效时的兜底页大小）
 const HISTORY_LIMIT: usize = 500;
+/// 首屏铺多少条：像微信那样先只看最近几条，滚到顶再补上一页
+const HISTORY_PAGE: usize = 10;
 
 /// mDNS 浏览到的候选设备，尚未通过 /ping 校验
 #[derive(Clone, Serialize)]
@@ -281,6 +283,8 @@ pub fn prepare_store(app: &AppHandle) -> Result<Arc<Store>, String> {
         .map_err(|e| format!("取 app_data_dir 失败: {e}"))?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建数据目录 {} 失败: {e}", dir.display()))?;
     std::fs::create_dir_all(dir.join("inbox")).map_err(|e| format!("创建收件箱失败: {e}"))?;
+    // 粘贴的图片要有个落点（与收件箱分开，免得混进“别人发来的东西”里）
+    std::fs::create_dir_all(dir.join("pastebox")).map_err(|e| format!("创建粘贴暂存失败: {e}"))?;
     eprintln!("[net] 数据目录 {}", dir.display());
     Ok(Arc::new(Store::new(dir)))
 }
@@ -331,9 +335,32 @@ pub async fn send_paths(hub: State<'_, Arc<Hub>>, paths: Vec<String>) -> Result<
         .map_err(|e| format!("发送任务被中断: {e}"))?
 }
 
+/// 从按时间排好的历史里切出一页 `[start, end)`。
+/// `cursor` 是已展示的最老一条的下标（往前翻页的起点），None 表示从最新一条开始往前切。
+/// 游标失效（气泡被删了）时也当成 None，宁可重给最新一页，也别回一堆空把界面卡住。
+fn history_range(len: usize, cursor: Option<usize>, page: usize) -> (usize, usize) {
+    let end = cursor.unwrap_or(len).min(len);
+    (end.saturating_sub(page), end)
+}
+
+/// 拉历史。参数名故意用单个单词（不用 before_id）：Tauri 会把 Rust 的 snake_case
+/// 参数映射成 JS 的 camelCase，少一层歧义少一个坑。
+/// `before` 是已展示的最早一条的 id，不传就是「最新一页」。
 #[tauri::command]
-pub fn msg_history(hub: State<'_, Arc<Hub>>, limit: Option<usize>) -> Vec<Message> {
-    hub.store.read_messages(limit.unwrap_or(HISTORY_LIMIT).clamp(1, 5000))
+pub fn msg_history(
+    hub: State<'_, Arc<Hub>>,
+    limit: Option<usize>,
+    before: Option<String>,
+) -> Vec<Message> {
+    // 不传游标就是「最新一页」；传了 before 就是「这条之前再往前的 limit 条」。
+    // 游标用 id 而不是「已看条数」：中间来了新消息、或重复拉到同一条时都不会串页
+    let all = hub.store.read_messages(usize::MAX);
+    let page = limit.unwrap_or(HISTORY_PAGE).clamp(1, HISTORY_LIMIT);
+    let cursor = before
+        .as_deref()
+        .and_then(|id| all.iter().position(|m| m.id == id));
+    let (start, end) = history_range(all.len(), cursor, page);
+    all[start..end].to_vec()
 }
 
 /// 打开收件箱目录（在系统文件管理器里定位到具体文件）
@@ -480,4 +507,30 @@ pub async fn pick_send_files(app: AppHandle) -> Result<Vec<String>, String> {
     });
     let files = rx.await.map_err(|e| format!("文件对话框异常: {e}"))?;
     Ok(files.unwrap_or_default().into_iter().filter_map(|f| f.into_path().ok()).map(|p| p.to_string_lossy().to_string()).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::history_range;
+
+    #[test]
+    fn 不传游标拿的是最新一页() {
+        assert_eq!(history_range(26, None, 10), (16, 26));
+        // 总数不到一页就全给，别回个空列表
+        assert_eq!(history_range(3, None, 10), (0, 3));
+        assert_eq!(history_range(0, None, 10), (0, 0));
+    }
+
+    #[test]
+    fn 有游标就从游标往前切() {
+        assert_eq!(history_range(26, Some(16), 10), (6, 16));
+        // 已经翻到最老一条，再翻就是空页（前端据此收起「加载更早」）
+        assert_eq!(history_range(26, Some(0), 10), (0, 0));
+    }
+
+    #[test]
+    fn 游标越界当失效处理() {
+        // 历史被清短了：越界的游标不能拿去切片，否则会 panic
+        assert_eq!(history_range(5, Some(99), 10), (0, 5));
+    }
 }

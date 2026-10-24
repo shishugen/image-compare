@@ -7,7 +7,7 @@
  * 这里额外负责导航、⌘1/⌘2/⌘3、平台文案与全局异常兜底。
  * ========================================================================== */
 
-import { VIEWS, currentView, el, setView, setStatus } from "./api.js";
+import { VIEWS, currentView, el, installPasteListener, setView, setStatus } from "./api.js";
 
 // 顺序即注册顺序：视图模块在导入时就完成事件绑定，此时 DOM 已就绪（script 在 body 末尾）
 import "./view-compare.js";
@@ -66,5 +66,7 @@ window.addEventListener("unhandledrejection", (ev) => {
 });
 
 if (!el("stage")) console.warn("[app] 缺少 #stage，对比视图可能无法布局");
+// 粘贴监听装在三个视图注册完落点之后，不然 routeDrop 找不到处理者
+installPasteListener();
 syncNav();
 console.log("[app] 入口装配完成，当前视图:", currentView());

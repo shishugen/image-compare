@@ -87,7 +87,7 @@
                   <div class="layer"><img class="canvas" alt="" draggable="false" /></div>
                   <div class="empty">
                     <div class="empty-icon">A</div>
-                    <p>单击选择图片，或拖拽图片到此窗口</p>
+                    <p>单击直接粘剪贴板里的图，或拖拽到此处；⌘O 选文件</p>
                   </div>
                 </div>
                 <div class="pane-tag">
@@ -104,7 +104,7 @@
                   <div class="layer"><img class="canvas" alt="" draggable="false" /></div>
                   <div class="empty">
                     <div class="empty-icon">B</div>
-                    <p>单击选择图片，或拖拽图片到此窗口</p>
+                    <p>单击直接粘剪贴板里的图，或拖拽到此处；⌘O 选文件</p>
                   </div>
                 </div>
                 <div class="pane-tag">
@@ -119,7 +119,7 @@
                   <div class="layer"><img class="canvas" alt="" draggable="false" /></div>
                   <div class="empty">
                     <div class="empty-icon">C</div>
-                    <p>单击选择图片，或拖拽图片到此窗口</p>
+                    <p>单击直接粘剪贴板里的图，或拖拽到此处；⌘O 选文件</p>
                   </div>
                 </div>
                 <div class="pane-tag">
@@ -134,7 +134,7 @@
                   <div class="layer"><img class="canvas" alt="" draggable="false" /></div>
                   <div class="empty">
                     <div class="empty-icon">D</div>
-                    <p>单击选择图片，或拖拽图片到此窗口</p>
+                    <p>单击直接粘剪贴板里的图，或拖拽到此处；⌘O 选文件</p>
                   </div>
                 </div>
                 <div class="pane-tag">
@@ -188,6 +188,9 @@
                 <span class="filter-count dim" id="xfer-filter-count" hidden></span>
               </div>
 
+              <!-- 首屏只铺最近 10 条，更早的靠这条补（内容没超出视口时滚不动，所以光靠滚动触发不够） -->
+              <button class="stream-older" id="xfer-older" hidden>加载更早的消息</button>
+
               <!-- 消息流：文字气泡 + 文件/文件夹气泡（名称、大小、进度、打开位置） -->
               <div class="stream" id="xfer-stream"></div>
 
@@ -196,7 +199,7 @@
                   id="xfer-input"
                   class="input compose-input"
                   rows="2"
-                  placeholder="写点什么，Enter 发送、Shift+Enter 换行；把文件拖进窗口即发送"
+                  placeholder="写点什么，Enter 发送、Shift+Enter 换行；把文件拖进窗口或 ⌘V 粘贴即发送"
                 ></textarea>
                 <button id="btn-xfer-send" class="btn btn-primary" disabled title="对端离线时不可发送">发送</button>
               </div>

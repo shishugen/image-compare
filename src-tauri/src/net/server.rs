@@ -483,7 +483,8 @@ fn flatten_batch(inbox: &Path, root: &Path, declared_name: &str) -> PathBuf {
 }
 
 /// 重名时按微信的习惯加 “ (1)” “ (2)” …，而不是默默覆盖已收的文件
-fn unique_dest(dir: &Path, name: &str) -> PathBuf {
+/// （粘贴落盘也复用这条规则，见 clip.rs）
+pub(crate) fn unique_dest(dir: &Path, name: &str) -> PathBuf {
     let first = dir.join(name);
     if !first.exists() {
         return first;
@@ -512,7 +513,7 @@ fn unique_dest(dir: &Path, name: &str) -> PathBuf {
 const MAX_COMPONENT_CHARS: usize = 120;
 
 /// 批量目录名/文件名单独取用时也要防穿越
-fn sanitize_component(s: &str) -> String {
+pub(crate) fn sanitize_component(s: &str) -> String {
     let cleaned: String = s
         .chars()
         .map(|c| match c {

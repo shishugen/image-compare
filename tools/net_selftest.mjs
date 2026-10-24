@@ -75,11 +75,14 @@ function signed(extra, digest) {
   };
 }
 
-/** 发一个文件。rel 决定收件箱里的相对路径，X-Name 是气泡上显示的名字 */
-async function putFile({ batch, rel, name, content, isLast, batchSize }) {
+/** 发一个文件。rel 决定收件箱里的相对路径，X-Name 是气泡上显示的名字。
+ *  shaOverride 只改 X-Sha256（签名仍按覆盖后的值算），用来专门制造
+ *  「签名能过、但头部声明的哈希与真实内容不符」这一岔路 */
+async function putFile({ batch, rel, name, content, isLast, batchSize, shaOverride }) {
+  const digest = shaOverride ?? sha(content);
   const headers = signed(
     {
-      "X-Sha256": sha(content),
+      "X-Sha256": digest,
       "X-Size": String(content.length),
       "X-Name": b64(name),
       "X-Rel-Path": b64(rel),
@@ -87,7 +90,7 @@ async function putFile({ batch, rel, name, content, isLast, batchSize }) {
       "X-Batch-Size": String(batchSize ?? content.length),
       "X-Last": isLast ? "1" : "0",
     },
-    sha(content)
+    digest
   );
   return ask("PUT", "/file", headers, content);
 }

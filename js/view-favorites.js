@@ -12,11 +12,13 @@ import {
   el,
   errText,
   fmtTime,
+  IMAGE_EXT,
   invoke,
   isTauriRuntime,
   onViewChange,
   openInCompare,
   registerDropHandler,
+  registerPasteTextHandler,
   sendPathsToPeer,
   sendTextToPeer,
   setStatus,
@@ -24,7 +26,7 @@ import {
 } from "./api.js";
 
 const MAX_CAT_LEVEL = 3; // 与 favorites.rs 一致
-const IMAGE_EXT = /\.(png|jpe?g|webp|gif|bmp|avif)$/i;
+// IMAGE_EXT 从 api.js 导，三个视图共用一份口径
 
 const ui = {
   tree: el("fav-tree"),
@@ -486,6 +488,17 @@ ui.body.addEventListener("keydown", (ev) => {
  * ------------------------------------------------------------------------ */
 // 非对比视图里拖进来的文件按方案走发送队列，不进图窗命中
 registerDropHandler("fav", (paths) => sendPathsToPeer(paths));
+
+// 焦点不在抽屉里时粘文字：直接起一个新收藏条目把文字放进去，省掉先点「＋条目」这一步
+registerPasteTextHandler("fav", (text) => {
+  // 抽屉开着且正文可写就接着用；正在建分类时正文是只读的，得先换到条目
+  const reusable = ui.editor.classList.contains("is-open") && !ui.body.readOnly;
+  if (!reusable) startCreate("fav", state.selected);
+  const cur = ui.body.value.replace(/\s+$/, "");
+  ui.body.value = cur ? cur + "\n" + text : text;
+  ui.body.focus();
+  toast("已粘进正文，起个标题就能保存");
+});
 
 // 传输视图里的「收藏」按钮会写新节点，切回来时重新取一次
 onViewChange((name) => {

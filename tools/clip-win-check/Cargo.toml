@@ -1,0 +1,32 @@
+[package]
+name = "clip-win-check"
+version = "0.0.0"
+edition = "2021"
+
+# 只在 mac 上给 clip.rs 的 Windows 分支做类型检查的壳工程，不参与打包与 CI。
+# 跑法（共享正式工程的 target 目录重用已编依赖）：
+#   cd tools/clip-win-check
+#   CARGO_TARGET_DIR=../../src-tauri/target cargo check --target x86_64-pc-windows-msvc --lib
+#
+# 只是个类型检查用的壳工程：不参与正式构建。
+# 空 workspace 声明防止 cargo 把它并进上级工作区。
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+tauri = { version = "2", features = ["devtools"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_System_Com",
+  "Win32_System_DataExchange",
+  "Win32_System_Memory",
+  "Win32_System_Ole",
+  "Win32_UI_Shell",
+] }

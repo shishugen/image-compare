@@ -5,6 +5,7 @@ use std::sync::Mutex;
 use tauri::{Emitter, Manager};
 use tauri_plugin_dialog::DialogExt;
 
+mod clip;
 mod favorites;
 mod http;
 mod net;
@@ -199,6 +200,12 @@ pub fn run() {
 
             // 局域网收发 + 收藏：状态放 Arc 里，后台线程与命令共享同一份
             let store = net::prepare_store(&app.handle().clone())?;
+            // 早期版本把收件箱消息的路径截断过，前端每次展开都会报“缩略图读取失败”，
+            // 所以在前端首次读消息之前先顺手把真身找回（只在路径对不上时动手，平时无感）
+            let repaired = store.repair_inbox_paths();
+            if repaired > 0 {
+                eprintln!("[store] 启动时修好了 {repaired} 条失效的收件箱路径");
+            }
             let hub = net::start(&app.handle().clone(), store.clone())?;
             app.manage(store);
             app.manage(hub);
@@ -209,6 +216,8 @@ pub fn run() {
             read_image,
             take_pending_paths,
             copy_text,
+            clip::paste_paths,
+            clip::copy_as_file,
             net::net_status,
             net::send_text,
             net::send_paths,

@@ -2,4 +2,7 @@ node_modules
 dist
 src-tauri/target
 src-tauri/gen
+# 壳工程自己不做发版，锁文件与产物不进仓库
+tools/clip-win-check/Cargo.lock
+tools/clip-win-check/target
 .DS_Store

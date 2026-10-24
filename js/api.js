@@ -10,6 +10,13 @@ export const isTauriRuntime = typeof window.__TAURI__ !== "undefined";
 
 export const el = (id) => document.getElementById(id);
 
+/**
+ * 算“图片”的扩展名。三个视图都用这一份：之前各自写了一份，
+ * 三份正则还不一样（transfer 有 svg、compare 有 tiff、favorites 两个都没），
+ * 同一张图在三个视图里会被归到不同类。这里是并集。
+ */
+export const IMAGE_EXT = /\.(png|jpe?g|gif|webp|bmp|avif|svg|tiff?)$/i;
+
 /** 发命令：非 Tauri 环境（纯浏览器里打开 js/index.html 调试）直接抛错，让调用方兜底 */
 export async function invoke(cmd, args) {
   if (!isTauriRuntime) throw new Error(`非 Tauri 环境，无法调用 ${cmd}`);
@@ -215,6 +222,117 @@ export async function sendPathsToPeer(paths) {
     toast(errText(err), "error");
     return false;
   }
+}
+
+/**
+ * 把本机文件/文件夹写进系统剪贴板，行为跟微信自己的复制一致：
+ * 剪贴板里同时有「文件」和「图片位图」两味 —— 粘进微信聊天框 / Word / 邮件正文
+ * 就是图片本身，粘进 Finder / 邮件附件区仍是那个文件。
+ * 位图那味由后端判：只单项且解得出位图才挂，非图片自动退化成纯文件。
+ * 参数可以是单个路径也可以是路径数组（对比视图一次把两张图都带上，那就是纯文件形式）。
+ */
+export async function copyPathAsFile(paths) {
+  const list = (Array.isArray(paths) ? paths : [paths]).filter(Boolean);
+  if (!list.length) {
+    toast("这条记录还没有本机路径，复制不了", "error");
+    return false;
+  }
+  try {
+    await invoke("copy_as_file", { paths: list });
+    toast(
+      list.length > 1
+        ? `已复制 ${list.length} 项文件，可直接粘`
+        : "已复制，粘进微信 / Word 就是图片，粘进 Finder 是文件"
+    );
+    return true;
+  } catch (err) {
+    toast(errText(err), "error");
+    return false;
+  }
+}
+
+/* --------------------------------------------------------------------------
+ * 粘贴：和拖拽共用一条下游，只是来源换成系统剪贴板
+ *
+ * 为什么不在这里读 clipboardData：WKWebView 递出来的 File 是 0 字节（本文件顶部
+ * 与 lib.rs 的注释都记着这条踩坑），paste 事件同样只有名字和类型。所以真正的读取
+ * 在 Rust 侧 clip.rs：剪贴板里是文件就给原路径，是位图（截图）就落到 pastebox/
+ * 当成文件。拿到路径后交给 routeDrop，三个视图各自的落点逻辑一行都不用改。
+ * ------------------------------------------------------------------------ */
+const pasteTextHandlers = {}; // 视图名 -> (text) => void
+let lastPasteAt = 0; // keydown 与 paste 两条入口的去重时间戳
+
+export function registerPasteTextHandler(viewName, fn) {
+  pasteTextHandlers[viewName] = fn;
+}
+
+const EDITABLE_TAGS = new Set(["INPUT", "TEXTAREA", "SELECT"]);
+
+function isEditable(node) {
+  if (!node || !node.tagName) return false;
+  return EDITABLE_TAGS.has(node.tagName) || node.isContentEditable === true;
+}
+
+/** 剪贴板里带文件/图片时，就算焦点在输入框也要走文件这条路（像微信里粘截图） */
+function hasBinaryFlavor(ev) {
+  const types = ev?.clipboardData?.types;
+  if (!types || !types.length) return false;
+  return Array.from(types).some(
+    (t) => t === "Files" || t === "text/uri-list" || /png|tiff|bmp|jpeg|gif|image/i.test(t)
+  );
+}
+
+async function runPaste(text) {
+  let paths;
+  try {
+    paths = await invoke("paste_paths");
+  } catch (err) {
+    // 剪贴板里是纯文字：当前视图接了就走它的说法，否则老实地告诉用户
+    const t = (text || "").trim();
+    const fn = pasteTextHandlers[currentView()];
+    if (t && fn) {
+      fn(t);
+      return;
+    }
+    toast(errText(err), "error");
+    return;
+  }
+  if (!paths || !paths.length) {
+    toast("剪贴板里没有文件或图片", "error");
+    return;
+  }
+  if (!routeDrop(paths)) toast("当前视图不接收文件，请切到对比或传输视图", "error");
+}
+
+function handlePasteEvent(ev) {
+  // 输入框里粘纯文字交给浏览器自己，抢过来只会把用户习惯打断
+  if (isEditable(ev.target) && !hasBinaryFlavor(ev)) return;
+  if (Date.now() - lastPasteAt < 500) return;
+  lastPasteAt = Date.now();
+  let text = "";
+  try {
+    text = ev.clipboardData?.getData("text/plain") || "";
+  } catch (err) {
+    console.warn("[paste] 读文字失败:", err);
+  }
+  ev.preventDefault();
+  runPaste(text).catch((err) => console.error("[paste] 失败:", err));
+}
+
+/**
+ * 装一次就好（main.js 入口处调）。
+ * keydown 是兜底：焦点不在任何可编辑元素上时 WebKit 不一定把 paste 派发到页面，
+ * 但按键一定能到；两条入口靠 lastPasteAt 去重，不会粘两遍。
+ */
+export function installPasteListener() {
+  document.addEventListener("paste", (ev) => handlePasteEvent(ev), true);
+  window.addEventListener("keydown", (ev) => {
+    if (!(ev.metaKey || ev.ctrlKey) || ev.altKey || (ev.key || "").toLowerCase() !== "v") return;
+    if (isEditable(ev.target)) return;
+    if (Date.now() - lastPasteAt < 500) return;
+    lastPasteAt = Date.now();
+    runPaste("").catch((err) => console.error("[paste] 失败:", err));
+  });
 }
 
 /* --------------------------------------------------------------------------

@@ -1820,6 +1820,8 @@ dependencies = [
  "base64 0.22.1",
  "hostname",
  "mdns-sd",
+ "objc2",
+ "objc2-foundation",
  "serde",
  "serde_json",
  "sha2 0.11.1",
@@ -1830,6 +1832,7 @@ dependencies = [
  "tiny_http",
  "tokio",
  "uuid",
+ "windows",
 ]
 
 [[package]]

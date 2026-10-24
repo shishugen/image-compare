@@ -26,6 +26,25 @@ tiny_http = "0.12"
 sha2 = "0.11"
 uuid = { version = "1", features = ["v4"] }
 hostname = "0.4"
-# 只用来做前端复制的最后一道兜底（WebView 拦下 clipboard API 时），不需要图片能力，
+# 只用来做前端文字复制的最后一道兜底（WebView 拦下 clipboard API 时），不需要图片能力，
 # 关掉默认特性可以避免拖进整套 image 解码依赖
 arboard = { version = "3", default-features = false }
+
+# 系统剪贴板读写（粘贴文件/图片、作为文件复制）——两个都已在依赖树里
+# （tauri / wry 自己带的），加直接依赖不会引入新 crate
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSArray", "NSString", "NSData"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = {
+  version = "0.62",
+  features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_UI_Shell",
+  ],
+}

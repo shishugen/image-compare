@@ -10,8 +10,11 @@
  * ========================================================================== */
 
 import {
+  copyPathAsFile,
   currentView,
   el,
+  errText,
+  IMAGE_EXT,
   invoke,
   isTauriRuntime,
   onViewChange,
@@ -20,6 +23,7 @@ import {
   routeDrop,
   routeDropHover,
   setStatus,
+  toast,
 } from "./api.js";
 
 const MIN_SCALE = 0.25;
@@ -61,7 +65,7 @@ class Pane {
     // 视图状态：scale 为倍率，x/y 为图片左上角相对视口左上角的位移（CSS 像素）
     this.st = { scale: 1, x: 0, y: 0 };
     this.natural = { w: 0, h: 0 };
-    this.meta = null; // { name, size }
+    this.meta = null; // { name, size, path }
     this.loaded = false;
   }
 
@@ -76,13 +80,13 @@ class Pane {
     this.img.style.imageRendering = scale >= 2 ? "pixelated" : "auto";
   }
 
-  /** 载入图片并适应窗口 */
-  async setImage({ dataUrl, name, size, natural }) {
+  /** 载入图片并适应窗口；path 是本机原路径，没有它就不能「作为文件复制」 */
+  async setImage({ dataUrl, name, size, natural, path }) {
     this.img.src = dataUrl;
     this.natural = natural;
     this.img.style.width = natural.w + "px";
     this.img.style.height = natural.h + "px";
-    this.meta = { name, size };
+    this.meta = { name, size, path };
     this.loaded = true;
     this.root.classList.add("has-image");
     this.tagName.textContent = name || this.key.toUpperCase();
@@ -220,6 +224,9 @@ function setGridMode(on) {
  * 全局控制状态
  * ------------------------------------------------------------------------ */
 let activePane = panes.a; // 工具栏操作的目标窗（独立模式下生效）
+// 用户明确点过哪个窗格：⌘V 就该进这个。和 activePane 分开记 ——
+// assign() 也会改 activePane，光靠它分不清“用户选的”还是“刚被自动铺上的”
+let panePicked = null;
 const isSync = () => ui.syncChk.checked;
 
 /** 把来源窗的状态复制给其它所有可见窗（同步模式） */
@@ -313,6 +320,8 @@ async function loadPathIntoPane(pane, path) {
     name: payload.name,
     size: payload.size,
     natural,
+    // 后端回的路径才是读过盘的那个，回不上就用人传进去的
+    path: payload.path || path,
   });
 }
 
@@ -384,6 +393,34 @@ async function openImages(targetKey) {
   } finally {
     openInFlight = false;
   }
+}
+
+// 图窗只收图片：剪贴板里是 zip/pdf 之类时不该硬塞进去报「载入失败」，
+// 而是退回让用户自己选文件，所以这里不用 routeDrop 而是自己筛一遍扩展名
+// （IMAGE_EXT 从 api.js 导，三个视图共用一份口径）
+
+/**
+ * 把剪贴板里的图片直接装进指定图窗（单击空窗的第一选择）。
+ * 读剪贴板只能在后端做（WKWebView 的 paste 事件拿不到内容，见 clip.rs），
+ * 返回的是路径，下游与拖拽完全一样。
+ * @returns {Promise<boolean>} 粘到了就 true；剪贴板里没图片就 false 且不弹任何提示
+ */
+async function pasteIntoPane(pane) {
+  let paths;
+  try {
+    paths = await invoke("paste_paths");
+  } catch (err) {
+    console.log("[open] 剪贴板里没有可粘的内容（%s），改用文件选择", errText(err));
+    return false;
+  }
+  const images = (paths || []).filter((p) => IMAGE_EXT.test(p));
+  if (!images.length) {
+    console.log("[open] 剪贴板里没有图片（共 %d 项），改用文件选择", paths?.length || 0);
+    return false;
+  }
+  // 重复粘同一份内容时后端会复用同一个文件，不再多落一份
+  await fillPanes(images, pane.key);
+  return true;
 }
 
 ui.picker.addEventListener("change", () => {
@@ -469,14 +506,20 @@ for (const pane of Object.values(panes)) {
   vp.addEventListener("pointercancel", endDrag);
   vp.addEventListener("pointerleave", () => (ui.stPos.textContent = "—"));
 
-  // 空窗单击即弹文件选择；拖拽过（位移 > 6px）不算单击
+  // 空窗单击 = 直接把剪贴板里的图粘进来；剪贴板没接住才退回文件选择框。
+  // 拖拽过（位移 > 6px）不算单击
   vp.addEventListener("click", (ev) => {
-    if (pane.loaded) return;
     if (!lastDown) return;
     const moved = Math.abs(ev.clientX - lastDown.x) + Math.abs(ev.clientY - lastDown.y);
     if (moved > 6) return;
     activePane = pane;
-    openImages(pane.key);
+    setPicked(pane);
+    // 已有图的窗格：单击只做「选中」，换图交给 ⌘V（之前这里直接 return，
+    // 连选中都不记，于是一次 ⌘V 又铺到第一个空窗去了）
+    if (pane.loaded) return;
+    pasteIntoPane(pane).then((ok) => {
+      if (!ok) openImages(pane.key);
+    });
   });
 
   // 双击 = 适应窗口 / 100% 互切（空窗由上面的单击接管，此处不再处理）
@@ -616,9 +659,28 @@ if (isTauriRuntime) {
 }
 
 // 别的视图（收到的图片、收藏里的路径）请求在对比里打开
-registerOpenHandler("compare", (paths) => fillPanes(paths));
-// 当前视图是「对比」时，拖进来的文件按落点窗进图窗
-registerDropHandler("compare", (paths, paneKey) => fillPanes(paths, paneKey || null));
+registerOpenHandler("compare", (paths) => fillPanes(paths, pasteTargetKey()));
+// 当前视图是「对比」时，拖进来的文件按落点窗进图窗；
+// 没有落点（全局 ⌘V 走的就是这条）时认当前活动窗格，而不是永远从 A 开始铺
+registerDropHandler("compare", (paths, paneKey) =>
+  fillPanes(paths, paneKey || pasteTargetKey())
+);
+
+/**
+ * 全局粘贴（⌘V）该进哪个窗格：用户点过的那个。
+ * 点过了就**照进**，哪怕它已经有图（把那张换掉就是用户点的意图）；
+ * 没点过、或点的那个已被布局切走时，退回“活动窗格空着就给它，否则找第一个空窗”。
+ */
+function pasteTargetKey() {
+  if (panePicked && visiblePanes().includes(panePicked)) return panePicked.key;
+  return activePane && !activePane.loaded ? activePane.key : null;
+}
+
+/** 记下选中的窗格，并描一圈边 —— 不描的话“下一次粘贴会进哪儿”完全看不出来 */
+function setPicked(pane) {
+  panePicked = pane;
+  for (const key of PANE_KEYS) panes[key].viewport.classList.toggle("is-picked", panes[key] === pane);
+}
 
 /* --------------------------------------------------------------------------
  * 工具栏
@@ -727,6 +789,14 @@ document.querySelectorAll(".tag-close").forEach((btn) => {
  * ------------------------------------------------------------------------ */
 const EDITABLE = new Set(["INPUT", "TEXTAREA", "SELECT"]);
 
+/** ⌘C 该带上哪几张：同步模式把所有已载入的窗一起拿，否则只拿当前活动窗 */
+function copyTargets() {
+  const pool = isSync()
+    ? visiblePanes().filter((p) => p.loaded)
+    : [activePane].filter((p) => p.loaded);
+  return pool.map((p) => p.meta?.path).filter(Boolean);
+}
+
 window.addEventListener("keydown", (ev) => {
   if (currentView() !== "compare") return;
   const t = ev.target;
@@ -738,6 +808,16 @@ window.addEventListener("keydown", (ev) => {
   if (meta && key === "o") {
     ev.preventDefault();
     openImages(null);
+    return;
+  }
+  if (meta && key === "c") {
+    const paths = copyTargets();
+    if (!paths.length) {
+      toast("当前图没有本机路径，没法作为文件复制", "error");
+      return;
+    }
+    ev.preventDefault();
+    copyPathAsFile(paths);
     return;
   }
   if (meta) return; // 交给系统快捷键（如 ⌘W / ⌘F）

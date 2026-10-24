@@ -6,18 +6,21 @@
  * ========================================================================== */
 
 import {
+  copyPathAsFile,
   copyText,
   currentView,
   el,
   errText,
   fmtSize,
   fmtTime,
+  IMAGE_EXT,
   invoke,
   isTauriRuntime,
   listen,
   openInCompare,
   registerDropHandler,
   registerDropHoverHandler,
+  registerPasteTextHandler,
   setStatus,
   toast,
 } from "./api.js";
@@ -41,6 +44,7 @@ const ui = {
   btnSettings: el("btn-xfer-settings"),
   dropHint: el("xfer-drop-hint"),
   dropText: el("xfer-drop-text"),
+  older: el("xfer-older"),
   search: el("xfer-search"),
   chips: el("xfer-chips"),
   filterCount: el("xfer-filter-count"),
@@ -57,9 +61,17 @@ const state = {
   sending: false,
   /** 当前搜索条件：kind 为 all/text/image/folder/archive/other，q 为关键词 */
   filter: { kind: "all", q: "" },
+  /** 已铺到最早那一条的 id，往前翻页的游标（用 id 不用条数：中间来新消息也不会串页） */
+  oldestId: null,
+  /** 历史里比游标更早的还有没有 */
+  hasMore: true,
+  loadingOlder: false,
 };
 
-const IMAGE_EXT = /\.(png|jpe?g|webp|gif|bmp|avif|svg)$/i;
+// IMAGE_EXT 从 api.js 导，三个视图共用一份口径
+
+/** 一次铺多少条：跟微信一样先只看最近这几条，滚到顶再往前翻页 */
+const PAGE = 10;
 /** 压缩包单独一类：收发列表里它们和文档最容易混，按微信的习惯也是分开显示的 */
 const ARCHIVE_EXT = /\.(zip|rar|7z|tar|gz|tgz|bz2|xz|zst|jar|apk|iso)$/i;
 /** 缩略图自动读盘的上限：超过它就先占位，点一下才走 IPC，铺历史时不会一次拽几十张图 */
@@ -256,6 +268,8 @@ function attachActions(rec, m) {
   const isImage = m.kind === "file" && IMAGE_EXT.test(m.name || "");
   const list = [
     ["另存为", () => saveAs(m.path)],
+    // 「复制」是写到系统剪贴板（文件形式），不是复制一份文件
+    ["复制", () => copyPathAsFile(m.path)],
     ["打开位置", () => invoke("reveal_in_folder", { path: m.path }).catch((e) => toast(errText(e), "error"))],
   ];
   if (isImage) list.push(["在对比中打开", () => openInCompare([m.path])]);
@@ -268,6 +282,9 @@ function attachActions(rec, m) {
  * 图不走网络也不走 asset: 协议：直接复用对比视图已有的 read_image 命令拿 base64
  * data URL，CSP 的 img-src 早就允许 data:，所以不用新增任何权限或改 CSP。
  * ------------------------------------------------------------------------ */
+
+/** 放大层当前那张图的本机路径，给 ⌘C 用（离开放大层就清掉） */
+let lightboxPath = null;
 
 /** 只有带本机路径的图片才出预览；接收中的占位气泡没 path，等 xfer-done 补上再调一次 */
 function attachThumb(rec, m) {
@@ -337,6 +354,7 @@ function paintThumb(rec, dataUrl) {
 }
 
 function openLightbox(dataUrl, name, p) {
+  lightboxPath = p || null;
   ui.lightboxImg.src = dataUrl;
   ui.lightboxImg.alt = name || "";
   ui.lightboxCap.textContent = [name, p].filter(Boolean).join(" · ");
@@ -344,6 +362,7 @@ function openLightbox(dataUrl, name, p) {
 }
 
 function closeLightbox() {
+  lightboxPath = null;
   if (ui.lightbox.hidden) return;
   ui.lightbox.hidden = true;
   // 去掉 src 让 webview 立刻释放解码后的大图内存
@@ -371,15 +390,20 @@ function paintMeta(rec, m) {
   rec.el.classList.toggle("is-sending", rec.state === "sending");
 }
 
-/** 追加或原地更新一条消息（同 id 的多次状态更新只重画一次气泡） */
-function upsertMessage(m) {
+/**
+ * 追加或原地更新一条消息（同 id 的多次状态更新只重画一次气泡）。
+ * `anchor` 非空时插在这个元素之前：往前翻历史要把更早的铺到最上面，
+ * 同一页按「旧的在前」依次插到同一个锚点前，顺序自然就是对的。
+ */
+function upsertMessage(m, anchor = null) {
   if (!m || !m.id) return;
   const atBottom = isNearBottom();
   let rec = state.bubbles.get(m.id);
   if (!rec) {
     rec = buildBubble(m);
     state.bubbles.set(m.id, rec);
-    ui.stream.appendChild(rec.el);
+    if (anchor && anchor.parentNode === ui.stream) ui.stream.insertBefore(rec.el, anchor);
+    else ui.stream.appendChild(rec.el);
   }
   rec.state = m.state || rec.state;
   // 累计一份最新的消息快照：搜索与类型归类都只读它，
@@ -415,13 +439,20 @@ function scrollBottom() {
 async function loadHistory() {
   if (!isTauriRuntime) return;
   try {
-    const list = await invoke("msg_history", { limit: 500 });
+    // 首屏只拉最近 PAGE 条（跟微信一样先看到最新的），更早的靠滚到顶/点顶栏补
+    const list = await invoke("msg_history", { limit: PAGE });
     ui.stream.textContent = "";
     state.bubbles.clear();
-    for (const m of list || []) upsertMessage(m);
+    state.oldestId = null;
+    for (const m of list || []) {
+      upsertMessage(m);
+      if (!state.oldestId) state.oldestId = m.id; // 列表旧的在前，第一条即最老
+    }
+    state.hasMore = (list || []).length >= PAGE;
     if (!state.bubbles.size) {
       ui.stream.innerHTML = `<div class="stream-empty">还没有消息。把文件拖进来，或选中文字收藏前先发一条。</div>`;
     }
+    renderOlderBar();
     // 重铺历史后把当前搜索条件再应用一次（applyFilter 会自己滚到底）
     applyFilter();
     if (!filterActive()) scrollBottom();
@@ -429,6 +460,58 @@ async function loadHistory() {
     console.error("[xfer] 读历史失败:", err);
     setStatus("读历史失败: " + errText(err));
   }
+}
+
+/** 往前补一页：铺完要把滚动位置接回去，否则视口会被新内容顶到最早那条上 */
+async function loadOlder() {
+  if (!isTauriRuntime || state.loadingOlder || !state.hasMore || !state.oldestId) return;
+  state.loadingOlder = true;
+  setOlderBarText("正在加载更早的消息…");
+  const h0 = ui.stream.scrollHeight;
+  const t0 = ui.stream.scrollTop;
+  try {
+    const list = await invoke("msg_history", { limit: PAGE, before: state.oldestId });
+    if (!list || !list.length) {
+      state.hasMore = false;
+      return;
+    }
+    // 当前最老那条气泡（用 .msg 而不是 firstElementChild，避开「还没有消息」那句占位）
+    const anchor = ui.stream.querySelector(".msg");
+    for (const m of list) {
+      upsertMessage(m, anchor);
+      state.oldestId = m.id; // 列表旧的在前，最后一条就是新的最老游标
+    }
+    state.hasMore = list.length >= PAGE;
+    applyFilter();
+    // 往上加了内容，得把多出来的高度补回 scrollTop，视口才能停在原来那几条上
+    ui.stream.scrollTop = ui.stream.scrollHeight - h0 + t0;
+  } catch (err) {
+    console.error("[xfer] 加载更早的消息失败:", err);
+    setStatus("加载更早的消息失败: " + errText(err));
+  } finally {
+    state.loadingOlder = false;
+    renderOlderBar();
+  }
+}
+
+function setOlderBarText(text) {
+  if (ui.older) ui.older.textContent = text;
+}
+
+/**
+ * 搜索/筛选得覆盖整份历史：现在只铺了最近 10 条，
+ * 不先把早期的补进来会让人误判“没搜到”。最多翻 60 页（后端一页上限 500 条）。
+ */
+async function loadAllForSearch() {
+  let guard = 0;
+  while (state.hasMore && guard++ < 60) await loadOlder();
+}
+
+/** 没更多了就把栏收起来，免得留一个点了没反应按钮 */
+function renderOlderBar() {
+  if (!ui.older) return;
+  ui.older.hidden = !(state.hasMore && state.bubbles.size);
+  setOlderBarText("加载更早的消息");
 }
 
 function clearEmptyHint() {
@@ -439,8 +522,8 @@ function clearEmptyHint() {
 /* --------------------------------------------------------------------------
  * 搜索：按类型筛已有气泡 + 关键词搜名字/文字内容
  *
- * 只在已加载的历史（最多 500 条）里做内存筛选，不发请求也不读盘：
- * 聊天记录本来就是一次性读进来的，再加一层后端搜索只能把同一份 JSONL 重解一遍。
+ * 搜索会先把更早的历史逐页补进来（loadAllForSearch），再在内存里筛：
+ * 后端只存了一份小 JSONL，再加一层搜索接口只能把同一份文件重解一遍。
  * ------------------------------------------------------------------------ */
 
 /** 归类：文件夹看 kind，图片/压缩包看名字后缀，剩下的文件进「其他」 */
@@ -471,6 +554,8 @@ function matches(rec) {
 
 /** 全量过一遍：切类型、改关键词、以及筛选中来了新消息时调用 */
 function applyFilter() {
+  // 搜的是整份历史，不是已铺出来的那一页 —— 先把早期的拉齐再筛
+  if (filterActive() && state.hasMore && !state.loadingOlder) loadAllForSearch();
   let hit = 0;
   for (const rec of state.bubbles.values()) {
     const ok = matches(rec);
@@ -644,6 +729,15 @@ ui.btnFolder.addEventListener("click", async () => {
 // 拖文件进窗口即发送：注册给 api.js 的拖拽路由（对比视图不会走到这里）
 registerDropHandler("transfer", (paths) => sendPaths(paths));
 
+// 焦点不在输入框上时粘文字：先填到输入框让用户看一眼再发，不直接往对端推
+registerPasteTextHandler("transfer", (text) => {
+  ui.input.value = text;
+  ui.input.focus();
+  // 高度自适应绑在 input 事件上，不手动派一次会停在默认行高
+  ui.input.dispatchEvent(new Event("input"));
+  toast("已粘到输入框，Enter 发送");
+});
+
 // 拖拽悬停遮罩：像微信那样先告诉用户「松开就发」，离线时也明确拦在那里
 registerDropHoverHandler("transfer", (phase) => {
   if (!ui.dropHint) return;
@@ -670,6 +764,12 @@ if (ui.lightbox && ui.lightboxClose) {
   });
   window.addEventListener("keydown", (ev) => {
     if (ev.key === "Escape") closeLightbox();
+    // 放大状态下 ⌘C 等于「把这张图当文件复制」，不另设按钮
+    if ((ev.metaKey || ev.ctrlKey) && !ev.shiftKey && (ev.key || "").toLowerCase() === "c") {
+      if (ui.lightbox.hidden) return;
+      ev.preventDefault();
+      if (lightboxPath) copyPathAsFile(lightboxPath);
+    }
   });
 }
 
@@ -775,6 +875,12 @@ listen("xfer-progress", (p) => {
   if (isNearBottom()) scrollBottom();
 });
 listen("xfer-done", (payload) => upsertMessage(payload?.message));
+
+/* 往前翻页：滚到顶自动补一页，内容不够一屏（滚不动）时靠顶栏点一下 */
+ui.stream.addEventListener("scroll", () => {
+  if (ui.stream.scrollTop < 30) loadOlder();
+});
+if (ui.older) ui.older.addEventListener("click", loadOlder);
 
 refreshStatus();
 loadHistory();
