@@ -7,6 +7,7 @@
 
 import {
   copyText,
+  currentView,
   el,
   errText,
   fmtSize,
@@ -40,6 +41,9 @@ const ui = {
   btnSettings: el("btn-xfer-settings"),
   dropHint: el("xfer-drop-hint"),
   dropText: el("xfer-drop-text"),
+  search: el("xfer-search"),
+  chips: el("xfer-chips"),
+  filterCount: el("xfer-filter-count"),
   lightbox: el("img-lightbox"),
   lightboxImg: el("lightbox-img"),
   lightboxCap: el("lightbox-cap"),
@@ -51,9 +55,13 @@ const state = {
   /** msgId -> { el, bar, state, kind } 便于原地更新进度与状态 */
   bubbles: new Map(),
   sending: false,
+  /** 当前搜索条件：kind 为 all/text/image/folder/archive/other，q 为关键词 */
+  filter: { kind: "all", q: "" },
 };
 
 const IMAGE_EXT = /\.(png|jpe?g|webp|gif|bmp|avif|svg)$/i;
+/** 压缩包单独一类：收发列表里它们和文档最容易混，按微信的习惯也是分开显示的 */
+const ARCHIVE_EXT = /\.(zip|rar|7z|tar|gz|tgz|bz2|xz|zst|jar|apk|iso)$/i;
 /** 缩略图自动读盘的上限：超过它就先占位，点一下才走 IPC，铺历史时不会一次拽几十张图 */
 const PREVIEW_AUTO_MAX = 4 * 1024 * 1024;
 /** 硬上限：再大就不在聊天里解图，引导用「在对比中打开」（对比视图本来就是为大图设计的） */
@@ -374,6 +382,9 @@ function upsertMessage(m) {
     ui.stream.appendChild(rec.el);
   }
   rec.state = m.state || rec.state;
+  // 累计一份最新的消息快照：搜索与类型归类都只读它，
+  // 占位气泡后来才补齐的 name/path/size 也在这里落地
+  rec.msg = { ...(rec.msg || {}), ...m };
   paintMeta(rec, m);
   // 接收完成时才拿到落盘路径与真实名字/大小，逐块补上（已填过则内部直接返回）
   if (rec.fileName && m.name) {
@@ -387,6 +398,8 @@ function upsertMessage(m) {
     // 状态已终结时用满格，避免出现「已送达但进度条 98%」
     rec.bar.style.width = m.state === "sent" ? "100%" : rec.bar.style.width || "0%";
   }
+  // 正筛着的时候来了新消息，不能让它绕过筛选直接冒出来
+  if (filterActive()) applyFilter();
   if (atBottom) scrollBottom();
 }
 
@@ -409,7 +422,9 @@ async function loadHistory() {
     if (!state.bubbles.size) {
       ui.stream.innerHTML = `<div class="stream-empty">还没有消息。把文件拖进来，或选中文字收藏前先发一条。</div>`;
     }
-    scrollBottom();
+    // 重铺历史后把当前搜索条件再应用一次（applyFilter 会自己滚到底）
+    applyFilter();
+    if (!filterActive()) scrollBottom();
   } catch (err) {
     console.error("[xfer] 读历史失败:", err);
     setStatus("读历史失败: " + errText(err));
@@ -419,6 +434,79 @@ async function loadHistory() {
 function clearEmptyHint() {
   const hint = ui.stream.querySelector(".stream-empty");
   if (hint) hint.remove();
+}
+
+/* --------------------------------------------------------------------------
+ * 搜索：按类型筛已有气泡 + 关键词搜名字/文字内容
+ *
+ * 只在已加载的历史（最多 500 条）里做内存筛选，不发请求也不读盘：
+ * 聊天记录本来就是一次性读进来的，再加一层后端搜索只能把同一份 JSONL 重解一遍。
+ * ------------------------------------------------------------------------ */
+
+/** 归类：文件夹看 kind，图片/压缩包看名字后缀，剩下的文件进「其他」 */
+function classify(m) {
+  if (!m) return "other";
+  if (m.kind === "text") return "text";
+  if (m.kind === "folder") return "folder";
+  const n = m.name || "";
+  if (IMAGE_EXT.test(n)) return "image";
+  if (ARCHIVE_EXT.test(n)) return "archive";
+  return "other";
+}
+
+function filterActive() {
+  return state.filter.kind !== "all" || !!state.filter.q;
+}
+
+function matches(rec) {
+  const m = rec.msg;
+  if (!m) return true;
+  const f = state.filter;
+  if (f.kind !== "all" && classify(m) !== f.kind) return false;
+  if (!f.q) return true;
+  // 文字消息搜正文，文件/文件夹搜名字（path 不搜：太长且容易误命中目录部分）
+  const hay = `${m.name || ""} ${m.text || ""}`.toLowerCase();
+  return hay.includes(f.q);
+}
+
+/** 全量过一遍：切类型、改关键词、以及筛选中来了新消息时调用 */
+function applyFilter() {
+  let hit = 0;
+  for (const rec of state.bubbles.values()) {
+    const ok = matches(rec);
+    rec.el.classList.toggle("is-filtered", !ok);
+    if (ok) hit++;
+  }
+  renderFilterCount(hit);
+  renderFilterEmpty(hit);
+  // 筛完剩下的往往都在上面，不滚一次的话视口会停在刚被藏起来的那片空白里
+  if (hit) scrollBottom();
+}
+
+function renderFilterCount(hit) {
+  const box = ui.filterCount;
+  if (!box) return;
+  if (!filterActive()) {
+    box.hidden = true;
+    return;
+  }
+  box.hidden = false;
+  box.textContent = `匹配 ${hit} / ${state.bubbles.size}`;
+}
+
+/** 一条都不剩时给句话，否则整个流是空白的，看起来像程序坏了 */
+function renderFilterEmpty(hit) {
+  let hint = ui.stream.querySelector(".filter-empty");
+  if (hit === 0 && state.bubbles.size > 0) {
+    if (!hint) {
+      hint = document.createElement("div");
+      hint.className = "filter-empty";
+      ui.stream.appendChild(hint);
+    }
+    hint.textContent = "没有符合条件的消息（只搜本机已加载的历史，不含对端）";
+  } else if (hint) {
+    hint.remove();
+  }
 }
 
 /* --------------------------------------------------------------------------
@@ -611,6 +699,42 @@ ui.btnReprobe.addEventListener("click", async () => {
 });
 ui.btnSettings.addEventListener("click", () => {
   ui.settings.classList.toggle("is-open");
+});
+
+/* 搜索：输入就筛。不加防抖——纯内存遍历几百个气泡，比等防抖窗口更快出结果 */
+if (ui.search) {
+  ui.search.addEventListener("input", () => {
+    state.filter.q = ui.search.value.trim().toLowerCase();
+    applyFilter();
+  });
+}
+
+// 类型 chip 单选，点「全部」等于清掉类型条件
+if (ui.chips) {
+  ui.chips.addEventListener("click", (ev) => {
+    const btn = ev.target.closest(".chip");
+    if (!btn || !ui.chips.contains(btn)) return;
+    state.filter.kind = btn.dataset.kind || "all";
+    for (const b of ui.chips.querySelectorAll(".chip")) b.classList.toggle("is-on", b === btn);
+    applyFilter();
+  });
+}
+
+// ⌘F/Ctrl+F 直跳搜索框；Esc 在搜索框里是清空并交还焦点，不抢其它地方的 Esc（比如关掉放大层）
+window.addEventListener("keydown", (ev) => {
+  if (currentView() !== "transfer" || !ui.search) return;
+  if ((ev.metaKey || ev.ctrlKey) && !ev.altKey && ev.key.toLowerCase() === "f") {
+    ev.preventDefault();
+    ui.search.focus();
+    ui.search.select();
+    return;
+  }
+  if (ev.key === "Escape" && document.activeElement === ui.search) {
+    ui.search.value = "";
+    state.filter.q = "";
+    applyFilter();
+    ui.search.blur();
+  }
 });
 
 // 抽屉内部的收起入口（收藏夹抽屉同样用这套 data 属性）

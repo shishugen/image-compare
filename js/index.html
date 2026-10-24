@@ -168,6 +168,26 @@
             </header>
 
             <div class="panel-body">
+              <!-- 搜索条：按类型筛历史气泡 + 关键词搜名字/文字内容（⌘F 直接跳进来） -->
+              <div class="filter-bar" id="xfer-filter">
+                <input
+                  id="xfer-search"
+                  class="input xfer-search"
+                  type="search"
+                  placeholder="搜名字或文字内容，Esc 清空"
+                  title="在已加载的历史里筛选，不发请求"
+                />
+                <div class="chip-row" id="xfer-chips">
+                  <button class="chip is-on" data-kind="all">全部</button>
+                  <button class="chip" data-kind="text">文字</button>
+                  <button class="chip" data-kind="image">图片</button>
+                  <button class="chip" data-kind="folder">文件夹</button>
+                  <button class="chip" data-kind="archive">压缩包</button>
+                  <button class="chip" data-kind="other">其他文件</button>
+                </div>
+                <span class="filter-count dim" id="xfer-filter-count" hidden></span>
+              </div>
+
               <!-- 消息流：文字气泡 + 文件/文件夹气泡（名称、大小、进度、打开位置） -->
               <div class="stream" id="xfer-stream"></div>
 
@@ -175,7 +195,7 @@
                 <textarea
                   id="xfer-input"
                   class="input compose-input"
-                  rows="1"
+                  rows="2"
                   placeholder="写点什么，Enter 发送、Shift+Enter 换行；把文件拖进窗口即发送"
                 ></textarea>
                 <button id="btn-xfer-send" class="btn btn-primary" disabled title="对端离线时不可发送">发送</button>

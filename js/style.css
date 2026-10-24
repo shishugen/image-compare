@@ -1171,3 +1171,66 @@ textarea,
   color: var(--text-dim);
   font-size: 12px;
 }
+
+/* ==========================================================================
+ * 传输视图搜索条：按类型筛 + 关键词搜
+ * ========================================================================== */
+.filter-bar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-panel);
+}
+
+/* 不给 flex:1，否则窄窗口里输入框会把 chips 挤到换行、把消息流顶下去 */
+.xfer-search {
+  flex: 0 1 220px;
+  height: 26px;
+}
+
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+.chip {
+  padding: 2px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: #1b1e24;
+  color: var(--text-dim);
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.chip:hover {
+  color: var(--text);
+}
+
+.chip.is-on {
+  border-color: var(--accent);
+  background: rgba(76, 141, 255, 0.16);
+  color: var(--accent);
+}
+
+.filter-count {
+  flex: 0 0 auto;
+}
+
+/* 没命中的气泡直接不占位：用 opacity 藏的话滚到底部时它还算高度，会留一大片空白 */
+.msg.is-filtered {
+  display: none;
+}
+
+.filter-empty {
+  margin: auto;
+  padding: 24px;
+  color: var(--text-dim);
+  text-align: center;
+}
