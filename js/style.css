@@ -192,7 +192,189 @@ body {
   color: var(--text);
 }
 
+/* 单图布局下「同步」没有作用：开关是真 input 藏在 label 里的，:disabled 什么都看不出来，
+   所以由 refreshLayoutUI() 给外层 label 挂这个类（连 pointer-events 一起断掉，
+   免得不点开关而点 label 上的文字还是能切） */
+.switch.is-disabled {
+  opacity: 0.4;
+  cursor: default;
+  pointer-events: none;
+}
+
 /* ---------- 对比主区 ---------- */
+/* 侧栏 + stage 并排。侧栏得是 stage 的兄弟（见 index.html 里那段注释），
+   所以多包一层来扛 flex，分隔条那套按 stage 宽度算百分比的逻辑一行不动 */
+.cmp-body {
+  flex: 1 1 auto;
+  display: flex;
+  min-height: 0;
+  min-width: 0;
+  /* 设置抽屉靠绝对定位住在这里（跟传输视图的 .panel-body 一个路子） */
+  position: relative;
+}
+
+/* 文件夹浏览侧栏：靠 [hidden] 的统一规则收起（不要再写高优先级的 display） */
+.filmstrip {
+  flex: 0 0 190px;
+  /* 这句才是重点：flex item 默认 min-width:auto，而下面 .fs-name 是 nowrap 的，
+     于是整个侧栏的自动最小尺寸 = 最长那条名字不换行的宽度，190px 根本按不住（实际会撑到几百 px）。
+     不补这一句，前面那个 190px 与后面的名字裁多长都是白做 */
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--bg-panel);
+  border-right: 1px solid var(--border);
+  /* 侧栏的焦点框按用户要求拆掉了（原先是一条 focus-visible 的描边规则）。
+     这里必须显式写 none 而不是只删那条规则 —— 侧栏自带 tabindex=0，
+     点行与 Tab 进来都会走 focusStrip() 的程序化 focus()，
+     光拆规则只会让 UA 默认焦点环冒出来，换汤不换药 */
+  outline: none;
+}
+
+.fs-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.fs-dir {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-weight: 600;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.fs-count {
+  flex: 0 0 auto;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+.fs-close {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.fs-close:hover {
+  background: #434854;
+  color: #fff;
+}
+
+/* 无列表 / 目录读不了时的说明 */
+.fs-tip {
+  flex: 0 0 auto;
+  margin: 6px 8px;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+.fs-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.fs-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px 3px 6px;
+  cursor: pointer;
+  border-left: 2px solid transparent;
+}
+
+.fs-row:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.fs-row.is-current {
+  background: rgba(76, 141, 255, 0.14);
+  border-left-color: var(--accent);
+}
+
+/* 键盘选中行（侧栏拿到焦点时 ↑↓ 移动的就是它）：不再画框。
+   ↑↓ 现在是「选中哪行就显示哪一张」，is-sel 与 is-current 永远落在同一行，
+   上面那层底色 + 左侧竖条已经把这一行标出来了，再套一圈就是重复描边（用户要求拆掉）。
+   类名仍挂在 DOM 上，自检与 devtools 靠它读「选中在哪一行」 */
+
+/* 读失败（文件被移走/改名）：标灰不隐藏，否则用户会以为列表漏了 */
+.fs-row.is-bad {
+  color: var(--text-dim);
+  opacity: 0.55;
+}
+
+.fs-no {
+  flex: 0 0 auto;
+  width: 22px;
+  text-align: right;
+  color: var(--text-dim);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 小图位：项目不引 image 依赖，Rust 侧出不了真缩略图，
+   所以这里拿整图 data URL 由 CSS 缩到 40px，同时解码的张数卡得很死 */
+.fs-thumb {
+  flex: 0 0 40px;
+  width: 40px;
+  height: 40px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-pane);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+.fs-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.fs-thumb-pending {
+  font-size: 9px;
+  color: var(--text-dim);
+}
+
+.fs-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.fs-name {
+  /* 12px 而不是继承的 13px：名称列在 190px 侧栏里只剩 ~102px（扣掉 padding、序号、小图与两个 gap），
+     shortName() 裁到 16 字符刚好放进去；留在 13px 会被下面那句末尾省略号再补一刀，
+     恰好把中间裁切想保住的扩展名砍掉 */
+  font-size: 12px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.fs-size {
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
 .stage {
   flex: 1 1 auto;
   display: flex;
@@ -205,12 +387,16 @@ body {
   flex: 1 1 50%;
   min-width: 0;
   display: flex;
+  /* 竖向：上面是画面（.viewport），底下是这个窗自己的信息行（.pane-foot）。
+     .pane-tag 是绝对定位，不参与这条轴 */
+  flex-direction: column;
 }
 
 .viewport {
   position: relative;
   flex: 1 1 auto;
   min-width: 0;
+  min-height: 0; /* 竖向布局下让画面能被底下一行挤回去，而不是把信息行顶出窗外 */
   overflow: hidden;
   background: var(--bg-pane);
   background-image: linear-gradient(45deg, #191b20 25%, transparent 25%),
@@ -231,11 +417,9 @@ body {
   cursor: pointer;
 }
 
-/* 选中的窗格：⌘V 会进的就是这一格。不描边的话根本看不出粘贴会落在哪 */
-.viewport.is-picked {
-  outline: 2px solid var(--accent);
-  outline-offset: -2px;
-}
+/* 选中的窗格不再描那一圈蓝边（用户要求拆掉那个框，它压在图上太抢眼）。
+   .is-picked 这个类仍然挂着，只当 devtools 里查「下一次 ⌘V 会进哪一格」的标记用，
+   粘贴落点的真实状态在 view-compare.js 的 panePicked。 */
 
 .pane:not(.has-image) .viewport:hover .empty-icon {
   border-color: var(--accent);
@@ -318,6 +502,24 @@ body {
   display: flex;
 }
 
+/* 窗底信息行：文件名 · 分辨率 · 体积。以前这四个挤在窗口最下面那条共用状态栏里，
+   四个窗平排一行既看不全（只能裁成 2048×…）也对不上是哪个窗；搬进窗里后
+   宽度天然跟着窗走，A 的那行就在 A 图正下方，四图 2×2 下也是各自对齐自己那个格 */
+.pane-foot {
+  flex: 0 0 auto;
+  height: 20px;
+  line-height: 19px;
+  padding: 0 8px;
+  font-size: 11px;
+  color: var(--text-dim);
+  background: var(--bg-panel);
+  border-top: 1px solid var(--border);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .tag-dot {
   width: 6px;
   height: 6px;
@@ -397,15 +599,18 @@ body {
   flex: 1 1 auto;
 }
 
-.st-file {
-  max-width: 32%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
 /* ==========================================================================
- * 布局切换：两图并排（默认） / 四图 2×2 网格
- * 四图专属元素统一带 .only-grid，非网格布局下不占位
+ * 布局切换：单图（1）/ 两图并排（2、默认）/ 四图 2×2 网格（4）
+ *
+ * 显隐全靠 body 上的三个类：.layout-1 / .layout-2 / .layout-4（互斥，只有一个）。
+ * 窗体自带的两个准入类：
+ *   .only-multi  只在 2/4 图出现（B 窗）
+ *   .only-grid   只在 4 图出现（C/D 窗）
+ * 两者都不带的（A 窗）就是三档共用的部分。
+ * 工具栏不再有分窗入口（「打开 A/B/C/D」已拆），也不再列 4 图那档按钮；
+ * 四个窗的文件信息也不再住在状态栏，而是各住在自己那个窗里（.pane-foot）——
+ * 准入类如今只剩窗体自己用。
+ * 分隔条不靠类、靠 :not(.layout-2)：它只有两图并排时能拖。
  * ========================================================================== */
 
 /* 分段式布局切换按钮 */
@@ -437,24 +642,25 @@ body {
   color: #fff;
 }
 
-/* 以下规则放在文件末尾，靠文档顺序覆盖 .pane / .btn / .st-item 的 display */
-.only-grid {
+/* 以下规则放在文件末尾，靠文档顺序覆盖 .pane 的 display */
+.only-grid,
+.only-multi {
   display: none;
 }
 
-body.grid-mode .toolbar .only-grid {
-  display: inline-block;
-}
-
-body.grid-mode .statusbar .only-grid {
-  display: inline-block;
-}
-
-body.grid-mode .stage .only-grid {
+/* 三档各自把类挂到 body 上，准入条件按类组合判定；
+   不在任何一个类下的窗（只有单图模式）就是只剩 A。
+   窗里的信息行（.pane-foot）不需要准入类：窗本身藏了它跟着藏，天然同档 */
+body.layout-4 .stage .only-grid {
   display: flex;
 }
 
-body.grid-mode .stage {
+body.layout-2 .stage .only-multi {
+  display: flex;
+}
+
+/* 只有 4 图是网格；1/2 图都是 flex 横向（单图下 A 独占，自然铺满） */
+body.layout-4 .stage {
   display: grid;
   grid-template-columns: 1fr 1fr;
   grid-template-rows: 1fr 1fr;
@@ -462,25 +668,25 @@ body.grid-mode .stage {
   padding: 6px;
 }
 
-/* 网格下等分两列，分隔条无用且会占一个格子 */
-body.grid-mode .splitter {
-  display: none;
-}
-
-body.grid-mode .pane {
-  flex: none;
+/* 网格下单图与两图共用的那几条限制 */
+body.layout-2 .pane,
+body.layout-4 .pane {
   min-height: 0;
 }
 
-/* 四行文件信息平铺，不然会超出状态栏宽度 */
-body.grid-mode .st-file {
-  max-width: 21%;
+body.layout-4 .pane {
+  flex: none;
+}
+
+/* 非两图布局下分隔条无用：网格下等分两列会占一个格子，单图下只剩一个窗更没什么可拖 */
+body:not(.layout-2) .splitter {
+  display: none;
 }
 
 /* ==========================================================================
  * 多视图外壳：左侧导航 + 视图容器 + 共用状态栏
  *
- * 显隐只由 body[data-view] 决定，与上面 .grid-mode 那套互不干扰；
+ * 显隐只由 body[data-view] 决定，与上面 .layout-1/2/4 那套互不干扰；
  * 视图隐藏时内部尺寸全为 0，所以 view-compare.js 的 fit() 必须跳过隐藏态。
  * ========================================================================== */
 
@@ -657,10 +863,225 @@ textarea.input {
   min-height: 0;
 }
 
-/* 传输视图是聊天式布局：消息流在上、输入区在下，所以必须纵向排。
-   收藏视图共用 .panel-body 但要横向（树 | 列表），故只限定在传输视图。 */
+/* 传输视图左边多了一条会话栏，聊天本体改成装在 .xfer-main 里竖向排，
+   所以 .panel-body 回到默认的横向（收藏视图本来就是横向） */
 .view-transfer .panel-body {
+  flex-direction: row;
+}
+
+.xfer-main {
+  /* 抽屉与拖拽遮罩是 absolute 的，照旧贴在聊天区里，不再盖住会话栏 */
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
   flex-direction: column;
+}
+
+/* ---------- 会话栏：一台一个对话框 ---------- */
+.session-list {
+  position: relative;
+  flex: 0 0 214px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--bg-panel);
+  border-right: 1px solid var(--border);
+}
+
+.session-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.session-rows {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+}
+
+.session-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+}
+
+.session-row:hover {
+  background: var(--bg);
+}
+
+/* 当前会话沿用全站那套 .is-active 写法，不另发明一种高亮 */
+.session-row.is-active {
+  background: var(--bg);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.s-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.s-top {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.s-top b {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-weight: 600;
+}
+
+.s-time {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.s-sub {
+  font-size: 11px;
+  color: var(--text-dim);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.s-badge {
+  flex: 0 0 auto;
+  min-width: 18px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 11px;
+  line-height: 18px;
+  text-align: center;
+}
+
+.s-acts {
+  flex: 0 0 auto;
+  /* 一行只放「改名」与「删除」两个：会话栏只有 214px，按钮再多名字就没了 */
+  display: grid;
+  grid-template-columns: auto auto;
+  gap: 0 6px;
+  opacity: 0;
+}
+
+.s-acts .link-btn {
+  font-size: 11px;
+}
+
+.session-row:hover .s-acts {
+  opacity: 1;
+}
+
+/* 行内改名：直接顶掉那一行的名字，不弹系统对话框（webview 里 prompt 不一定能用） */
+.s-rename {
+  flex: 1 1 auto;
+  min-width: 0;
+  font: inherit;
+  font-weight: 600;
+  padding: 0 4px;
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  background: var(--bg-pane);
+  color: var(--text);
+  user-select: text;
+}
+
+.session-empty {
+  padding: 12px 10px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+/* 「＋ 新聊天」的弹层：把已登记的与刚发现的合成一个列表，点一下就开会话 */
+.chat-pick {
+  position: absolute;
+  top: 36px;
+  left: 8px;
+  right: 8px;
+  z-index: 6;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+}
+
+.chat-pick[hidden] {
+  display: none;
+}
+
+.pick-title {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.pick-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 240px;
+  overflow: auto;
+}
+
+.pick-list button {
+  text-align: left;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.pick-list button:hover {
+  border-color: var(--accent);
+}
+
+.pick-list button:disabled {
+  color: var(--text-dim);
+  cursor: default;
+}
+
+.pick-list button:disabled:hover {
+  border-color: var(--border);
+}
+
+/* 日期分隔线：居中一枚小药丸，与气泡同宽约束，不参与左右分栏 */
+.day-divider {
+  align-self: center;
+  margin: -2px 0;
+  padding: 1px 10px;
+  border-radius: 999px;
+  background: var(--bg-panel);
+  color: var(--text-dim);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+/* 筛着的时候日期线会变成噪声（匹配的结果本来就不连续），直接隐掉 */
+.stream.is-filtering .day-divider {
+  display: none;
 }
 
 .drawer {

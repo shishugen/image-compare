@@ -7,7 +7,8 @@
  *   - Finder / 资源管理器里复制的文件、文件夹 → 直接就是原路径，不用复制一份
  *   - 截图、微信里复制的图片 → 剪贴板里只有位图数据，落盘成文件再当文件用
  *
- * 复制出去一次挂两味（跟微信自己的复制粘贴对齐）：文件 URL + 图片位图。
+ * 复制出去一次挂两味（跟微信自己的复制粘贴对齐）：文件 URL + 图片位图，
+ * 但两味必须挤在**同一个 pasteboard item** 上（分成两个 item 时，逐项粘的应用会插两张同样的图）。
  * 粘进微信聊天框 / Word / 邮件正文拿到的是**图片本身**，粘进 Finder 仍是那个文件。
  * 位图那味只在「单项且解得出位图」时才有，非图片文件自动退化成纯文件形式。
  * ========================================================================== */
@@ -337,10 +338,10 @@ mod platform {
         format!("剪贴板图片-{}.{}", crate::store::now_ms(), ext)
     }
 
-    /// 给单个图片造一个只带 public.png 的剪贴板项目。
-    /// 解码依旧走系统的 NSBitmapImageRep（Rust 侧不引图片解码库），解不出就返回 None，
-    /// 调用方按「只有文件」处理。超过 40MB 的直接跳过：那种图转一次 PNG 的内存代价不值。
-    unsafe fn png_item(path: &str) -> Option<Retained<AnyObject>> {
+    /// 给单个图片读出 PNG 位图。解码依旧走系统的 NSBitmapImageRep（Rust 侧不引图片解码库），
+    /// 解不出就返回 None，调用方按「只有文件」处理。超过 40MB 的直接跳过：
+    /// 那种图转一次 PNG 的内存代价不值。
+    unsafe fn png_data(path: &str) -> Option<Retained<NSData>> {
         const MAX_CLIP_IMAGE_BYTES: u64 = 40 * 1024 * 1024;
         let bytes = std::fs::read(path).ok()?;
         if bytes.len() as u64 > MAX_CLIP_IMAGE_BYTES {
@@ -359,20 +360,62 @@ mod platform {
         if png.length() == 0 {
             return None;
         }
+        Some(png)
+    }
+
+    /// 造一个**同时**挂着文件 URL 与（可选）PNG 位图的 pasteboard item。
+    /// 关键是「一个 item 两味」而不是「两个 item 各一味」：writeObjects 是一个对象一个 item，
+    /// 分在两个 item 上时，逐项粘的应用（Word / 备忘录 / Keynote）会把同一张图插两次。
+    /// public.file-url 的数据口径就是文件 URL 的 absoluteString 的 UTF-8 字节（NSPasteboardTypeFileURL）。
+    unsafe fn file_item(url: &AnyObject, png: Option<&NSData>) -> Option<Retained<AnyObject>> {
         let raw: *mut AnyObject = msg_send![class!(NSPasteboardItem), alloc];
         let raw: *mut AnyObject = msg_send![raw, init];
         let item = Retained::retain(raw)?;
-        let key = ty("public.png");
-        let ok: bool = msg_send![&*item, setData: &*png, forType: &*key];
+        let abs: *mut NSString = msg_send![url, absoluteString];
+        let abs = Retained::retain_autoreleased(abs)?;
+        // NSStringEncoding 里 NSUTF8StringEncoding == 4
+        let url_data: *mut NSData = msg_send![&*abs, dataUsingEncoding: 4usize];
+        let url_data = Retained::retain_autoreleased(url_data)?;
+        let ok: bool = msg_send![&*item, setData: &*url_data, forType: &*ty("public.file-url")];
         if !ok {
             return None;
+        }
+        if let Some(png) = png {
+            let ok: bool = msg_send![&*item, setData: png, forType: &*ty("public.png")];
+            if !ok {
+                return None;
+            }
         }
         Some(item)
     }
 
+    /// 测试探针用：把剪贴板里有几个 item、各自挂了哪些类型全部回给调用方。
+    /// 「粘出去变成两张一模一样的图」就是在这里暴露的：writeObjects 是一个对象一个 item，
+    /// 两味分在两个 item 上时，逐项粘的应用（Word / 备忘录 / Keynote）会各插一张
+    #[cfg(test)]
+    pub unsafe fn dump_items() -> Vec<Vec<String>> {
+        let mut out = Vec::new();
+        let Some(pb) = pasteboard() else { return out };
+        let items: *mut NSArray<AnyObject> = msg_send![&*pb, pasteboardItems];
+        let Some(items) = Retained::retain_autoreleased(items) else {
+            return out;
+        };
+        for item in items.iter() {
+            let types: *mut NSArray<NSString> = msg_send![&*item, types];
+            let mut names = Vec::new();
+            if let Some(types) = Retained::retain_autoreleased(types) {
+                for t in types.iter() {
+                    names.push(t.to_string());
+                }
+            }
+            out.push(names);
+        }
+        out
+    }
+
     /// 用 NSURL 写进剪贴板：writeObjects 会让系统自己处理多文件与书签，
     /// 粘到 Finder / 微信时就是「复制了这几个文件」；
-    /// 单项且是图片时，再多挂一个只带 public.png 的 item，两味并存
+    /// 单项且是图片时换成一个同时带文件 URL 与 PNG 的 item（两味共存，但只有一个 item）
     pub fn copy_as_file(paths: Vec<String>) -> Result<(), String> {
         unsafe {
             let pb = pasteboard().ok_or("系统剪贴板不可用")?;
@@ -386,11 +429,14 @@ mod platform {
                     None => return Err(format!("路径转 URL 失败: {p}")),
                 }
             }
-            // writeObjects 会把多个对象的类型取并集，同类型冲突时后写的赢 ——
-            // 这里 NSURL 只出 public.file-url、item 只出 public.png，不冲突
+            // 单项且解得出位图时，把两味挂到同一个 item 上换掉那个 NSURL ——
+            // 位图那味只能这么并进来（NSURL 对象自己不出 public.png），而再 push 一个 item
+            // 会让逐项粘的应用插两张一模一样的图。解不出位图就维持纯 NSURL
             if paths.len() == 1 {
-                if let Some(item) = png_item(&paths[0]) {
-                    urls.push(item);
+                if let Some(png) = png_data(&paths[0]) {
+                    if let Some(item) = file_item(&urls[0], Some(&png)) {
+                        urls = vec![item];
+                    }
                 }
             }
             let arr = NSArray::from_retained_slice(&urls);
@@ -746,7 +792,19 @@ mod real_clipboard {
         // 反向：把一张真 PNG 写进剪贴板，再用 osascript 读回来看到底挂上了哪几味
         if let Some(first) = paths_probe_file() {
             super::platform::copy_as_file(vec![first.clone()]).expect("写入剪贴板");
-            println!("[probe] 已把 {first} 写入剪贴板（文件 URL + 图片位图）");
+            let items = unsafe { super::platform::dump_items() };
+            println!("[probe] 已把 {first} 写入剪贴板");
+            println!("[probe] 剪贴板里共 {} 个 item：", items.len());
+            for (i, types) in items.iter().enumerate() {
+                println!("[probe]   item#{i}: {:?}", types);
+            }
+            // 两味必须在同一个 item 上：分成两个就会被逐项粘的应用插成两张同样的图
+            assert_eq!(items.len(), 1, "剪贴板里出现了 {} 个 item，粘出去就会插多张同样的图", items.len());
+            assert_eq!(items[0].len(), 2, "那一个 item 应该同时带两味：{:?}", items[0]);
+            // 回读一次：合并成一个 item 后，文件那味仍然解得开吗（我们自己读剪贴板走的就是 public.file-url）
+            let back = super::platform::paste_paths(&store).expect("写完立刻回读却读不到文件 —— public.file-url 那味没生效");
+            assert!(back.iter().any(|p| p == &first), "回读到的不是刚写进去那个文件: {back:?}");
+            println!("[probe] 回读拿到的还是原路径，文件那味完好");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
