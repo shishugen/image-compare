@@ -5,4 +5,7 @@ src-tauri/gen
 # 壳工程自己不做发版，锁文件与产物不进仓库（tools/win-check 与 tools/clip-win-check 同一套）
 tools/*/Cargo.lock
 tools/*/target
+# 这是个 mac + windows 桌面应用，但 tauri icon 每次都会顺手多生成 ios/android 两套，不进仓库
+src-tauri/icons/ios
+src-tauri/icons/android
 .DS_Store
