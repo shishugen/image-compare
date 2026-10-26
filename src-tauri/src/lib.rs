@@ -7,6 +7,7 @@ use tauri_plugin_dialog::DialogExt;
 
 mod clip;
 mod favorites;
+mod history;
 mod http;
 mod net;
 mod pair;
@@ -335,6 +336,9 @@ pub fn run() {
             favorites::fav_upsert,
             favorites::fav_delete,
             favorites::fav_move,
+            history::get_history,
+            history::record_view,
+            history::clear_history,
             prefs::get_prefs,
             prefs::set_prefs
         ])

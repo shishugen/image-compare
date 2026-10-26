@@ -35,7 +35,7 @@
                 <!-- 「打开 A/B/C/D」四个入口已拆：要往指定窗里放图就单击那个空窗（直接粘剪贴板，没图才弹选文件）、
                      拖文件进窗，或者 ⌘V；一次多张就走下面这个「打开对比」（自动铺满可见窗） -->
                 <button id="btn-open-pair" class="btn btn-primary" title="一次选择多张图（⌘O）">打开对比</button>
-                <button id="btn-strip" class="btn btn-toggle" disabled title="浏览这张图所在文件夹的全部图片（⌘⇧B）">浏览列表</button>
+                <button id="btn-strip" class="btn btn-toggle" disabled title="先打开一张本机的图，这里就会列出最近看过的列表（⌘⇧B）">列表</button>
               </div>
 
               <div class="tb-sep"></div>
@@ -84,14 +84,22 @@
 
             <!-- 对比主区 -->
             <div class="cmp-body">
-              <!-- 浏览侧栏：列出「当前这张图所在目录」的全部图片，点一行就是浏览到那张。
+              <!-- 浏览侧栏：默认列「最近看过的」（打开 / 拖入 / 粘贴 / 列表里逐张翻看 / 放大看过，都算看过；
+                   同一张只留一条、重复查看只置顶，最多 100 条），
+                   头部可以切回「当前文件夹」（列当前这张图所在目录的全部图片）。点一行就是浏览到那张。
                    它是 stage 的兄弟而不是子元素：分隔条按 stage 宽度算百分比，
                    侧栏挤进 stage 会让两窗总宽溢出、拖拽比例全错 -->
-              <aside class="filmstrip" id="filmstrip" tabindex="0" role="listbox" hidden aria-label="当前图片所在文件夹">
+              <aside class="filmstrip" id="filmstrip" tabindex="0" role="listbox" hidden aria-label="图片列表">
                 <div class="fs-head">
+                  <div class="fs-srcs" role="group" aria-label="列表来源">
+                    <button id="btn-src-history" class="fs-src is-active" title="最近看过的图片（同一张只留一条，重复查看只置顶）">最近看过</button>
+                    <button id="btn-src-dir" class="fs-src" title="当前这张图所在的文件夹">当前文件夹</button>
+                  </div>
+                  <button class="fs-close" id="btn-strip-close" title="收起列表（⌘⇧B）">×</button>
+                </div>
+                <div class="fs-sub">
                   <span class="fs-dir" id="fs-dir" title=""></span>
                   <span class="fs-count" id="fs-count"></span>
-                  <button class="fs-close" id="btn-strip-close" title="收起浏览列表（⌘⇧B）">×</button>
                 </div>
                 <p class="fs-tip" id="fs-tip" hidden></p>
                 <div class="fs-list" id="fs-list"></div>
@@ -202,6 +210,12 @@
                     </select>
                   </label>
                   <p class="hint">双指滚动按这里选的行为走；触控板捏合（pinch）始终缩放，不受这一项影响。</p>
+
+                  <div class="set-sub">查看历史</div>
+                  <p class="hint">侧栏默认列「最近看过」：打开 / 拖入 / 粘贴 / 在列表里逐张翻看 / 在传输里放大看过，都算看过；<strong>同一张只留一条</strong>，重复查看只置顶，最多 <strong>100 条</strong>。翻看时列表不会回跳（只更新记录），切走再切回来看到的就是最新顺序。文件被移走 / 改名时那一行只会标灰，<strong>不会自动删掉</strong>（外置盘没挂载也是「读不到」，不能就当没看过给抹了），要清就整份清。</p>
+                  <div class="drawer-acts">
+                    <button id="btn-history-clear" class="btn btn-ghost" title="只清这份查看记录，不动图片文件本身">清空查看历史</button>
+                  </div>
                 </div>
               </aside>
             </div>

@@ -238,6 +238,48 @@ body {
   align-items: center;
   gap: 6px;
   padding: 5px 8px;
+}
+
+/* 头部第一行那两个源切换 tab。取态照工具栏 .btn-toggle 那一套（常态暗字透明底、
+   选中是 accent 底白字），不另造一套视觉；侧栏只 190px 宽，所以字号降到 11px、
+   内边距收到 5px —— 再宽一点两枚就能撑破那行 */
+.fs-srcs {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  gap: 4px;
+}
+
+.fs-src {
+  flex: 0 0 auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1px 5px;
+  font-size: 11px;
+  background: transparent;
+  color: var(--text-dim);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.fs-src:hover {
+  color: var(--text);
+}
+
+.fs-src.is-active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+/* 第二行：当前源说明（目录源写目录名，历史源写「最近看过」）+ 张数。
+   分隔线从 .fs-head 移到这一行底：两行都属于头部，列表才是主体 */
+.fs-sub {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px 5px;
   border-bottom: 1px solid var(--border);
 }
 
@@ -274,7 +316,7 @@ body {
   color: #fff;
 }
 
-/* 无列表 / 目录读不了时的说明 */
+/* 无列表 / 目录读不了 / 刚清空时的说明 */
 .fs-tip {
   flex: 0 0 auto;
   margin: 6px 8px;

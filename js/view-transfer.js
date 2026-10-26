@@ -23,6 +23,7 @@ import {
   invoke,
   isTauriRuntime,
   listen,
+  noteViewSeen,
   openInCompare,
   registerDropHandler,
   registerDropHoverHandler,
@@ -894,6 +895,9 @@ function paintThumb(rec, dataUrl) {
 function openLightbox(dataUrl, name, p) {
   lightboxPath = p || null;
   lightboxSrc = dataUrl || null;
+  // 放大看过就算真看过：记一条查看历史（带绝对路径才记，聊天气泡里那张没落盘的没得记）。
+  // 只落盘不重排：侧栏在对比视图里，这会儿看不见；不 await，不能卡住放大这一下
+  if (lightboxPath) noteViewSeen(lightboxPath);
   ui.lightboxImg.src = dataUrl;
   ui.lightboxImg.alt = name || "";
   ui.lightboxCap.textContent = [name, p].filter(Boolean).join(" · ");

@@ -366,6 +366,8 @@ const world = {
   leakBad: false, // 桩故意漏一条非图片进来，验前端那份 IMAGE_EXT 兜得住
   pick: [], // pick_images 的应答
   reads: new Map(), // path -> 读了几回
+  history: [], // 桩后端那份查看历史（绝对路径，新的在前）
+  historyErr: false, // 打开后 record_view 就报错，验「记录失败不影响载入与浏览」
 };
 
 const extOf = (name) => {
@@ -429,6 +431,21 @@ function listFolder(path) {
 
 const enc = (p) => "data:image/png;base64," + Buffer.from(p).toString("base64");
 
+/* --------- 查看历史：桩后端照 Rust 的口径记（去重置顶 + 截断到 100） --------- */
+const HISTORY_MAX = 100; // 与 Rust / 前端的 HISTORY_MAX 对齐
+/** seen 给成「每隔一分钟看了一张」：这样行上那格相对时间是可断言的（第一条刚刚、第二条 1 分钟前） */
+const seenOf = (i) => Date.now() - i * 60_000;
+const historyFile = () => ({ items: world.history.map((p, i) => ({ path: p, seen: seenOf(i) })) });
+function recordHistory(path) {
+  if (!path || !path.startsWith("/")) throw new Error("记录查看失败：不是绝对路径");
+  if (world.historyErr) throw new Error("history.json 写入失败（桩）");
+  const i = world.history.indexOf(path);
+  if (i >= 0) world.history.splice(i, 1);
+  world.history.unshift(path);
+  world.history.length = Math.min(world.history.length, HISTORY_MAX);
+  return historyFile();
+}
+
 const calls = [];
 async function invokeStub(cmd, args) {
   calls.push([cmd, args || {}]);
@@ -448,6 +465,14 @@ async function invokeStub(cmd, args) {
     }
     case "take_pending_paths":
       return [];
+    case "get_history":
+      return historyFile();
+    case "record_view":
+      return recordHistory(args.path);
+    case "clear_history":
+      if (world.historyErr) throw new Error("history.json 写入失败（桩）");
+      world.history.length = 0;
+      return null;
     default:
       return null;
   }
@@ -624,6 +649,20 @@ const thumbImg = (i) => thumbOf(i)?.querySelector("img") || null;
 const totalReads = () => [...world.reads.values()].reduce((a, b) => a + b, 0);
 const ghostName = () => ghost().querySelector(".sg-name").text;
 
+/** 行上第二格（.fs-size）真正显示的那段字：目录源是体积，历史源是相对时间 */
+const rowMeta = () =>
+  rows().map(
+    (r) => r.children.find((c) => c.classSet.has("fs-main"))?.children.find((c) => c.classSet.has("fs-size"))?.text ?? ""
+  );
+const srcTab = (src) => byId(src === "dir" ? "btn-src-dir" : "btn-src-history");
+/** 点头部那枚 tab 切源（setStripSource 是异步的：切到目录源要重发一次列目录） */
+async function useSource(src) {
+  click(srcTab(src));
+  await settle(20);
+}
+const historyCalls = () => calls.filter(([c]) => c === "record_view" || c === "get_history" || c === "clear_history");
+const folderCalls = () => calls.filter(([c]) => c === "list_folder_images");
+
 let failed = 0;
 function check(name, ok, extra = "") {
   console.log(`${ok ? "PASS" : "FAIL"}  ${name}${extra ? "  " + extra : ""}`);
@@ -631,6 +670,26 @@ function check(name, ok, extra = "") {
 }
 
 await settle();
+
+/* ===================== 0) 默认源就是「最近看过」 ===================== */
+check(
+  "默认源是「最近看过」：头部那枚 tab 亮着",
+  srcTab("history").classSet.has("is-active") && !srcTab("dir").classSet.has("is-active")
+);
+check(
+  "冷启动只发一次 get_history 填默认源",
+  calls.filter(([c]) => c === "get_history").length === 1,
+  String(calls.filter(([c]) => c === "get_history").length)
+);
+check("首启动历史是空的：侧栏不弹出来抢地方", strip().hidden === true && rows().length === 0);
+check("两个源都还没内容时按钮禁用", byId("btn-strip").disabled === true);
+check("历史源下头部那一行说「最近看过」而不是目录名", byId("fs-dir").text === "最近看过", byId("fs-dir").text);
+
+/* 1~17 节验的是「目录源」的既有行为（README 第八节那些判据一字不差）：
+   进门先点一下「当前文件夹」切过去，后面的用例就都按目录源跑 */
+await useSource("dir");
+check("切到目录源不会自己把侧栏弹出来", strip().hidden === true);
+check("切源不发 get_history（本地那份够用）", calls.filter(([c]) => c === "get_history").length === 1);
 
 /* ===================== 1) 没有本机路径的来源不该建列表 ===================== */
 let since = mark();
@@ -640,18 +699,18 @@ check(
   statusText().startsWith("载入失败") && statusText().includes("0 字节"),
   statusText()
 );
-check("这种来源不会去列目录", calls.slice(since).filter(([c]) => c === "list_folder_images").length === 0);
+check("目录源下这种来源不会去列目录", calls.slice(since).filter(([c]) => c === "list_folder_images").length === 0);
 check("侧栏还藏着", strip().hidden === true);
 
 await pickFiles([{ name: "剪贴板图.png", size: 2048 }]);
 check("有体积的 File 能进空着的 A 窗", srcOf("a") === "剪贴板图.png", srcOf("a"));
 check(
-  "File 来源没有本机路径：侧栏藏起来并说明原因",
+  "目录源下：File 来源没有本机路径：侧栏藏起来并说明原因",
   strip().hidden === true && byId("fs-tip").text === "这个来源没有本机路径，列不出文件夹",
   byId("fs-tip").text
 );
-check("没有列表时「浏览列表」按钮禁用", byId("btn-strip").disabled === true);
-check("这种来源一路都没去列目录", calls.slice(since).filter(([c]) => c === "list_folder_images").length === 0);
+check("目录源下没有列表时「列表」按钮禁用", byId("btn-strip").disabled === true);
+check("目录源下这种来源一路都没去列目录", calls.slice(since).filter(([c]) => c === "list_folder_images").length === 0);
 
 /* ===================== 2) 载入一张本地图就列出它所在目录 ===================== */
 click(byId("btn-clear")); // 把 File 那张清掉，后面都从两个空窗开始
@@ -665,21 +724,21 @@ const alphaList = [
   `${ALPHA}/IMG_100.png`,
   `${ALPHA}/scan.tif`,
 ];
-check("列目录用的参数就是这张图的路径", calls.slice(since).some(([c, a]) => c === "list_folder_images" && a.path === `${ALPHA}/IMG_10.png`));
+check("目录源下：列目录用的参数就是这张图的路径", calls.slice(since).some(([c, a]) => c === "list_folder_images" && a.path === `${ALPHA}/IMG_10.png`));
 check("列表只含本层的图片", rowPaths().join(",") === alphaList.join(","), rowNames().join(","));
 check("非图片与子目录都不在列表里", !rowPaths().some((p) => p.includes("notes.txt") || p.includes("raw/")));
 check("自然序：IMG_2 排在 IMG_10 前、IMG_10 排在 IMG_100 前", rowNames().indexOf("IMG_2.png") < rowNames().indexOf("IMG_10.png") && rowNames().indexOf("IMG_10.png") < rowNames().indexOf("IMG_100.png"));
 check("tif 也认（三份表必须一致）", rowNames().includes("scan.tif"));
 check("有列表就自动露出来", strip().hidden === false);
-check("头部写着目录名与张数", byId("fs-dir").text === "ALPHA" && byId("fs-count").text === "5 张", `${byId("fs-dir").text}/${byId("fs-count").text}`);
+check("目录源下头部写着目录名与张数", byId("fs-dir").text === "ALPHA" && byId("fs-count").text === "5 张", `${byId("fs-dir").text}/${byId("fs-count").text}`);
 check("按钮解除禁用并高亮", byId("btn-strip").disabled === false && byId("btn-strip").classSet.has("is-active"));
 check("当前项高亮在 IMG_10 那行", rowNames()[currentIndex()] === "IMG_10.png", String(currentIndex()));
 check("列表建起来时把当前项滚进可见", rows()[currentIndex()].scrollIntoViewCalls > 0);
 
 since = mark();
 await openViaCmdO([`${ALPHA}/IMG_2.png`]);
-check("同目录再载入一张不重发 IPC", calls.slice(since).filter(([c]) => c === "list_folder_images").length === 0);
-check("同目录载入会把当前项对齐", rowNames()[currentIndex()] === "IMG_2.png", rowNames()[currentIndex()]);
+check("目录源下同目录再载入一张不重发 IPC", calls.slice(since).filter(([c]) => c === "list_folder_images").length === 0);
+check("目录源下同目录载入会把当前项对齐", rowNames()[currentIndex()] === "IMG_2.png", rowNames()[currentIndex()]);
 check("B 窗接住了这张（A 已有图，空窗优先）", srcOf("b") === `${ALPHA}/IMG_2.png`, srcOf("b"));
 
 /* ===================== 3) 落窗严格交替，另一个窗留着对照 ===================== */
@@ -870,8 +929,8 @@ check("连按最终只动了该动的窗", changedPanes(beforeHold).length >= 1,
 /* ===================== 8) 小图的内存闸门：只解当前项 ±1 ===================== */
 since = mark();
 await openViaCmdO([`${GAMMA}/g3_big.png`]); // 换目录 → 行全部重建，小图从零开始
-check("换目录只重发一次列目录", calls.slice(since).filter(([c]) => c === "list_folder_images").length === 1);
-check("新目录的行重建了", rowNames().join(",") === "g1.png,g2.png,g3_big.png,g4.png,g5.png,gone.png", rowNames().join(","));
+check("目录源下换目录只重发一次列目录", calls.slice(since).filter(([c]) => c === "list_folder_images").length === 1);
+check("目录源下新目录的行重建了", rowNames().join(",") === "g1.png,g2.png,g3_big.png,g4.png,g5.png,gone.png", rowNames().join(","));
 check("当前项 ±1 自动出小图", hasThumb(1) && hasThumb(3), `${hasThumb(1)},${hasThumb(3)}`);
 check("窗口外的行不读盘（几百张的目录才敢列）", !hasThumb(0) && !hasThumb(4) && !hasThumb(5) && pendingOf(4) === "");
 check("过 4MB 的不自动解，只给「大」字占位", pendingOf(2) === "大" && !hasThumb(2), pendingOf(2));
@@ -918,25 +977,25 @@ world.missing.delete(`${GAMMA}/gone.png`);
 /* ===================== 10) 换目录就刷新列表；只有一张也照常列 ===================== */
 since = mark();
 await openViaCmdO([`${BETA}/beta_10.png`]);
-check("换目录会重发一次列目录", calls.slice(since).filter(([c]) => c === "list_folder_images").length === 1);
-check("列表换成那个目录的图并按自然序排", rowNames().join(",") === "beta_1.png,beta_2.png,beta_10.png", rowNames().join(","));
-check("头部目录名跟着换", byId("fs-dir").text === "BETA" && byId("fs-dir").title === BETA);
-check("旧目录的小图不留在行上", rows().every((r) => !r.querySelector(".fs-thumb img")));
-check("换了目录就把上一次的失败记录清空", badIndex() === -1, String(badIndex()));
+check("目录源下换目录会重发一次列目录", calls.slice(since).filter(([c]) => c === "list_folder_images").length === 1);
+check("目录源下列表换成那个目录的图并按自然序排", rowNames().join(",") === "beta_1.png,beta_2.png,beta_10.png", rowNames().join(","));
+check("目录源下头部目录名跟着换", byId("fs-dir").text === "BETA" && byId("fs-dir").title === BETA);
+check("目录源下旧目录的小图不留在行上", rows().every((r) => !r.querySelector(".fs-thumb img")));
+check("目录源下换了目录就把上一次的失败记录清空", badIndex() === -1, String(badIndex()));
 click(rows()[0]);
 await settle();
-check("点新目录里的行照样走交替（beta_10 还在 A）", currentIndex() === 0 && srcOf("b") === `${BETA}/beta_1.png` && srcOf("a") === `${BETA}/beta_10.png`, `${currentIndex()}/${srcOf("b")}`);
+check("目录源下点新目录里的行照样走交替（beta_10 还在 A）", currentIndex() === 0 && srcOf("b") === `${BETA}/beta_1.png` && srcOf("a") === `${BETA}/beta_10.png`, `${currentIndex()}/${srcOf("b")}`);
 
 await openViaCmdO(["/tmp/shot/ONLY/only.png"]);
-check("目录里就这一张也照常列出", rows().length === 1 && rowNames().join(",") === "only.png", String(rows().length));
+check("目录源下目录里就这一张也照常列出", rows().length === 1 && rowNames().join(",") === "only.png", String(rows().length));
 check("只有一张时 ] 不越界", key("]").prevented === true);
 await settle();
 check("游标停在第一张、也就是最后一张", currentIndex() === 0 && statusText().includes("已经是最后一张"), statusText());
 
 /* ===================== 11) 后端截断要说明一声，前端那份筛图是兜底 ===================== */
 await openViaCmdO([`${HUGE}/p0.png`]);
-check("目录过大只列 2000 张", rows().length === FOLDER_MAX_ITEMS, String(rows().length));
-check("截断时在列表底部说明一声", stripList().children.some((c) => c.classSet.has("fs-tip") && c.text.includes(`目录过大，只列出前 ${FOLDER_MAX_ITEMS} 张`)));
+check("目录源下目录过大只列 2000 张", rows().length === FOLDER_MAX_ITEMS, String(rows().length));
+check("目录源下截断时在列表底部说明一声", stripList().children.some((c) => c.classSet.has("fs-tip") && c.text.includes(`目录过大，只列出前 ${FOLDER_MAX_ITEMS} 张`)));
 
 world.leakBad = true;
 await openViaCmdO([`${ALPHA}/IMG_2.png`]);
@@ -1335,6 +1394,174 @@ check(
 );
 fireWin("mouseup", { clientX: 30, clientY: 60 });
 await settle();
+// 上面那趟拖拽还欠一次「紧跟的 click 要吐掉」（语义在第 15 节验过了）：
+// 这里空点一下把它吐干净，别让它漏到第 18 节去吃掉点失效行的那一下
+click(rows()[1]);
+await settle();
+
+/* ===================== 18) 历史源（默认那一路）的完整行为 ===================== */
+world.assetOn = false; // 17 节把它开着；这一节要回到 read_image 那条路，「文件被移走」才真能失败
+key("2");
+click(byId("btn-clear"));
+await settle();
+const fc18 = folderCalls().length;
+const shot18a = shot();
+await useSource("history");
+check(
+  "切到历史源用本地那份列表，不重发 get_history",
+  calls.filter(([c]) => c === "get_history").length === 1 && rows().length > 0,
+  `${calls.filter(([c]) => c === "get_history").length} 次 get_history / ${rows().length} 行`
+);
+check("切到历史源不重发列目录", folderCalls().length === fc18);
+// 这里盯的是图窗不是小图：切源后 renderStrip 会按老口径给当前项 ±1 解两张小图，那是应当的
+check("切到历史源不动图窗：一张也没进也没出", changedPanes(shot18a).length === 0, changedPanes(shot18a).join(","));
+
+// 上面十几节攒来的记录先清干净，这一段的所有权归历史源
+click(byId("btn-history-clear"));
+await settle(20);
+check("清空走一次 clear_history", calls.filter(([c]) => c === "clear_history").length === 1);
+check("清空后行全没了", rows().length === 0);
+check("清空后那句提示说的是谁干的，不是「暂无图片」", byId("fs-tip").text.includes("查看历史已清空"), byId("fs-tip").text);
+check("两个源都空了：按钮重新禁用", byId("btn-strip").disabled === true);
+
+/* —— 记一次查看 = 一行；重复查看只置顶 —— */
+since = mark();
+await openViaCmdO([`${ALPHA}/IMG_2.png`]);
+check("打开一张就发一次 record_view", calls.slice(since).filter(([c]) => c === "record_view").length === 1);
+check("渲染用的就是 record_view 的返回值：不额外发 get_history", calls.slice(since).filter(([c]) => c === "get_history").length === 0);
+check("历史源下这一行就是那张图", rowPaths().join(",") === `${ALPHA}/IMG_2.png`, rowPaths().join(","));
+check("行上第二格是相对时间不是体积", rowMeta()[0] === "刚刚", rowMeta()[0]);
+check("历史源下有列表就自动露出来", strip().hidden === false);
+check("历史源下不列目录", folderCalls().length === fc18);
+check("历史源下头部那一行写「最近看过」", byId("fs-dir").text === "最近看过" && byId("fs-count").text === "1 张", `${byId("fs-dir").text}/${byId("fs-count").text}`);
+
+await openViaCmdO([`${ALPHA}/IMG_10.png`]);
+check("新看的那张顶在最前", rowPaths().join(",") === `${ALPHA}/IMG_10.png,${ALPHA}/IMG_2.png`, rowPaths().join(","));
+await openViaCmdO([`${ALPHA}/IMG_2.png`]);
+check("同一张再看一次不多出一行，只置顶", rowPaths().join(",") === `${ALPHA}/IMG_2.png,${ALPHA}/IMG_10.png`, rowPaths().join(","));
+check("重复查看把时间刷成「刚刚」，旧的那条成了 1 分钟前", rowMeta().join("|") === "刚刚|1 分钟前", rowMeta().join("|"));
+
+/* —— 逐张浏览也是「真看过」：一个入口不走 fillPanes，得自己记，一张都不许漏 —— */
+await openViaCmdO([`${ALPHA}/IMG_100.png`]); // 历史源放到 3 行，够翻一张也够早退一次
+since = mark();
+const rowsHist0 = rowPaths().join(",");
+key("]");
+await settle();
+check("历史源里翻到下一张：发了一次 record_view", calls.slice(since).filter(([c]) => c === "record_view").length === 1, String(calls.slice(since).filter(([c]) => c === "record_view").length));
+check(
+  "历史源里浏览不重排侧栏：行顺序一字不变（每按一次方向键就把当前行顶到第一行，翻图时列表会跳、下一张也跟着变）",
+  rowPaths().join(",") === rowsHist0,
+  `${rowsHist0} -> ${rowPaths().join(",")}`
+);
+check("不重排不等于没跟上：当前项跟着走到了第 2 行", currentIndex() === 1, String(currentIndex()));
+since = mark();
+click(rows()[1]); // 就是正看着的那一张
+await settle();
+check("点在正看着的那一行：早退那条路不重读盘也不多写一次盘", calls.slice(since).filter(([c]) => c === "record_view").length === 0, String(calls.slice(since).filter(([c]) => c === "record_view").length));
+
+await useSource("dir");
+const alpha5 = rowPaths().slice(); // 目录源那 5 张的绝对路径
+check("目录源里确实列的是 5 张（不是历史）", alpha5.length === 5 && byId("fs-count").text === "5 张", byId("fs-count").text);
+const seenBefore = new Set(world.history);
+const needIn = alpha5.filter((p) => !seenBefore.has(p));
+const rowsDir0 = rowPaths().join(",");
+since = mark();
+for (let i = 0; i < alpha5.length; i++) {
+  click(rows()[i]); // 挨个点一遍：这就是「把整个文件夹看了一遍」
+  await settle();
+}
+check(
+  `这趟浏览把 ${needIn.length} 张从没见过的补进了历史：一张不漏`,
+  needIn.length > 0 && needIn.every((p) => world.history.includes(p)),
+  alpha5.filter((p) => !world.history.includes(p)).join(",") || `${needIn.length} 张全在`
+);
+check("目录源里逐张浏览行的就是这一份目录列表，一点没被历史带跳", rowPaths().join(",") === rowsDir0, rowPaths().join(","));
+check(
+  "5 行挨个点一遍就发 5 次 record_view（已在历史里的那几张也要发：重看一次得把它的 seen 刷成刚刚）",
+  calls.slice(since).filter(([c]) => c === "record_view").length === alpha5.length,
+  `${calls.slice(since).filter(([c]) => c === "record_view").length} vs ${alpha5.length}`
+);
+await useSource("history");
+check(
+  "切回历史源看到的就是最新顺序：最后浏览那张顶在最前（那趟只落盘没重排，但盘上记到了）",
+  rowPaths()[0] === alpha5[alpha5.length - 1],
+  rowPaths().join(",")
+);
+check("切回来不重发 get_history：本地那份一直在跟着写盘更新", calls.filter(([c]) => c === "get_history").length === 1);
+
+/* —— 切源：只换喂给行的那份列表，不动图窗也不清小图缓存 —— */
+const shot18 = shot();
+const fc18b = folderCalls().length;
+await useSource("dir");
+check("切到目录源不动图窗", changedPanes(shot18).length === 0, changedPanes(shot18).join(","));
+check("切到目录源拿当前那张去列一次目录", folderCalls().length === fc18b + 1 && rowNames().includes("big.png"), rowNames().join(","));
+check("目录源下头部又写目录名", byId("fs-dir").text === "ALPHA" && byId("fs-count").text === "5 张", `${byId("fs-dir").text}/${byId("fs-count").text}`);
+check("切到目录源不动侧栏的开合（还开着）", strip().hidden === false, `hidden:${strip().hidden}`);
+const rd18c = totalReads();
+await useSource("history");
+// 两个方向都得查：只在前一半查的话，「切源顺手把 open 写掉」会被 ensureFolderList 的自动弹开抹平（变异测试踩过）
+check("切回历史源同样不收起侧栏", strip().hidden === false, `hidden:${strip().hidden}`);
+io.fire(rows().map((r) => ({ target: r, isIntersecting: true })));
+await settle();
+check("切回历史源不重发列目录", folderCalls().length === fc18b + 1);
+check("切源不清 thumbCache：同一张不回盘重读", totalReads() === rd18c && hasThumb(0), `${rd18c} -> ${totalReads()}`);
+check("切回历史源不重发 get_history（本地那份够用）", calls.filter(([c]) => c === "get_history").length === 1);
+
+/* —— 失效行：标灰、不动落窗不推游标，但绝不从历史里被抹掉 —— */
+await openViaCmdO([`${ALPHA}/IMG_100.png`]);
+world.missing.add(`${ALPHA}/IMG_100.png`); // 看完就被移走 / 改名
+await openViaCmdO([`${ALPHA}/IMG_2.png`]);
+const shot18d = shot();
+click(rows()[1]); // 就是那张已被移走的
+await settle();
+check("点失效那一行：标灰", badIndex() === 1, String(badIndex()));
+check("点失效那一行不动落窗", changedPanes(shot18d).length === 0, changedPanes(shot18d).join(","));
+check("点失效那一行不推进游标：当前项还在最前", currentIndex() === 0, String(currentIndex()));
+check("读失败不会把那一行从历史里自动删掉（外置盘没挂载不算没看过）", world.history.includes(`${ALPHA}/IMG_100.png`));
+world.missing.delete(`${ALPHA}/IMG_100.png`);
+
+/* —— 100 条上限：第 101 张进来后最旧那条消失 —— */
+world.history.length = 0;
+for (let i = 0; i < HISTORY_MAX; i++) world.history.push(`${ALPHA}/seed_${String(i).padStart(3, "0")}.png`);
+await openViaCmdO([`${ALPHA}/IMG_10.png`]);
+check("只留最新 100 条", rows().length === HISTORY_MAX, String(rows().length));
+check("新那张顶在最前", rowPaths()[0] === `${ALPHA}/IMG_10.png`, rowPaths()[0]);
+check("被挤掉的是最旧那一条", !rowPaths().includes(`${ALPHA}/seed_099.png`) && rowPaths().includes(`${ALPHA}/seed_000.png`));
+check("张数说的也封顶了", byId("fs-count").text === `${HISTORY_MAX} 张`, byId("fs-count").text);
+
+/* —— 文案必须按源分流：历史源下提「目录」就是假话 —— */
+click(byId("btn-history-clear"));
+await settle(20);
+key("]");
+await settle();
+check("空历史里翻下一张：说的是查看历史，不提目录", statusText().includes("查看历史") && !statusText().includes("目录"), statusText());
+click(byId("btn-strip"));
+await settle();
+check("空历史里点「列表」也说的是查看历史", statusText().includes("还没有查看历史") && !statusText().includes("目录"), statusText());
+check("「列表」按钮那句 title 也说得出两个源（不能只说一个）", byId("btn-strip").title.includes("最近看过"), byId("btn-strip").title);
+
+/* —— 记录失败不能拖累载入与浏览 —— */
+world.historyErr = true;
+const shot18e = shot();
+await openViaCmdO([`${ALPHA}/IMG_2.png`]);
+check("record_view 报错：图照样进窗，当前项不对也不报错", srcOf("a") === `${ALPHA}/IMG_2.png` || srcOf("b") === `${ALPHA}/IMG_2.png`, JSON.stringify(shot18e));
+check("记录失败只说一声", statusText().includes("记录查看失败"), statusText());
+// 报错期间历史根本写不进去（桩在 push 之前就抛），所以先恢复写盘攒两行，再回到失败态翻一张：
+// 验的是「浏览那一路走的也是同一个口子，它失败时同样不能拖住翻图」
+world.historyErr = false;
+await openViaCmdO([`${ALPHA}/IMG_10.png`]);
+await openViaCmdO([`${ALPHA}/IMG_2.png`]);
+world.historyErr = true;
+since = mark();
+key("]");
+await settle();
+check(
+  "记录失败时侧栏照常翻到下一张：行还在、当前项跟着走",
+  rows().length === 2 && currentIndex() === 1 && calls.slice(since).filter(([c]) => c === "record_view").length === 1,
+  `rows:${rows().length}/idx:${currentIndex()}/${calls.slice(since).filter(([c]) => c === "record_view").length} 次`,
+);
+check("浏览那一路记录失败也只是说一声，不抛出", statusText().includes("记录查看失败"), statusText());
+world.historyErr = false;
 
 console.log(failed ? `\n${failed} 项未通过` : "\n全部通过");
 process.exit(failed ? 1 : 0);

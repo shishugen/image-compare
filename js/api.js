@@ -140,6 +140,25 @@ export function registerOpenHandler(viewName, fn) {
   openHandlers[viewName] = fn;
 }
 
+/**
+ * 记一次「真看过这张图」——三个视图共用的低层口子：对比视图的各个载入入口、侧栏逐张
+ * 浏览（点行 / ↑↓ / ←→）、传输与聊天视图点缩略图放大，看过就得记，一条不漏。
+ * 存哪、怎么去重、怎么截到 100 条全在 Rust 侧 history.rs，这里只发出去。
+ *
+ * 故意不碰任何视图状态：侧栏要不要跟着重排是调用方的事（view-compare 拿返回值自己排，
+ * 传输视图压根看不见侧栏，只要落盘）。record_view 这个命令全项目只在这一处发出去。
+ * 返回整份新历史（调用方直接拿来渲染，不必再读一遍）；失败返回 null。
+ */
+export function noteViewSeen(path) {
+  if (!isTauriRuntime || !path) return Promise.resolve(null);
+  return invoke("record_view", { path }).catch((err) => {
+    // 记不上历史必须吭一声：静默失败会让人以为「浏览过的都在里面」，回头一翻是空的
+    console.error("[history] 记录查看失败:", err);
+    setStatus("记录查看失败: " + errText(err));
+    return null;
+  });
+}
+
 /* --------------------------------------------------------------------------
  * 状态栏与提示
  * ------------------------------------------------------------------------ */

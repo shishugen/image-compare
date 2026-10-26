@@ -21,6 +21,7 @@ import {
   invoke,
   isTauriRuntime,
   onViewChange,
+  noteViewSeen,
   registerDropHandler,
   registerOpenHandler,
   routeDrop,
@@ -64,6 +65,10 @@ const ui = {
   stripGhost: el("strip-ghost"),
   btnStrip: el("btn-strip"),
   btnStripClose: el("btn-strip-close"),
+  // 侧栏的两个列表源：默认「最近看过」，头部可切回「当前文件夹」
+  btnSrcHistory: el("btn-src-history"),
+  btnSrcDir: el("btn-src-dir"),
+  btnHistoryClear: el("btn-history-clear"),
   // 设置抽屉：布局与同步在这里只是上面那几个控件的镜像，滚轮行为则只剩这里一个入口
   settings: el("cmp-settings"),
   btnSettings: el("btn-cmp-settings"),
@@ -585,6 +590,11 @@ const STRIP_INFLIGHT_MAX = 3; // 同时发出去的 read_image 封顶
 const STRIP_DIR_MAX = 2000; // 与 Rust 的 FOLDER_MAX_ITEMS 对齐，后端截断时说明一声
 const STRIP_NAME_MAX = 16; // 侧栏名称列的显示上限：190px 侧栏里名称列只剩 ~102px，12px 字号下正好放得下 16 字符
 
+/** 与 Rust 的 HISTORY_MAX 对齐：截断在后端做，这里只用于把上限写进头部那句说明 */
+const HISTORY_MAX = 100;
+/** 侧栏两个列表源的 id（setStripSource 只认这两个值） */
+const STRIP_SOURCES = ["history", "dir"];
+
 /** asset 这条路是不是在这台机器上走不通：只要有一张 403/404 就当成系统性的（scope 没覆盖到它、
  *  或 Windows 那边 canonicalize 后的路径与 glob 对不上），整列直接退回 read_image。
  *  只认一次、不退回去反复撞墙：否则每滚一回视口就多一次失败请求 + 一行日志 */
@@ -608,8 +618,8 @@ function thumbAssetFailed(i, row) {
 }
 
 const browse = {
-  dir: "", // 列表是哪个目录（同目录不重发 IPC）
-  items: [], // [{ path, name, size }]，已按自然序排好
+  dir: "", // 列表是哪个目录（同目录不重发 IPC）；历史源下不用，切回历史时清空以逼目录源重列一次
+  items: [], // 目录源：[{ path, name, size }]，已按自然序排好；历史源：[{ path, name, seen }]
   idx: -1, // 正在看的是第几项
   sel: -1, // 侧栏键盘选中行：↑↓ 一动就把那一张显示出来（与点行完全同一条路）
   slot: null, // 上一次浏览落在哪个窗（a/b/c/d），下一次去可见序列里它的下一个
@@ -619,6 +629,9 @@ const browse = {
   wanted: null, // 连按方向键时上一次还没读完：只记最后想要那一张，读完这趟再补一次
   truncated: false, // 后端把目录截断了
   bad: new Set(), // 读失败的路径：行标灰但不隐藏
+  source: "history", // 列表来源："history" 最近看过（默认）| "dir" 当前图所在目录
+  history: [], // 最近一次已知的历史（[{ path, seen }]）：切回历史源不用重发 IPC
+  lastPath: "", // 最后一次真载入显示过的本机路径：切到目录源就拿它去列目录
 };
 
 /** path -> 整图 data URL。拿 Map 的插入顺序当 LRU：命中就重新插到末尾 */
@@ -660,6 +673,24 @@ function formatBytes(n) {
   return Math.max(1, Math.round(n / 1024)) + "KB";
 }
 
+/** 历史行右边那一格放「什么时候看过」而不是体积：体积存进历史就会过期（改名、
+ *  重存后显示旧值），而这一行什么时候看过才是翻列表时要的信息 */
+function seenText(ms) {
+  if (!(ms > 0)) return "";
+  const diff = Date.now() - ms;
+  if (diff < 60e3) return "刚刚"; // 含 seen 被顶到未来几毫秒的情况
+  if (diff < 3600e3) return `${Math.floor(diff / 60e3)} 分钟前`;
+  if (diff < 86400e3) return `${Math.floor(diff / 3600e3)} 小时前`;
+  if (diff < 7 * 86400e3) return `${Math.floor(diff / 86400e3)} 天前`;
+  const d = new Date(ms);
+  return `${d.getMonth() + 1}/${d.getDate()}`;
+}
+
+/** 行的第二格：按条目自身形状分流，不读 browse.source —— 这样 buildStrip 与源无关 */
+function stripMetaText(it) {
+  return it.size === undefined ? seenText(it.seen) : formatBytes(it.size);
+}
+
 /** 浏览落窗：可见窗序列（a→b→c→d，按当前档位裁）里「上一个用过的窗」的下一个，到末尾绕回第一个。
  *  两图下就是原来的严格交替（行为一字不差）；四图下 A→B→C→D→A，屏幕上始终是连着的四张对照；
  *  单图只剩 A 一个窗，点列表就是换掉那一张。
@@ -679,17 +710,104 @@ function nextBrowseSlot() {
 const otherKeys = (k) => (LAYOUT_KEYS[layout] || LAYOUT_KEYS[2]).filter((x) => x !== k);
 
 /**
+ * 记一次查看。磁盘写走 api.js 的 noteViewSeen（三个视图共用那一份）。
+ * opts.reorder：这次要不要拿返回值立刻重排侧栏。
+ *   true —— ⌘O / 粘贴 / 拖入 / 外部打开这类「新载入」：新的一张本来就该置顶；
+ *   false —— 侧栏逐张浏览：历史源下每按一次方向键就把当前行顶到第一行，
+ *            列表会在翻图时不停跳、下一张也跟着变。所以照样写盘（一条不漏），
+ *            只是这一趟不重排，切到目录源再切回来时看到的就是最新顺序。
+ */
+function recordView(path, { reorder = true } = {}) {
+  if (!isTauriRuntime || !path) return;
+  browse.lastPath = path;
+  // 不 await：一次图片载入不该卡在磁盘写上
+  noteViewSeen(path).then((list) => {
+    if (!list) return; // 写失败：api.js 已经吭过一声，侧栏继续用本地那份，下次成功会补上
+    if (reorder) applyHistory(list, { fromView: true });
+    else browse.history = (list.items || []).filter((it) => it && it.path);
+  });
+}
+
+/**
  * 填完图窗之后的接线处：browse.slot 记成「刚放进去那个窗」，下一次浏览就去序列里下一个
  * —— 这样第一次浏览绝不会把刚打开的那张顶掉。
  * 五个载入入口（⌘O、单击空窗、拖文件进窗、⌘V、外部打开）都走 fillPanes，
- * 所以只在这一处接线。
+ * 所以「新载入」只在这一处接线；侧栏逐张浏览不走 fillPanes，它自己记（reorder:false）。
  */
 function noteLoaded(pane, src) {
   if (!pane) return;
   // 只有落在当前档的可见序列里才记账：往隐藏窗里塞一张不该搅动浏览的轮转
   if ((LAYOUT_KEYS[layout] || LAYOUT_KEYS[2]).includes(pane.key)) browse.slot = pane.key;
   const path = typeof src === "string" ? src : pane.meta?.path || "";
-  ensureFolderList(path);
+  // 记一次查看：返回值就是整份新历史，直接拿来渲染，不再多发一次 get_history
+  recordView(path);
+  // 目录源保持原有的「换图就对齐 / 换目录就重列」；历史源下不重列目录（它不靠目录）
+  if (browse.source === "dir") ensureFolderList(path);
+}
+
+/**
+ * 把历史喂给侧栏。行渲染机器（buildStrip / markStrip / 行拖拽 / 小图观察名单）全部只读
+ * browse.items 与 browse.idx，所以这里只是换一份 items 进去，不是另一套侧栏。
+ * opts.fromView：这一次列表变化是「刚真看了一张」带来的，可以按旧口径自动弹出侧栏；
+ * 冷启动 / 切源 / 清空都不是，不能凭空把侧栏弹出来抢地方。
+ */
+function applyHistory(list, opts = {}) {
+  const items = (list?.items || []).filter((it) => it && it.path);
+  browse.history = items;
+  if (browse.source !== "history") return;
+  browse.items = items.map((it) => ({ path: it.path, name: baseOf(it.path), seen: it.seen }));
+  // 历史源没有「换目录」这件事：thumbCache 不在这清（来回切一次源就把小图全丢了是白费重读盘），
+  // bad 也不清：文件真读不到，两个源下都是同一条僵尸路径，标灰应该一致
+  browse.dir = ""; // 切回目录源时不能走「同一个目录不重发 IPC」那条短路
+  browse.truncated = false;
+  const i = browse.items.findIndex((it) => it.path === browse.lastPath);
+  browse.idx = i;
+  browse.sel = i;
+  if (opts.fromView && !browse.userClosed && browse.items.length) browse.open = true;
+  applyStripVisibility(opts.tip);
+  renderStrip();
+}
+
+/** 冷启动只拉一次，填默认源（不自动弹出侧栏：那时候用户还没看任何图） */
+async function loadHistory() {
+  if (!isTauriRuntime) return;
+  try {
+    applyHistory(await invoke("get_history"));
+  } catch (err) {
+    console.error("[history] 读查看历史失败:", err);
+    setStatus("读查看历史失败: " + errText(err));
+  }
+}
+
+/**
+ * 换列表源：只换喂给 items 的东西，不动 browse.open（侧栏开着还是收着是用户自己的事），
+ * 也不清 thumbCache。
+ */
+async function setStripSource(src) {
+  if (!STRIP_SOURCES.includes(src) || browse.source === src) return;
+  browse.source = src;
+  if (src === "dir") {
+    await ensureFolderList(browse.lastPath);
+    applyStripVisibility();
+    return;
+  }
+  if (browse.history.length) {
+    applyHistory({ items: browse.history });
+  } else {
+    await loadHistory(); // 本地那份还是空：可能是冷启动那次读失败，重拉一次
+  }
+}
+
+function markStripSourceButtons() {
+  if (ui.btnSrcHistory) ui.btnSrcHistory.classList.toggle("is-active", browse.source === "history");
+  if (ui.btnSrcDir) ui.btnSrcDir.classList.toggle("is-active", browse.source === "dir");
+}
+
+/** 列表空了时那句提示必须按源说：历史源下讲「文件夹」是假话 */
+function emptyListTip() {
+  return browse.source === "history"
+    ? "还没有查看历史（先打开一张本机的图）"
+    : "还没有可浏览的文件夹（先打开一张本机的图）";
 }
 
 /** 列这张图所在目录的图片。拿不到本机路径的来源（浏览器兜底、File 对象）退回提示 */
@@ -754,26 +872,35 @@ async function ensureFolderList(path) {
 function applyStripVisibility(tip) {
   if (ui.strip) ui.strip.hidden = !browse.open;
   if (ui.btnStrip) {
-    ui.btnStrip.disabled = !browse.items.length;
+    // 禁用条件看两个源：只看当前源的话，历史被清空就按不亮切回目录源那条路
+    const hasAny = browse.items.length > 0 || browse.history.length > 0;
+    ui.btnStrip.disabled = !hasAny;
     ui.btnStrip.classList.toggle("is-active", browse.open && browse.items.length > 0);
-    ui.btnStrip.title = browse.items.length
-      ? "浏览这张图所在文件夹的全部图片（⌘⇧B 开关）"
-      : "先打开一张本机的图，就会列出它所在的文件夹";
+    ui.btnStrip.title = hasAny
+      ? "看最近看过 / 当前文件夹的列表（⌘⇧B 开关）"
+      : "先打开一张本机的图，这里就会列出最近看过的列表";
   }
   if (ui.stripDir) {
-    ui.stripDir.textContent = browse.dir ? baseOf(browse.dir) : "";
-    ui.stripDir.title = browse.dir || "";
+    // 头部那一行是「当前源说明」：历史源下讲目录名是假话（那份列表根本不是目录）
+    if (browse.source === "history") {
+      ui.stripDir.textContent = "最近看过";
+      ui.stripDir.title = `最多留 ${HISTORY_MAX} 条，重复查看只置顶`;
+    } else {
+      ui.stripDir.textContent = browse.dir ? baseOf(browse.dir) : "";
+      ui.stripDir.title = browse.dir || "";
+    }
   }
   if (ui.stripCount) ui.stripCount.textContent = browse.items.length ? `${browse.items.length} 张` : "";
   if (ui.stripTip) {
     ui.stripTip.textContent = tip || "";
     ui.stripTip.hidden = !tip;
   }
+  markStripSourceButtons();
 }
 
 function toggleStrip(byUser) {
   if (!browse.items.length) {
-    setStatus("还没有可浏览的文件夹（先打开一张本机的图）");
+    setStatus(emptyListTip());
     return;
   }
   browse.open = !browse.open;
@@ -826,7 +953,7 @@ function buildStrip() {
     name.textContent = shortName(it.name || baseOf(it.path));
     const size = document.createElement("span");
     size.className = "fs-size";
-    size.textContent = formatBytes(it.size);
+    size.textContent = stripMetaText(it);
     main.appendChild(name);
     main.appendChild(size);
     row.appendChild(no);
@@ -1136,7 +1263,7 @@ const stripIO =
 /** 浏览到列表里第 index 张：2/4 图下落窗严格交替，单图下永远换 A；失败不推进游标 */
 async function browseTo(index) {
   if (!browse.items.length) {
-    setStatus("这个目录里没有图片");
+    setStatus(browse.source === "history" ? "历史里还没有图片" : "这个目录里没有图片");
     return;
   }
   if (index < 0 || index >= browse.items.length) {
@@ -1180,6 +1307,9 @@ async function browseTo(index) {
   }
   browse.slot = key;
   browse.idx = index;
+  // 逐张浏览也是「真看了这一张」：必须记进历史（目录源里翻完 30 张，历史里就该有 30 条），
+  // 但用 reorder:false —— 只落盘不重排，否则历史源下每按一次方向键列表就跳一次
+  recordView(item.path, { reorder: false });
   // 大图刚读过盘，那份 data URL 直接给侧栏复用，省一次 read_image
   rememberThumb(item.path, typeof pane.img?.src === "string" && pane.img.src.startsWith("data:") ? pane.img.src : "");
   setPicked(pane);
@@ -1203,7 +1333,7 @@ async function browseTo(index) {
 
 function stepBrowse(delta) {
   if (!browse.items.length) {
-    setStatus("还没有可浏览的文件夹（先打开一张本机的图）");
+    setStatus(emptyListTip());
     return;
   }
   if (browse.idx < 0) {
@@ -1256,6 +1386,30 @@ if (ui.btnStripClose) ui.btnStripClose.addEventListener("click", () => {
   browse.userClosed = true;
   applyStripVisibility();
 });
+
+// 两个列表源的切换入口（头部那两个 tab）
+if (ui.btnSrcHistory) ui.btnSrcHistory.addEventListener("click", () => setStripSource("history"));
+if (ui.btnSrcDir) ui.btnSrcDir.addEventListener("click", () => setStripSource("dir"));
+
+/**
+ * 清空查看历史：只有整份清，没有单条删（那需要一整套行的增删 UI，而「清掉重来」
+ * 已经覆盖了唯一的真实需求）。侧栏那句提示不能是「暂无图片」：那是后端列不出来的
+ * 措辞，这里是用户自己清的，得说清是谁干的
+ */
+if (ui.btnHistoryClear) {
+  ui.btnHistoryClear.addEventListener("click", async () => {
+    if (!isTauriRuntime) return;
+    try {
+      await invoke("clear_history");
+    } catch (err) {
+      console.error("[history] 清空查看历史失败:", err);
+      setStatus("清空查看历史失败: " + errText(err));
+      return;
+    }
+    applyHistory({ items: [] }, { tip: "查看历史已清空（下一次打开本机的图重新开始记）" });
+    setStatus("已清空查看历史");
+  });
+}
 
 /* --------------------------------------------------------------------------
  * 视图交互：滚轮缩放 / 拖拽平移 / 坐标读数
@@ -1840,6 +1994,8 @@ refreshStatus();
 // 布局/同步/滚轮行为从 prefs.json 恢复（非 Tauri 环境直接返回，用出厂态）。
 // 异步：首帧先按 HTML 写死的 layout-2 排布，读到存的那一档再切过去
 loadPrefs();
+// 侧栏默认源（最近看过）冷启动拉一次；不自动弹出侧栏
+loadHistory();
 
 // 切回对比视图时重新量一次：视图隐藏期间 clientWidth 是 0，不能在那时候 fit
 onViewChange((name) => {

@@ -1,4 +1,4 @@
-//! 本地存储与通用工具：设备身份、对端绑定、消息历史、收藏树。
+//! 本地存储与通用工具：设备身份、对端绑定、消息历史、收藏树、查看历史。
 //!
 //! 全部落在 `app_data_dir` 下，不跨设备同步（设计已确认）。
 //! 字段命名一律 snake_case，与前端读法保持一致 —— 不加任何 serde rename_all，
@@ -466,6 +466,78 @@ impl Preferences {
 }
 
 /* --------------------------------------------------------------------------
+ * 查看历史（history.json）
+ * ------------------------------------------------------------------------ */
+
+/// 历史最多留多少条。侧栏是一次全渲染的（行很轻，小图靠观察名单只解可见那十几张），
+/// 这个上限是防膨胀与防「翻不到头」，不是性能阈值。
+pub const HISTORY_MAX: usize = 100;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HistoryItem {
+    /// 图片的绝对路径原文（不 canonicalize，跟 `Preferences::inbox` 同一个口径：
+    /// 把一个合法的软链换成它指向的地方，用户看到的路径就变了）
+    pub path: String,
+    /// 最后一次查看的时刻（毫秒）。同一张只留一条，重复查看只刷新它并置顶
+    pub seen: i64,
+}
+
+#[derive(Default, Debug, Serialize, Deserialize)]
+pub struct HistoryFile {
+    pub items: Vec<HistoryItem>,
+}
+
+impl HistoryFile {
+    /// 读时清脏，跟 `Preferences::normalize` 一个路子：手改坏的历史不能让侧栏
+    /// 出现一排点不动的空行，也不能因为一条脏数据把整份列表丢掉。
+    /// - 丢弃空 path 与非绝对路径（相对路径会相对于进程当前目录，不可预期）
+    /// - 按 path 去重，留 `seen` 更大的那条
+    /// - 按 seen 降序（新的在前）并截断到 `HISTORY_MAX`
+    /// - `seen <= 0` 补当前时间（手改成 0 也不致于排到最末尾去）
+    pub fn normalize(&mut self) {
+        // 100 条量级下不引 HashMap：双层循环最坏一万次比较，比多一个 import 与分配更便宜
+        let mut kept: Vec<HistoryItem> = Vec::with_capacity(self.items.len());
+        for it in self.items.drain(..) {
+            if it.path.is_empty() || !Path::new(&it.path).is_absolute() {
+                continue;
+            }
+            let seen = if it.seen > 0 { it.seen } else { now_ms() };
+            match kept.iter_mut().find(|k| k.path == it.path) {
+                Some(k) => {
+                    if seen > k.seen {
+                        k.seen = seen;
+                    }
+                }
+                None => kept.push(HistoryItem { path: it.path, seen }),
+            }
+        }
+        // 同一毫秒内记了两张时按路径定序：否则上游顺序稍有差别就会让
+        // 行号每次读出来都跳，看起来像随机重排
+        kept.sort_by(|a, b| b.seen.cmp(&a.seen).then_with(|| a.path.cmp(&b.path)));
+        kept.truncate(HISTORY_MAX);
+        self.items = kept;
+    }
+
+    /// 记一次查看：已有同路径就拎到最前并刷新 `seen`，没有就插到最前，最后截断。
+    /// 与 `normalize` 共用「新的在前」这一份口径，不在调用方各写一遍。
+    ///
+    /// 前提是 `items` 已经「新的在前」（截断砍的是末尾）—— 所有调用方拿到的列表
+    /// 都出自 `Store::load_history`，那份已经 normalize 过，这里不再重排一次。
+    pub fn record(&mut self, path: &str, seen: i64) {
+        if let Some(i) = self.items.iter().position(|it| it.path == path) {
+            self.items.remove(i);
+        }
+        // 同一毫秒里连记两条时（一次粘贴进来好几张、自动化跑一轮），normalize 会
+        // 把并列的那两条按路径重排，看上去像随机换位。顶到队首时刻 +1 保证
+        // 「后看的在前」在毫秒粒度内也成立
+        let floor = self.items.first().map(|it| it.seen).unwrap_or(0);
+        let seen = if seen > floor { seen } else { floor + 1 };
+        self.items.insert(0, HistoryItem { path: path.to_string(), seen });
+        self.items.truncate(HISTORY_MAX);
+    }
+}
+
+/* --------------------------------------------------------------------------
  * Store：所有本地读写走这里
  * ------------------------------------------------------------------------ */
 
@@ -729,6 +801,28 @@ impl Store {
                 .as_slice(),
         )
     }
+
+    /* ---- history：看过的图片，只存路径与时刻 ---- */
+
+    /// 没这份文件（首启动）或整份被改坏就回空列表，不是 Err —— 历史读不出来
+    /// 不值得把侧栏初始化挂掉。脏值在这一步统一清掉，下一次保存就是干净份
+    pub fn load_history(&self) -> HistoryFile {
+        let mut h = fs::read_to_string(self.file("history.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str::<HistoryFile>(&t).ok())
+            .unwrap_or_default();
+        h.normalize();
+        h
+    }
+
+    pub fn save_history(&self, h: &HistoryFile) -> Result<(), String> {
+        atomic_write(
+            &self.file("history.json"),
+            serde_json::to_vec_pretty(h)
+                .map_err(|e| format!("序列化查看历史失败: {e}"))?
+                .as_slice(),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -962,6 +1056,115 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&other);
         let _ = std::fs::remove_dir_all(&s.dir);
+    }
+
+    #[test]
+    fn 查看历史没文件时回空列表且能往返() {
+        let s = 临时存储("hist-roundtrip");
+        assert!(
+            s.load_history().items.is_empty(),
+            "首启动没这份文件，读出来应是空列表而不是报错"
+        );
+        std::fs::create_dir_all(&s.dir).unwrap();
+
+        s.save_history(&HistoryFile {
+            items: vec![
+                HistoryItem { path: "/a/1.jpg".into(), seen: 200 },
+                HistoryItem { path: "/a/2.jpg".into(), seen: 100 },
+            ],
+        })
+        .unwrap();
+        let back = s.load_history();
+        assert_eq!(back.items.len(), 2);
+        assert_eq!(back.items[0].path, "/a/1.jpg", "新的在前");
+        assert_eq!(back.items[1].path, "/a/2.jpg");
+
+        // 整份被改坏：回空列表，不报错 —— 历史读不出来不值得把侧栏初始化挂掉
+        std::fs::write(s.file("history.json"), "{ 这不是 JSON").unwrap();
+        assert!(s.load_history().items.is_empty());
+        let _ = std::fs::remove_dir_all(&s.dir);
+    }
+
+    #[test]
+    fn 查看历史清脏值去重并封顶到上限() {
+        // 用当前时刻做基准：`seen <= 0` 补的是 now_ms()，写死小整数会被它盖过去，
+        // 排序断言就变成了测「补的时刻比谁都大」而不是测降序
+        let 现在 = now_ms();
+        let mut h = HistoryFile {
+            items: vec![
+                HistoryItem { path: "".into(), seen: 现在 + 9000 },           // 空路径
+                HistoryItem { path: "recv/今日.png".into(), seen: 现在 + 8000 }, // 相对路径
+                HistoryItem { path: "/a/x.jpg".into(), seen: 现在 + 1000 },
+                HistoryItem { path: "/a/x.jpg".into(), seen: 现在 + 5000 }, // 重复：留 seen 大的
+                HistoryItem { path: "/a/y.jpg".into(), seen: 0 },   // 脏时刻，要补当前
+            ],
+        };
+        h.normalize();
+        assert_eq!(h.items.len(), 2, "空路径与相对路径都被丢弃，重复的只留一条");
+        assert_eq!(h.items[0].path, "/a/x.jpg", "去重后按 seen 降序");
+        assert_eq!(h.items[0].seen, 现在 + 5000, "同一条重复时留更大的那个时刻");
+        assert_eq!(h.items[1].path, "/a/y.jpg");
+        assert!(h.items[1].seen >= 现在, "seen<=0 要补一个当前时间，不能留在 0");
+
+        // 截断：塞 HISTORY_MAX + 50 条，留下的必须是最靠前的那 100 个。
+        // seen 从 1 起：等于 0 的那条会被补成当前时间，反倒排到最前去
+        let mut many = HistoryFile { items: Vec::new() };
+        for i in 0..(HISTORY_MAX + 50) {
+            many.items.push(HistoryItem { path: format!("/a/{i:04}.jpg"), seen: i as i64 + 1 });
+        }
+        many.normalize();
+        assert_eq!(many.items.len(), HISTORY_MAX);
+        assert_eq!(many.items[0].path, format!("/a/{:04}.jpg", HISTORY_MAX + 49), "新的在前");
+        assert_eq!(many.items[HISTORY_MAX - 1].path, "/a/0050.jpg", "被砍的是最旧那 50 条");
+    }
+
+    #[test]
+    fn 记一次查看是置顶不是追加() {
+        let mut h = HistoryFile {
+            items: vec![
+                HistoryItem { path: "/a/1.jpg".into(), seen: 300 },
+                HistoryItem { path: "/a/2.jpg".into(), seen: 200 },
+                HistoryItem { path: "/a/3.jpg".into(), seen: 100 },
+            ],
+        };
+        // 看已有的那张：只置顶刷新，列表长度不变
+        h.record("/a/3.jpg", 400);
+        assert_eq!(h.items.len(), 3, "同一张只留一条");
+        assert_eq!(h.items[0].path, "/a/3.jpg");
+        assert_eq!(h.items[0].seen, 400);
+        assert_eq!(h.items[1].path, "/a/1.jpg", "被顶下去的两条保持原有相对顺序");
+
+        // 新的一张：插到最前
+        h.record("/a/9.jpg", 500);
+        assert_eq!(h.items[0].path, "/a/9.jpg");
+        assert_eq!(h.items.len(), 4);
+
+        // 同一毫秒里连着记（seen 撞车）：后记的那条仍在前面，重读也不被按路径重排
+        let mut same = HistoryFile {
+            items: vec![HistoryItem { path: "/a/keep.jpg".into(), seen: 500 }],
+        };
+        same.record("/a/later.jpg", 500);
+        same.normalize();
+        assert_eq!(same.items[0].path, "/a/later.jpg", "并列时刻要顶到更大，不能靠路径定序取胜");
+        assert_eq!(same.items[1].path, "/a/keep.jpg");
+
+        // 满员后再记一条：最旧那条掉出去。这里必须按「新的在前」建满员列表 ——
+        // record 只置顶不重排，排序是 load 时 normalize 的活（命令拿到的列表都来自 load_history）
+        let mut full = HistoryFile { items: Vec::new() };
+        for i in 0..HISTORY_MAX {
+            full.items.push(HistoryItem {
+                path: format!("/a/{i:04}.jpg"),
+                seen: HISTORY_MAX as i64 - i as i64,
+            });
+        }
+        full.record("/a/new.jpg", HISTORY_MAX as i64 + 1);
+        assert_eq!(full.items.len(), HISTORY_MAX, "封顶不因新记录而突破");
+        assert_eq!(full.items[0].path, "/a/new.jpg");
+        assert_eq!(full.items[1].path, "/a/0000.jpg", "原有顺序整体后移一位");
+        assert!(
+            !full.items.iter().any(|it| it.path == "/a/0099.jpg"),
+            "被挤掉的是末尾那条（最旧的）"
+        );
     }
 
     #[test]

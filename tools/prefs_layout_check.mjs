@@ -364,6 +364,15 @@ async function invokeStub(cmd, args) {
     }
     case "take_pending_paths":
       return [];
+    // 侧栏现在默认列「最近看过」：这三条得能应，不然 invoke 就抛「命令不存在」。
+    // 这里固定回一份空历史：本文件验的是布局/同步/分隔条，不是历史源那条路（那在
+    // tools/folder_browse_check.mjs 第 18 节），下面进门就先切到目录源
+    case "get_history":
+      return { items: [] };
+    case "record_view":
+      return { items: [] };
+    case "clear_history":
+      return null;
     default:
       return null;
   }
@@ -479,6 +488,13 @@ function check(name, ok, extra = "") {
 }
 
 await settle();
+
+/* 侧栏默认源已换成「最近看过」，而这里 1~9 节靠的是「载入一张本地图就列出它所在目录」：
+   进门先点一下「当前文件夹」，后面那些列表断言才照旧按目录源跑 */
+check("默认那枚是「最近看过」（切之前它是亮的）", byId("btn-src-history").classSet.has("is-active") && !byId("btn-src-dir").classSet.has("is-active"));
+click(byId("btn-src-dir"));
+await settle();
+check("切到目录源后那枚 tab 亮、头部不再说「最近看过」", byId("btn-src-dir").classSet.has("is-active") && byId("fs-dir").text !== "最近看过", byId("fs-dir").text);
 
 /* ===================== 1) 首启动：没这份文件就是出厂态 ===================== */
 check("没有 prefs.json 时按出厂态两图并排", bodyLayout() === "layout-2", bodyLayout());
@@ -604,7 +620,7 @@ check("单图下 ⌘O 选三张只铺进 A 窗", srcOf("a") === A0 && srcOf("b")
 click(byId("btn-clear"));
 await settle(2);
 await openTo("a", A2); // 打开最后一张，侧栏应该列出这个目录
-check("载入本地图后侧栏自动列出这个目录", rows().length === 3 && byId("filmstrip").hidden === false, `行数=${rows().length}`);
+check("目录源下：载入本地图后侧栏自动列出这个目录", rows().length === 3 && byId("filmstrip").hidden === false, `行数=${rows().length}`);
 check(
   "列表按自然序排（IMG_2 < IMG_10 < IMG_100）",
   rows().map((r) => r.dataset.path).join(",") === [A0, A1, A2].join(","),
@@ -1198,6 +1214,135 @@ check(
   "这两项只在抽屉打开那一刻读（进启动路径就会多一份 get_prefs + inbox_dir 往返，也会拿到一份可能旧的）",
   /if \(ui\.settings\.classList\.contains\("is-open"\)\) refreshRecvPrefs\(\);/.test(xferJs) &&
     /async function refreshRecvPrefs\(\) \{[\s\S]{0,200}?invoke\("get_prefs"\)/.test(xferJs)
+);
+
+/* ---------------------------- 图标管线那三步 ---------------------------- */
+// 为什么这几条要钉住：换图标时踩到「npm run icon 本身就是坏的」——tauri icon 不带参数
+// 会去找 ./app-icon.png，直接报 no such file。这类「一执行就错」的东西最该前移成静态合约。
+const pkgJson = readFileSync(join(here, "..", "package.json"), "utf8");
+const makeIconPy = readFileSync(join(here, "..", "tools", "make_icon.py"), "utf8");
+const gitignore = readFileSync(join(here, "..", ".gitignore"), "utf8");
+check(
+  "npm run icon 必须把源图路径写死（tauri icon 不带参数会去找 ./app-icon.png，直接失败）",
+  pkgJson.includes('"icon": "tauri icon assets/app-icon-source.png"')
+);
+check(
+  "make_icon.py 是产源图的唯一入口，写的就是 assets/app-icon-source.png（手贴 PNG 会被下一次跑脚本覆盖）",
+  makeIconPy.includes('OUT = Path(__file__).resolve().parent.parent / "assets" / "app-icon-source.png"') &&
+    existsSync(join(here, "..", "assets", "app-icon-source.png"))
+);
+check(
+  "tauri icon 每次都会多生成 ios/android 两套（本项目没移动目标），这两个目录得在 .gitignore 里",
+  /^src-tauri\/icons\/ios$/m.test(gitignore) && /^src-tauri\/icons\/android$/m.test(gitignore)
+);
+
+/* ------------------------- 查看历史（侧栏默认源） ------------------------- */
+/* 为什么这一堆要钉住静态源码：历史那份数据走的是「读不到就当没发生过」的路子，
+   真机上不报错、只表现为「侧栏白着」或「记不住」，逻辑自检（folder_browse）那边
+   用的是桩后端，咬不到 Rust 侧的闸门与「别塞进 prefs.json」这个决定。 */
+const historyRs = readFileSync(join(here, "..", "src-tauri", "src", "history.rs"), "utf8");
+check(
+  "三条历史命令都进了 generate_handler，mod history 也在（漏一条就是 invoke 到「命令不存在」，而那只在点 tab / 清空时才炸）",
+  /mod history;/.test(libRs) &&
+    /history::get_history,/.test(libRs) &&
+    /history::record_view,/.test(libRs) &&
+    /history::clear_history,/.test(libRs) &&
+    (historyRs.match(/#\[tauri::command\]/g) || []).length === 3
+);
+check(
+  "history.json 只经 atomic_write 落盘；读那一路把「文件缺失」与「解析失败」都回成空列表而不是 Err（第一次启动本就没这个文件，回 Err 侧栏就永远白着）",
+  /fn save_history\(&self, h: &HistoryFile\) -> Result<\(\), String> \{\s*atomic_write\(\s*&self\.file\("history\.json"\)/.test(storeRs) &&
+    /fn load_history\(&self\) -> HistoryFile \{[\s\S]{0,240}?\.unwrap_or_default\(\);\s*h\.normalize\(\);/.test(storeRs) &&
+    !/fs::write\(\s*&self\.file\("history\.json"\)/.test(storeRs)
+);
+check(
+  "上限只有一处定义：Rust 用 HISTORY_MAX 常量截断（写死数字的两处一分叉，头部那句「最多留 N 条」就成了假话），前端那份显式对齐它",
+  /pub const HISTORY_MAX: usize = 100;/.test(storeRs) &&
+    /kept\.truncate\(HISTORY_MAX\);/.test(storeRs) &&
+    !/kept\.truncate\(100\)/.test(storeRs) &&
+    /const HISTORY_MAX = 100;/.test(cmpJs) &&
+    /最多留 \$\{HISTORY_MAX\} 条/.test(cmpJs)
+);
+check(
+  "绝对路径的闸门在 Rust 那侧：空与相对都硬拒（前端只发一条路径，闸门放前端就等于没放）",
+  /fn record\(store: &Store, path: &str\) -> Result<HistoryFile, String> \{[\s\S]{0,400}?if path\.is_empty\(\) \{[\s\S]{0,240}?!Path::new\(path\)\.is_absolute\(\)/.test(historyRs)
+);
+const setPrefsSig = prefsRs.slice(
+  prefsRs.indexOf("pub fn set_prefs("),
+  prefsRs.indexOf(") -> Result<Value, String>", prefsRs.indexOf("pub fn set_prefs(")) + 20
+);
+check(
+  "源选择不进 prefs.json：set_prefs 的参数表里只有 layout/sync/wheel/notify/inbox，没有任何 history/source 字样（钉住「侧栏开合与源都是单次会话自己的事」这条既有口径）",
+  setPrefsSig.includes("layout: Option<String>") &&
+    setPrefsSig.includes("inbox: Option<String>") &&
+    !/history|source|strip/i.test(setPrefsSig) &&
+    !/invoke\("set_prefs"[\s\S]{0,120}?(history|stripSource|source)/.test(cmpJs)
+);
+check(
+  "两个源 tab 的 id 在 HTML 与 CSS 里都在，CSS 还留着 is-active 那一态（只有 HTML 没样式的话，点亮与不点亮看着一样，用户分不出当前源）",
+  ["btn-src-history", "btn-src-dir"].every((id) => html.includes(`id="${id}"`)) &&
+    /\.fs-src \{/.test(css) &&
+    /\.fs-src\.is-active \{/.test(css)
+);
+check(
+  "清空那枚按钮在对比视图的设置抽屉里（不是工具栏、也不是传输抽屉），且那句说明写清「不动图片文件本身」",
+  (() => {
+    const from = html.indexOf('id="cmp-settings"');
+    const to = html.indexOf("</aside>", from);
+    const seg = from >= 0 && to > from ? html.slice(from, to) : "";
+    return seg.includes('id="btn-history-clear"') && seg.includes("不动图片文件本身");
+  })()
+);
+check(
+  "历史渲染直接吃写盘的返回值：对比视图里只有一处 get_history 的 invoke（冷启动那次），写完再读一遍会多一次往返且两份顺序可能不一致",
+  /noteViewSeen\(path\)\.then\(\(list\) => \{[\s\S]{0,400}?applyHistory\(list, \{ fromView: true \}\)/.test(cmpJs) &&
+    (cmpJs.match(/invoke\("get_history"\)/g) || []).length === 1
+);
+check(
+  "记一次查看不 await：一次图片载入不该卡在磁盘写上（失败只 setStatus 说一声，侧栏继续用本地那份）",
+  !/await\s+(noteViewSeen|invoke\("record_view")/.test(cmpJs) &&
+    /function recordView\(path,[\s\S]{0,600}?noteViewSeen\(path\)\.then/.test(cmpJs) &&
+    /function noteLoaded\([\s\S]{0,700}?recordView\(path\);/.test(cmpJs) &&
+    /export function noteViewSeen\([\s\S]{0,700}?setStatus\("记录查看失败: "/.test(apiJs)
+);
+check(
+  "record_view 只从 api.js 发这一个口子：各视图自己写一份就会有三套截断/去重口径（同一张在两个视图里被记成两条）",
+  (apiJs.match(/invoke\("record_view"/g) || []).length === 1 &&
+    !/invoke\("record_view"/.test(cmpJs) &&
+    !/invoke\("record_view"/.test(xferJs) &&
+    /export function noteViewSeen\(path\)/.test(apiJs)
+);
+check(
+  "侧栏逐张浏览走的是「不重排」那一路：browseTo 真读到图之后必须显式传 reorder:false（漏了它历史源下每按一次方向键列表就跳一次、下一张也跟着变），且不重排时也要把最新那份存进 browse.history",
+  /async function browseTo\([\s\S]{0,3000}?recordView\(item\.path, \{ reorder: false \}\)/.test(cmpJs) &&
+    /function recordView\(path, \{ reorder = true \} = \{\}\)/.test(cmpJs) &&
+    /else browse\.history = /.test(cmpJs)
+);
+check(
+  "传输视图点缩略图放大也记一次查看（放大就是真看过），而且不在这个视图里碰侧栏渲染（它压根看不见侧栏）",
+  /function openLightbox\([\s\S]{0,600}?noteViewSeen\(lightboxPath\)/.test(xferJs) &&
+    !/applyHistory/.test(xferJs) &&
+    xferJs.includes("noteViewSeen,")
+);
+check(
+  "切源与历史渲染都不清 thumbCache：清它的那一处只在 ensureFolderList 里（换目录才该丢；来回切一次源把小图全丢了是白费重读盘）",
+  (cmpJs.match(/thumbCache\.clear\(\)/g) || []).length === 1 &&
+    (() => {
+      const from = cmpJs.indexOf("async function ensureFolderList");
+      return cmpJs.slice(from, cmpJs.indexOf("\n}", from)).includes("thumbCache.clear()");
+    })()
+);
+check(
+  "文案按源分流：空列表那句两个版本都在，历史源下头部写「最近看过」而不是目录名（历史源下说「目录」是假话）",
+  cmpJs.includes('"还没有查看历史（先打开一张本机的图）"') &&
+    cmpJs.includes('"还没有可浏览的文件夹（先打开一张本机的图）"') &&
+    /if \(browse\.source === "history"\) \{\s*ui\.stripDir\.textContent = "最近看过";/.test(cmpJs)
+);
+check(
+  "侧栏那一句 aria-label 与工具栏文案都不再假定列表就是文件夹（「当前图片所在文件夹」是历史源下的假话）",
+    !html.includes("当前图片所在文件夹") &&
+    html.includes('aria-label="图片列表"') &&
+    /id="btn-strip"[^>]*>列表<\/button>/.test(html)
 );
 
 /* -------------------------------------------------------------------------- */
