@@ -844,6 +844,12 @@ kill %1; rm -rf "$SB"
     而不是只看 run 的结论；补发的话，那个残缺 Release 要么删掉重建，要么另起一个版本号
     （挪 tag 得先删远端 tag，属破坏性操作，要显式确认）。
     本次实测：run 结论 failure，Release 里只有 `image-compare-macos-arm64.tgz`，缺 `image-compare-setup.exe`。
+    ② 更坑的是补发：删 tag 会连带删掉同名 Release，而这个级联是异步的、按 tag 名匹配的 ——
+    它能在删除之后好几分钟才落地，于是把 CI 刚新建的那个 Release 一起吃掉。实测两次「删了重推同名 tag」：
+    两个平台的 job 全绿、两步 `Attach installers` 都报 success（因为它写进了一个正在等死的 Release），
+    结果 `/releases` 里始终没有 vX.Y.Z。所以：同名的 tag 只删一次、不反复挪；真要把包补上，
+    优先另起一个版本号推新 tag（新 tag 不涉及删除，不会武装这个级联），或者等删除事件排空后
+    在网页上对原 run 点 Re-run jobs（本机没 token 时只能走这两条）。
 
 ---
 
