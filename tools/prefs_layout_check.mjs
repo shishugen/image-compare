@@ -20,7 +20,7 @@
  *
  * 运行：node tools/prefs_layout_check.mjs
  */
-import { mkdirSync, copyFileSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdirSync, copyFileSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import os from "node:os";
@@ -1083,6 +1083,9 @@ const prefsRs = readFileSync(join(here, "..", "src-tauri", "src", "prefs.rs"), "
 const soundRs = readFileSync(join(here, "..", "src-tauri", "src", "net", "sound.rs"), "utf8");
 const serverRs = readFileSync(join(here, "..", "src-tauri", "src", "net", "server.rs"), "utf8");
 const cargoToml = readFileSync(join(here, "..", "src-tauri", "Cargo.toml"), "utf8");
+const winCheckLib = existsSync(join(here, "win-check", "src", "lib.rs"))
+  ? readFileSync(join(here, "win-check", "src", "lib.rs"), "utf8")
+  : "";
 check(
   "抽屉里七个新节点齐（开关、文案、试听、路径、选择/恢复/打开），且 checkbox 初始就是 checked（出厂态要能与 Rust 的 default_notify 对上，不然「读到空」与「读到默认」行为不一样）",
   ['chk-notify-sound', 'sw-notify-text', 'btn-notify-audition', 'inbox-dir-value', 'btn-inbox-choose', 'btn-inbox-reset', 'btn-inbox-reveal'].every((id) => html.includes(`id="${id}"`)) &&
@@ -1130,8 +1133,8 @@ check(
 );
 check(
   "sound.rs 三个平台分支齐：mac 走 afplay、Windows 走 MessageBeep、其余空实现（少一条要么是没声，要么是 dead_code 告警）",
-  /#\[cfg\(target_os = "macos"\)\][\s\S]{0,600}?Command::new\("afplay"\)/.test(soundRs) &&
-    /#\[cfg\(target_os = "windows"\)\][\s\S]{0,600}?MessageBeep\(/.test(soundRs) &&
+  /#\[cfg\(target_os = "macos"\)\]\s*\{[\s\S]{0,600}?Command::new\("afplay"\)/.test(soundRs) &&
+    /#\[cfg\(target_os = "windows"\)\]\s*\{[\s\S]{0,900}?MessageBeep\(/.test(soundRs) &&
     /#\[cfg\(not\(any\(target_os = "macos", target_os = "windows"\)\)\)\]/.test(soundRs)
 );
 check(
@@ -1141,8 +1144,36 @@ check(
     /sound::should_play\(enabled, &last, id\)/.test(netMod)
 );
 check(
-  "MessageBeep 只给已有的 windows 依赖加一个 feature，不引新 crate（Win32_UI_WindowsAndMessaging）",
-  /"Win32_UI_WindowsAndMessaging",/.test(cargoToml) && !/\nrodio|\ncoreaudio|\nopenal/.test(cargoToml)
+  "MessageBeep 只给已有的 windows 依赖加 feature，不引新 crate；Debug 与 WindowsAndMessaging 两个都在（函数归在 Diagnostics::Debug 页、参数类型 MB_ICONASTERISK 还在 WindowsAndMessaging）",
+  /"Win32_UI_WindowsAndMessaging",/.test(cargoToml) &&
+    /"Win32_System_Diagnostics_Debug",/.test(cargoToml) &&
+    !/\nrodio|\ncoreaudio|\nopenal/.test(cargoToml)
+);
+/* Windows 那一半只在 CI 的 windows job 里编译：mac 全绿、整个 run 因为这条挂掉时，
+   Release 里只会剩一个资产。import 路径与返回值形态都是「运行期看不出来、编译器才说」的东西，
+   所以这里用壳工程真正编一遍 + 下面三条合约把结论钉住 */
+check(
+  "sound.rs 从 System::Diagnostics::Debug 引 MessageBeep，且没有从 WindowsAndMessaging 引它（CI 那次的 E0432 就是这么来的）",
+  /use windows::Win32::System::Diagnostics::Debug::MessageBeep;/.test(soundRs) &&
+    /use windows::Win32::UI::WindowsAndMessaging::MB_ICONASTERISK;/.test(soundRs) &&
+    !/WindowsAndMessaging::MessageBeep/.test(soundRs)
+);
+check(
+  "MessageBeep 的返值按 Result<()> 收（if let Err），不是当 BOOL 手调 .as_bool()（0.62 改了签名，按旧写法根本编译不过）",
+  /if let Err\(e\) = unsafe \{ MessageBeep\(MB_ICONASTERISK\) \}/.test(soundRs) &&
+    !/MessageBeep\([^)]*\)\.as_bool\(\)/.test(soundRs)
+);
+check(
+  "MAC_SOUNDS 带 macos 门控（windows / linux 分支都不读它，不门控就是一个 never used 告警，本仓要求 0 warning）",
+  /#\[cfg\(target_os = "macos"\)\]\s*const MAC_SOUNDS: \[&str; 3\]/.test(soundRs)
+);
+check(
+  "tools/win-check 壳工程在场，include 的正是那两个只有 windows 才编译的文件，且它的 windows 特性列表也带上 Debug（壳少给特性会把好代码报成找不到符号）",
+  existsSync(join(here, "win-check", "Cargo.toml")) &&
+    // 用字符串包含而不是正则：path 里满是 / 与 .，正则转义很容易漏一个把正则字面量直接关掉
+    ['#[path = "../../../src-tauri/src/net/sound.rs"]', "mod sound;",
+      '#[path = "../../../src-tauri/src/net/badge.rs"]', "mod badge;"].every((s) => winCheckLib.includes(s)) &&
+    /"Win32_System_Diagnostics_Debug",/.test(readFileSync(join(here, "win-check", "Cargo.toml"), "utf8"))
 );
 check(
   "两处落库各调一次 notify_arrived：文字一条、文件整批一条（少一处就是收文件不出声；一个文件夹也就响一声）",

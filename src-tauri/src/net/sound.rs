@@ -10,6 +10,9 @@
 //! 同一套打法），Windows 用系统提示音 `MessageBeep`。
 
 /// mac 上的候选音效，按优先级排。精简过的系统可能没有 Tink，所以留两级兜底
+///
+/// 只在 mac 上编：windows / linux 分支都不读它，不门控就是一个 dead_code 告警（本仓要求 0 warning）
+#[cfg(target_os = "macos")]
 const MAC_SOUNDS: [&str; 3] = [
     "/System/Library/Sounds/Tink.aiff",
     "/System/Library/Sounds/Ping.aiff",
@@ -49,11 +52,17 @@ pub fn play(id: &str) {
     {
         // MB_ICONASTERISK = 「星号」事件音，跟着用户的系统提示音设置走，
         // 比我们自己塞一个 wav 更不容易出现「别人机器上怎么没声」。
-        // ⚠️ 这两行在本机（macOS）编译不到，参数类型与返回值形态只能到 Windows 上实测
-        use windows::Win32::UI::WindowsAndMessaging::{MessageBeep, MB_ICONASTERISK};
-        // 返回值是 BOOL，且这条不影响任何后续动作：系统禁了提示音也不能当成传输失败
-        if !unsafe { MessageBeep(MB_ICONASTERISK.0) }.as_bool() {
-            eprintln!("[sound] MessageBeep 没响（{id}，系统提示音被关了？）");
+        //
+        // ⚠ MessageBeep 不在 WindowsAndMessaging 模块里，而在 System::Diagnostics::Debug
+        //（windows 0.62.2 的元数据把 user32 这个函数归到了那一页），所以 Cargo.toml
+        // 除了 Win32_UI_WindowsAndMessaging 还要多一个 Win32_System_Diagnostics_Debug；
+        // 参数直接吃 MESSAGEBOX_STYLE（不是 .0），返值是 Result<()>（底层 BOOL 为假就是 Err）。
+        // 这一条是靠 tools/win-check 壳工程在 mac 上编译到才发现的（CI 以前只在 windows job 里报）
+        use windows::Win32::System::Diagnostics::Debug::MessageBeep;
+        use windows::Win32::UI::WindowsAndMessaging::MB_ICONASTERISK;
+        // 响不了不影响任何后续动作：系统禁了提示音不能当成传输失败
+        if let Err(e) = unsafe { MessageBeep(MB_ICONASTERISK) } {
+            eprintln!("[sound] MessageBeep 没响（{id}，系统提示音被关了？）: {e}");
         }
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]

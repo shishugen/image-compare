@@ -160,6 +160,8 @@ mac-image-compare/
 │   │                       asset 协议那三处联动的配置），以及本机接收那一段：提示音开关/收件目录
 │   │                       在 HTML/CSS/store.rs/prefs.rs/sound.rs/server.rs/Cargo.toml 七处的静态合约，见第九节）
 │   ├── zoom_math_check.js  缩放数学回归：锚点不变性、上下限封顶、双窗同步
+│   ├── win-check/          壳工程：在 mac 上给 net/sound.rs 与 net/badge.rs 的 Windows 分支做类型检查
+│   │                       （第七节第 8 条，CI 的 windows job 挂过一次之后补的）
 │   ├── clip-win-check/     壳工程：在 mac 上给 clip.rs 的 Windows 分支做类型检查（见第七节第 8 条），
 │   │                       内含 onlytiff.js（备「剪贴板里只有 TIFF」）、onlyfileurl.js（备「只有
 │   │                       file-url 且只给 data」）、restore_clip.js（探针跑完把剪贴板还原给用户）
@@ -200,7 +202,8 @@ node tools/zoom_math_check.js                                                   
 node tools/paste_route_check.mjs                                                # 粘贴分流：什么时候该抢、抢来交给谁（10 项）
 node tools/session_route_check.mjs                                              # 会话路由：同一台多框、未读、分页游标不串、离线排队、放大层缩放平移与田字平铺、「传输」按钮角标、本机接收抽屉（182 项）
 node tools/folder_browse_check.mjs                                              # 文件夹浏览：列表口径、按可见窗轮转落窗（两图/四图）、拖行到指定窗、小图两套口径（148 项）
-node tools/prefs_layout_check.mjs                                               # 三档布局与系统设置：联动、存盘、单图浏览、CSS/HTML/tauri.conf.json/Rust 侧合约，含本机接收那一段与提示音（151 项）
+node tools/prefs_layout_check.mjs                                               # 三档布局与系统设置：联动、存盘、单图浏览、CSS/HTML/tauri.conf.json/Rust 侧合约，含本机接收那一段与提示音（155 项）
+cd tools/win-check && CARGO_TARGET_DIR=../../src-tauri/target cargo check --target x86_64-pc-windows-msvc --lib   # Windows 那半在 mac 上过类型检查（见第七节第 8 条）
 node tools/net_selftest.mjs                                                     # 端到端协议自检
 ```
 
@@ -494,16 +497,21 @@ kill %1; rm -rf "$SB"
 8. **clip.rs 的 Windows 分支在 mac 上只能靠壳工程做类型检查**：正式工程的 build.rs（tauri-build → winres）
    交叉到 windows 时要资源编译器（llvm-rc），本机没有，直接 `cargo check --target x86_64-pc-windows-msvc`
    会在 build script 里 panic。`tools/clip-win-check/` 就是为了绕过这一层：它用 `#[path]` 把 clip.rs 原样
-   include 进来，再补 store / net::server 几个最小桩，依赖版本与正式工程一致：
+   include 进来，再补 store / net::server 几个最小桩，依赖版本与正式工程一致。同一套做法后来又多了一个壳：
+   `tools/win-check/` 只 include `net/sound.rs` 与 `net/badge.rs`（这两个文件不需要桩，直接 `#[path]` 就够），
+   它是在 CI 的 windows job 因为一个 `use` 路径报错挂掉之后补的（见 #35）：
 
    ```bash
    rustup target add x86_64-pc-windows-msvc
-   cd tools/clip-win-check
+   cd tools/clip-win-check    # 或 tools/win-check（两个壳共用一个 target 目录）
    CARGO_TARGET_DIR=../../src-tauri/target cargo check --target x86_64-pc-windows-msvc --lib
    ```
 
    （共享 target 目录是为了重用已编好的 tauri 依赖，否则一次要重编几分钟）。
    这一步只保证能过类型检查，真正装包仍然只能靠 CI 的 windows 产物与实机验证。
+   壳里那句 `#![allow(dead_code)]` 不是多余的：正式工程里 `first_existing` / `should_play` 这些由
+   server.rs 调，而壳只 include 这两个文件，不 allow 就会一堆 never used 告警把真问题淹掉。
+   想知道某个 `#[cfg]` 门控能不能拆（比如 MAC_SOUNDS），就得临时把这句 allow 注释掉再跑。
 9. **粘进来的图“显示不正常”，先查剪贴板再查代码**：源程序往剪贴板里放的可能就是它给这个文件画的
    **占位图标**（实测过一张 1024×1024 的“JPG 文档图标”位图，微信未下载完的图、云盘在线文件、
    网页里加载失败的 img 都是这个形状）。我们原样存进 pastebox，看上去就是“图错了”，其实链路全对。
@@ -816,9 +824,26 @@ kill %1; rm -rf "$SB"
     出厂态三方一致（HTML `checked` / `default_notify()` / `Preferences::default()` 用的是同一个函数）、
     `set_prefs` 的参数名必须是单词 `notify` / `inbox`（#1 那条 camelCase 约束的续集：写成 `inboxDir` 不会报错，
     只会永远不生效）、`check_inbox` 三道闸齐、启动建目录不许再硬写 `dir.join("inbox")`、sound.rs 三个 `#[cfg]` 分支齐、
-    两处落库各调一次 `notify_arrived`、两个新命令进了 `generate_handler`。这 16 条每条都做过负向变异（改坏必须变红）。
-    ⑤ Windows 那一半本机编译不到（`MessageBeep` 的返回值形态、`MB_ICONASTERISK.0` 能不能直接递），
-    属于「到 Windows 上才能知」的东西，真机验收时得单独过一条。
+    两处落库各调一次 `notify_arrived`、两个新命令进了 `generate_handler`。这 20 条每条都做过负向变异（改坏必须变红）。
+    ⑤ Windows 那一半的编译错靠 `tools/win-check` 在 mac 上就能抓到（#8），不等到推 tag。
+    本机跑不了的是“听”：`MB_ICONASTERISK` 到底跟着谁的提示音方案走、系统禁了提示音时会不会
+    把错误当成传输失败 —— 那两条归真机验收，不归编译器。
+
+35. **windows 0.62 把 `MessageBeep` 归在 `System::Diagnostics::Debug` 页下，而参数类型仍在 `UI::WindowsAndMessaging`**。
+    头文件上这是 user32 的函数，元数据里却不是按 DLL 分页的 —— 按直觉从 `WindowsAndMessaging` 引，mac 上一切正常
+    （那个分支根本不参与编译），直到 CI 的 windows job 报 `E0432: unresolved import`。签名也不是旧文档里那套：
+    参数直接吃 `MESSAGEBOX_STYLE`（不是 `.0`），返值是 `Result<()>`（不返 BOOL 让你手调 `.as_bool()`）。
+    靠 `tools/win-check` 在 mac 上重编一遍就能拿到同样的报错，不必拿 CI 当编译器用（见第七节第 8 条）。
+    另外两个细节：`Win32_System_Diagnostics_Debug` 这个特性目前是 tauri 传递过来的（不显式声明也能过），
+    但自己 import 了就自己写上；`MAC_SOUNDS` 必须跟 `#[cfg(target_os = "macos")]`，否则 windows 分支就是一个
+    never used 告警（本仓要求 0 warning）。这三条现在都有静态合约钉着。
+
+36. **CI 的 windows job 挂了，Release 可能已经拿到了一半资产**。`build.yml` 里 `fail-fast: false`，
+    mac 那条腿成功就会把 tgz 传上 Release（上传那一步在各条腿自己名下），windows 腿编译失败只让整个 run 变红，
+    看起来就是「发版成功了，但只有一个包」。所以推完 tag 必须核 `releases/tags/vX.Y.Z` 的资产个数与名字，
+    而不是只看 run 的结论；补发的话，那个残缺 Release 要么删掉重建，要么另起一个版本号
+    （挪 tag 得先删远端 tag，属破坏性操作，要显式确认）。
+    本次实测：run 结论 failure，Release 里只有 `image-compare-macos-arm64.tgz`，缺 `image-compare-setup.exe`。
 
 ---
 

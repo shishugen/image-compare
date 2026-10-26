@@ -1,0 +1,36 @@
+[package]
+name = "win-check"
+version = "0.0.0"
+edition = "2021"
+
+# 壳工程：在 mac 上给 net/badge.rs 与 net/sound.rs 的 Windows 分支做真实类型检查。
+# 正式工程的 build.rs（tauri-build → tauri-winres）交叉到 windows 时要资源编译器 llvm-rc，
+# 本机没有，直接 cargo check 会在 build script 里 panic —— 与 clip-win-check 是同一个绕法，
+# 只是这个壳 include 的是角标与提示音那两个文件。跑法：
+#   cd tools/win-check
+#   CARGO_TARGET_DIR=../../src-tauri/target cargo check --target x86_64-pc-windows-msvc --lib
+#
+# 只保证过类型检查，真正装包仍只能靠 CI 的 windows 产物与实机验证。
+# 空 workspace 声明防止 cargo 把它并进上级工作区。
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+tauri = { version = "2", features = ["protocol-asset", "devtools"] }
+serde_json = "1"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# 特性列表与正式工程保持一致，否则 MessageBeep 这些会以「找不到符号」的形式报出来，
+# 看着像代码错其实是壳工程少给了特性
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_System_Com",
+  "Win32_System_DataExchange",
+  "Win32_System_Memory",
+  "Win32_System_Ole",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_System_Diagnostics_Debug",
+  "Win32_UI_Shell",
+] }

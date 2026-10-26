@@ -45,8 +45,12 @@ windows = {
     "Win32_System_DataExchange",
     "Win32_System_Memory",
     "Win32_System_Ole",
-    # 收消息那一声「叮」：MessageBeep 走系统提示音，不引新 crate，只多一个特性
+    # 收消息那一声「叮」：MessageBeep 走系统提示音，不引新 crate，只多一个特性。
+    # ⚠ 函数本体在 System::Diagnostics::Debug 页下（见 net/sound.rs 的 import），
+    # 而参数类型 MESSAGEBOX_STYLE 在 UI::WindowsAndMessaging。Debug 这个特性目前是 tauri
+    # 传递过来的（去掉它也能过编译），但我们自己 import 了就自己声明，不押上游的特性列表
     "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Diagnostics_Debug",
     "Win32_UI_Shell",
   ],
 }
