@@ -50,6 +50,14 @@ const ui = {
   candidates: el("xfer-candidates"),
   settings: el("xfer-settings"),
   btnSettings: el("btn-xfer-settings"),
+  // 本机接收（提示音 / 收件目录）
+  notifyChk: el("chk-notify-sound"),
+  notifyText: el("sw-notify-text"),
+  btnAudition: el("btn-notify-audition"),
+  inboxValue: el("inbox-dir-value"),
+  btnInboxChoose: el("btn-inbox-choose"),
+  btnInboxReset: el("btn-inbox-reset"),
+  btnInboxReveal: el("btn-inbox-reveal"),
   dropHint: el("xfer-drop-hint"),
   dropText: el("xfer-drop-text"),
   older: el("xfer-older"),
@@ -58,6 +66,7 @@ const ui = {
   filterCount: el("xfer-filter-count"),
   sessions: el("xfer-sessions"),
   sessionRows: el("xfer-session-rows"),
+  navBadge: el("nav-badge-xfer"),
   btnNewChat: el("btn-session-new"),
   chatPick: el("xfer-chat-pick"),
   pickList: el("xfer-pick-list"),
@@ -65,6 +74,13 @@ const ui = {
   lightboxImg: el("lightbox-img"),
   lightboxCap: el("lightbox-cap"),
   lightboxClose: el("lightbox-close"),
+  lightboxIn: el("lightbox-in"),
+  lightboxOut: el("lightbox-out"),
+  lightboxFit: el("lightbox-fit"),
+  lightboxOne: el("lightbox-one"),
+  lightboxZoom: el("lightbox-zoom"),
+  lightboxTile: el("lightbox-tile"),
+  lightboxTileStage: el("lightbox-tile-stage"),
 };
 
 /** 「未标记」那一行的会话 ID 与对端 ID 都是空串：老历史里 peer 缺失的那些消息进这里。
@@ -80,6 +96,8 @@ const state = {
   sending: false,
   /** 当前搜索条件：kind 为 all/text/image/folder/archive/other，q 为关键词 */
   filter: { kind: "all", q: "" },
+  /** 当前生效的收件目录，只给「打开目录」用（抽屉打开时读一次） */
+  inboxDir: "",
 };
 
 /**
@@ -242,8 +260,11 @@ function renderPeerHead() {
   const sess = sessionRowOf(state.cur);
   // 地址与最后在线时间取自 peers 列表：会话行里的 last 是「最后一条消息」，不是「最后 ping 通」
   const peer = (state.status?.peers || []).find((p) => p.id === sess?.peer) || null;
-  const canSend = !!sess && sess.bound && sess.online;
-  node.classList.toggle("is-online", canSend);
+  // 能不能发只看这台加没加过：离线也能发（存本机排队，上线自动补发），
+  // 而未配对是连地址都没有、排队也排不了，所以那个仍然得禁着
+  const canSend = !!sess && sess.bound;
+  const reachable = canSend && sess.online;
+  node.classList.toggle("is-online", reachable);
   if (!state.status?.passphrase_set) {
     node.innerHTML = `<span class="dot dot-warn"></span><b>还没设置配对口令</b><span class="peer-sub">每台填同一个口令才能互认</span>`;
   } else if (!sess) {
@@ -346,6 +367,30 @@ function applySessions(payload) {
   renderPeerHead();
 }
 
+/* --------------------------------------------------------------------------
+ * 左侧「传输」按钮上的未读总数
+ *
+ * 与会话栏每行那个数、以及图标角标（Rust 侧 badge.rs）同一个口径：
+ * 就是把 sessions 里每行的 unread 加起来，「未标记」与补漏行在后端已被置 0，
+ * 掺不进来。封顶 99+ 也照抄会话行那套写法，免得同一个未读数在三个地方长三种样。
+ *
+ * 只由 renderSessionRail() 调：本地累加未读那条路（bumpRail）不重新取列表，
+ * 挂在这里两边就不可能各算一份。
+ * ------------------------------------------------------------------------ */
+function renderNavBadge(rows) {
+  const b = ui.navBadge;
+  if (!b) return;
+  // unread 缺字段、为 null、为负都当 0：宁可少报一个角标，不能报出个 NaN
+  const total = (rows || []).reduce((n, s) => n + (s.unread > 0 ? s.unread : 0), 0);
+  if (!total) {
+    b.textContent = "";
+    b.hidden = true;
+    return;
+  }
+  b.textContent = total > 99 ? "99+" : String(total);
+  b.hidden = false;
+}
+
 /** 切到某个对话框（参数是会话 ID，不是对端 ID） */
 async function openSession(id) {
   if (state.cur === id) return;
@@ -369,6 +414,9 @@ let railSig = "";
 
 function renderSessionRail() {
   if (!ui.sessionRows) return;
+  // 按钮上那个总数与这些行同时从 state.sessionList 算出来：
+  // 只在这里刷新，本地加未读（bumpRail）那条路才不会漏掉角标
+  renderNavBadge(state.sessionList);
   const sig = JSON.stringify([
     state.cur,
     state.sessionList.map((s) => [s.id, s.peer, s.name, s.online, s.unread, s.last, s.summary]),
@@ -702,9 +750,12 @@ function buildBubble(m) {
     bar.className = "bar";
     const fill = document.createElement("i");
     fill.style.width = m.state === "sent" ? "100%" : "0%";
+    // 刚入队的那一条还没开始传，进度条只能是一路 0%，看着像卡住了：先藏起来
     bar.appendChild(fill);
+    bar.hidden = m.state === "queued";
     bubble.appendChild(bar);
     rec.bar = fill;
+    rec.barBox = bar;
 
     const actsBox = document.createElement("div");
     actsBox.className = "msg-actions";
@@ -770,6 +821,8 @@ function attachActions(rec, m) {
 
 /** 放大层当前那张图的本机路径，给 ⌘C 用（离开放大层就清掉） */
 let lightboxPath = null;
+/** 当前那张图的 data URL：田字平铺拿它当 background-image（与单张同一份数据，不二次读盘） */
+let lightboxSrc = null;
 
 /** 只有带本机路径的图片才出预览；接收中的占位气泡没 path，等 xfer-done 补上再调一次 */
 function attachThumb(rec, m) {
@@ -833,17 +886,22 @@ function paintThumb(rec, dataUrl) {
   img.className = "thumb";
   img.src = dataUrl;
   img.alt = rec.name;
-  img.title = "点击放大";
+  img.title = "点击放大（滚轮缩放、拖拽平移）";
   rec.thumbBox.appendChild(img);
   rec.thumbBox.addEventListener("click", () => openLightbox(dataUrl, rec.name, rec.path));
 }
 
 function openLightbox(dataUrl, name, p) {
   lightboxPath = p || null;
+  lightboxSrc = dataUrl || null;
   ui.lightboxImg.src = dataUrl;
   ui.lightboxImg.alt = name || "";
   ui.lightboxCap.textContent = [name, p].filter(Boolean).join(" · ");
   ui.lightbox.hidden = false;
+  // 每次打开都从「适应窗口」开始，不拿上一张的倍率去套这一张
+  lbMeasure();
+  lbReset();
+  lb.touched = false;
 }
 
 function closeLightbox() {
@@ -852,6 +910,181 @@ function closeLightbox() {
   ui.lightbox.hidden = true;
   // 去掉 src 让 webview 立刻释放解码后的大图内存
   ui.lightboxImg.removeAttribute("src");
+  // 关层把倍数、变换与平铺一起清掉：图还挂在 DOM 上，留着旧 transform 会让下次打开时
+  // 新图解码完成前的那一瞬按上一张的倍率撑开
+  lb.zoom = lb.fit = 1;
+  lb.x = lb.y = 0;
+  lb.drag = null;
+  lb.moved = false;
+  lb.touched = false;
+  lb.tiled = false;
+  if (ui.lightboxImg.style) ui.lightboxImg.style.transform = "";
+  if (ui.lightboxTileStage && ui.lightboxTileStage.style) {
+    // 背图不抹掉就是一份 base64 一直挂在内存里（与去掉 img.src 同一个道理）
+    ui.lightboxTileStage.style.backgroundImage = "none";
+    lb.bgSrc = null;
+  }
+  if (ui.lightbox.classList) {
+    ui.lightbox.classList.remove("is-zoomable", "is-dragging", "is-tiled");
+  }
+}
+
+/* ---------- 放大层的缩放 ----------
+   口径跟对比视图那套一致：存的 zoom = 渲染宽 / 原始宽，1 = 100% = 原始像素，25%~800%，
+   步长、滚轮因子、锚点公式都与 view-compare.js 一致（学一次两边通用）。 */
+const LB_MIN = 0.25;
+const LB_MAX = 8;
+const LB_STEP_IN = 1.25;
+const LB_STEP_OUT = 0.8;
+// 与对比视图的滚轮因子同值
+const LB_WHEEL_K = 0.0018;
+// 拖拽超过这几个像素才算「在平移」，否则仍当点击处理（背着一张图点背景是关层，不是拖动）
+const LB_DRAG_SLOP = 3;
+// 键盘平移一步
+const LB_PAN_KEY = 40;
+// 图被拖出去时至少留在屏幕里的部分，不然一路拖会拖到全黑找不到北
+const LB_KEEP = 60;
+
+const clampLb = (v) => Math.min(LB_MAX, Math.max(LB_MIN, v));
+
+/** zoom = 渲染/原始；fit = 被 CSS 装进屏幕那一档对应的 zoom（图比屏幕小就是 1，
+ *  CSS 不会把图放大）；box = 打开那一刻量到的**未变换**布局盒，变换不改布局，
+ *  所以整层开着期间都拿它当基准（窗口变宽了会重新量，见 resize） */
+const lb = { zoom: 1, fit: 1, x: 0, y: 0, natural: 0, box: { left: 0, top: 0, w: 0, h: 0 }, drag: null, moved: false, touched: false, tiled: false, bgSrc: null };
+
+/** CSS 已经把图装进屏幕了，transform 只负责在它之上再放大多少 */
+const lbScale = () => lb.zoom / (lb.fit || 1);
+
+function lbMeasure() {
+  const r = ui.lightboxImg.getBoundingClientRect();
+  lb.natural = ui.lightboxImg.naturalWidth || 0;
+  lb.box = { left: r.left || 0, top: r.top || 0, w: r.width || 0, h: r.height || 0 };
+  lb.fit = lb.natural > 0 && lb.box.w > 0 ? lb.box.w / lb.natural : 1;
+}
+
+function lbReset() {
+  lb.zoom = lb.fit;
+  lb.x = 0;
+  lb.y = 0;
+  lb.drag = null;
+  lbRender();
+}
+
+/** 平移量收拢：让图中心至少落在视口内 LB_KEEP 的位置上。
+ *  平铺模式下不收：图案本来就铺满了整屏，拖不到全黑；而拿单张那个盒的中心去卡
+ *  一个周期图案，只会把「拖到隔壁那条缝」错拦下来 */
+function lbClamp() {
+  if (lb.tiled) return;
+  const s = lbScale();
+  const w = lb.box.w * s;
+  const h = lb.box.h * s;
+  const vw = window.innerWidth || 0;
+  const vh = window.innerHeight || 0;
+  if (!vw || !vh) return;
+  const cx = lb.box.left + lb.x + w / 2;
+  const cy = lb.box.top + lb.y + h / 2;
+  const nx = Math.min(vw - LB_KEEP, Math.max(LB_KEEP, cx));
+  const ny = Math.min(vh - LB_KEEP, Math.max(LB_KEEP, cy));
+  lb.x += nx - cx;
+  lb.y += ny - cy;
+}
+
+function lbRender() {
+  const s = lbScale();
+  lbClamp();
+  if (ui.lightboxImg.style) {
+    ui.lightboxImg.style.transform =
+      s === 1 && lb.x === 0 && lb.y === 0 ? "" : `translate(${lb.x}px, ${lb.y}px) scale(${s})`;
+  }
+  if (ui.lightboxZoom) ui.lightboxZoom.textContent = `${Math.round(lb.zoom * 100)}%`;
+  // 只比适应窗口大才有东西可平移；适应状态下拖图是无意义的抢鼠标
+  const draggable = s > 1.001;
+  if (ui.lightbox && ui.lightbox.classList) {
+    ui.lightbox.classList.toggle("is-zoomable", draggable);
+    ui.lightbox.classList.toggle("is-tiled", lb.tiled);
+    if (!draggable) ui.lightbox.classList.remove("is-dragging");
+  }
+  if (lb.tiled) lbRenderTiles(s);
+}
+
+/** 田字平铺：格子尺寸 = 单张在当前倍率下的渲染尺寸，把「某个格子的左上角」
+ *  （也就是四份的十字交点）钉在单张图的中心 + 平移量上 —— 于是十字落在屏幕正中，
+ *  四份围绕它拼。与单张共用同一套 zoom/x/y，所以切换不跳视野 */
+function lbRenderTiles(s) {
+  const st = ui.lightboxTileStage;
+  if (!st || !st.style) return;
+  // background-image 只在换图时写一次：那串 base64 可以很大，每一帧重拼字符串会卡
+  if (lb.bgSrc !== lightboxSrc) {
+    lb.bgSrc = lightboxSrc || null;
+    st.style.backgroundImage = lightboxSrc ? `url("${lightboxSrc}")` : "none";
+  }
+  const tw = Math.max(1, lb.box.w * s);
+  const th = Math.max(1, lb.box.h * s);
+  st.style.backgroundSize = `${tw}px ${th}px`;
+  st.style.backgroundPosition = `${lb.box.left + lb.box.w / 2 + lb.x}px ${lb.box.top + lb.box.h / 2 + lb.y}px`;
+}
+
+/** 田字开关：倍率与平移量原样带过去，单张与平铺是同一套状态的两种画法 */
+function lbSetTiled(on) {
+  lb.tiled = on === undefined ? !lb.tiled : !!on;
+  lbRender();
+}
+
+/** 当前这张渲染后图的中心，换算成「相对未变换盒左上」的锚点（按钮与键盘走这里，
+ *  所以图是围着自己的中心长回去，不会跳到屏幕中间） */
+function lbCenter() {
+  const s = lbScale();
+  return { x: lb.x + (lb.box.w * s) / 2, y: lb.y + (lb.box.h * s) / 2 };
+}
+
+/** 锚点缩放：保住 anchor 处的图像内容不动。anchor 是相对未变换布局盒左上的坐标，
+ *  算法与 view-compare.js 的 applyZoom 同一套（scale 与 zoom 只差一个常数，比例可直代） */
+function lbZoomAt(target, anchor) {
+  const z = clampLb(target);
+  const k = z / lb.zoom;
+  if (k === 1) return;
+  lb.touched = true;
+  lb.x = anchor.x - (anchor.x - lb.x) * k;
+  lb.y = anchor.y - (anchor.y - lb.y) * k;
+  lb.zoom = z;
+  lbRender();
+}
+
+function lbStep(factor) {
+  lbZoomAt(lb.zoom * factor, lbCenter());
+}
+
+/** 鼠标点 → 锚点坐标（减掉打开时量到的盒左上） */
+function lbAnchor(ev) {
+  return { x: (ev.clientX || 0) - lb.box.left, y: (ev.clientY || 0) - lb.box.top };
+}
+
+/** 「适应」与「1:1」：前者连平移量一起清掉，后者以当前中心为锚 */
+function lbToFit() {
+  lb.touched = true;
+  lbReset();
+}
+
+function lbToOne() {
+  lb.touched = true;
+  lbZoomAt(1, lbCenter());
+}
+
+/** 双击：在「适应」与「原始像素」之间切，以点击处为锚 */
+function lbToggleDbl(ev) {
+  lb.touched = true;
+  if (lb.zoom > lb.fit * 1.001) {
+    lbToFit();
+  } else {
+    lbZoomAt(1, lbAnchor(ev));
+  }
+}
+
+function lbPan(dx, dy) {
+  lb.touched = true;
+  lb.x += dx;
+  lb.y += dy;
+  lbRender();
 }
 
 /** 「下载」在这套架构里就是「把已落盘的东西复制到用户选的位置」：
@@ -870,10 +1103,23 @@ function paintMeta(rec, m) {
   // 收进来的那一条标的是对话框名而不是设备名：同一台的两个框得能看出不是同一个
   const who = m.dir === "in" ? sessName(msgSid(m), m.peer) : "本机";
   const stateText =
-    rec.state === "sending" ? " · 传输中" : rec.state === "failed" ? " · 失败" : "";
+    rec.state === "sending" ? " · 传输中" : rec.state === "failed" ? " · 失败" : rec.state === "queued" ? " · 待发" : "";
   rec.meta.textContent = `${who} · ${fmtTime(m.ts)}${stateText}`;
   rec.el.classList.toggle("is-failed", rec.state === "failed");
   rec.el.classList.toggle("is-sending", rec.state === "sending");
+  rec.el.classList.toggle("is-queued", rec.state === "queued");
+  // 进度条只在真在传的时候才有意义：排队那几天它只能停在 0%，
+  // 补发一开始（状态转 sending）就把它放回来
+  if (rec.barBox) rec.barBox.hidden = rec.state === "queued";
+  // 排队与失败都得看得出「为什么还没出去、已经白试了几次」，
+  // 否则用户只看到一颗待发点，不知道是该等还是该重发
+  const why = m.reason ? `（第 ${m.retry || 1} 次尝试失败：${m.reason}）` : "";
+  rec.el.title =
+    rec.state === "queued"
+      ? `对方离线，已排队；它上线后会自动补发${why}`
+      : rec.state === "failed"
+        ? `补发失败，已停手${why}；可以重新发送`
+        : "";
 }
 
 /**
@@ -1244,8 +1490,12 @@ async function runSend(task) {
   ui.btnFile.disabled = true;
   ui.btnFolder.disabled = true;
   try {
-    await task();
-    toast("已送达");
+    const res = await task();
+    // 后端不再拿「离线」当错误：返回来的可能是刚入队的那一条（文件是一批）。
+    // 两种回执得说清楚，否则用户以为东西已经送出去了
+    const list = Array.isArray(res) ? res : [res];
+    const queued = list.some((m) => m && m.state === "queued");
+    toast(queued ? "对方离线，已排队，上线自动发出" : "已送达");
   } catch (err) {
     const msg = errText(err);
     console.error("[xfer] 发送失败:", err);
@@ -1289,6 +1539,86 @@ async function savePairConfig() {
   try {
     renderStatus(await invoke("set_pair_config", args));
     toast("配对设置已保存");
+  } catch (err) {
+    toast(errText(err), "error");
+  }
+}
+
+/* --------------------------------------------------------------------------
+ * 本机接收：提示音与收件目录
+ *
+ * 两项都存在 prefs.json，与对比视图那份是同一个文件、同一对命令（get_prefs / set_prefs）。
+ * set_prefs 是局部更新：这里只传 notify / inbox，不会把用户选的布局冲掉，反之也一样。
+ * 声音本身在 Rust 侧播（js 里 new Audio() 会被 WKWebView 的自动播放策略拦下，
+ * 而且窗口关掉后根本没人在场），这里只负责那个开关。
+ * ------------------------------------------------------------------------ */
+
+/** 开关那颗是真 input 藏在 label 里、靠 CSS 画的，关着时从外观上看不出区别，所以文案跟着状态走 */
+function paintNotifySwitch(on) {
+  if (ui.notifyChk) ui.notifyChk.checked = on;
+  if (ui.notifyText) ui.notifyText.textContent = on ? "响一声" : "不响";
+}
+
+function paintInboxDir(path, custom) {
+  state.inboxDir = path;
+  if (ui.inboxValue) ui.inboxValue.textContent = path || "读取失败";
+  // 已经在默认目录上时「恢复默认」没有意义，灰掉比点了没反应好懂
+  if (ui.btnInboxReset) ui.btnInboxReset.disabled = !custom;
+}
+
+/** 抽屉每次打开都重读：另一个抽屉可能刚改过同一份 prefs.json，用户也可能手改过磁盘 */
+async function refreshRecvPrefs() {
+  try {
+    const p = await invoke("get_prefs");
+    // 老 prefs.json 里没这两项时 Rust 已按出厂态补齐，这里只兜「命令整个没回」
+    if (p && typeof p.notify === "boolean") paintNotifySwitch(p.notify);
+  } catch (_) {
+    /* 非 Tauri 环境（自检桩）保持 HTML 初始态 */
+  }
+  try {
+    const d = await invoke("inbox_dir");
+    if (d && d.path) paintInboxDir(String(d.path), !!d.custom);
+  } catch (_) {}
+}
+
+/** 存一项偏好。失败时 Rust 那句带路径的原因必须原样上屏，否则只能看到「点了没反应」 */
+async function saveRecvPrefs(patch, okText) {
+  try {
+    await invoke("set_prefs", patch);
+    if (okText) toast(okText);
+    return true;
+  } catch (err) {
+    toast(errText(err), "error");
+    return false;
+  }
+}
+
+async function chooseInboxDir() {
+  let picked = null;
+  try {
+    picked = await invoke("pick_folder", { title: "选择收件目录" });
+  } catch (err) {
+    toast(errText(err), "error");
+    return;
+  }
+  // 用户在原生对话框里点了取消：什么都不该做，更不该把目录清空
+  if (!picked) return;
+  const ok = await saveRecvPrefs(
+    { inbox: picked },
+    "收件目录已改，只影响新收到的文件；旧的留在原处照样能打开",
+  );
+  if (ok) await refreshRecvPrefs();
+}
+
+async function resetInboxDir() {
+  // 空串在 Rust 侧就是「回到 <数据目录>/inbox」，不是一个叫空的目录
+  if (await saveRecvPrefs({ inbox: "" }, "收件目录已恢复默认")) await refreshRecvPrefs();
+}
+
+async function revealInboxDir() {
+  if (!state.inboxDir) return;
+  try {
+    await invoke("reveal_in_folder", { path: state.inboxDir });
   } catch (err) {
     toast(errText(err), "error");
   }
@@ -1394,24 +1724,98 @@ registerDropHoverHandler("transfer", (phase) => {
     return;
   }
   const sess = sessionRowOf(state.cur);
-  const online = !!sess && sess.bound && sess.online;
+  // 遮罩只在**未配对**时才拦：离线也已经能接了（入队等补发），拦住只会让人以为发不出去
+  const bound = !!sess && sess.bound;
+  const online = bound && sess.online;
   ui.dropHint.hidden = false;
-  ui.dropHint.classList.toggle("is-blocked", !online);
+  ui.dropHint.classList.toggle("is-blocked", !bound);
   ui.dropText.textContent = !state.status?.passphrase_set
     ? "先在「配对设置」里填口令"
     : !sess
       ? "先在左边选一个会话"
-      : online
-        ? `松开即发送给「${sess.name}」`
-        : `「${sess.name}」${sess.bound ? "离线，暂发不出去" : "还没添加，发不出去"}`;
+      : !bound
+        ? `「${sess.name}」还没添加：先配对才能发给它`
+        : online
+          ? `松开即发送给「${sess.name}」`
+          : `松开即发送：「${sess.name}」离线，会排队等它上线自动发出`;
 });
 
-// 放大层：点背景/关闭按钮/Esc 都能退出，只在有该 DOM 时绑定
+// 放大层：点背景/关闭按钮/Esc 都能退出，图本身可以缩放与平移，只在有该 DOM 时绑定
 if (ui.lightbox && ui.lightboxClose) {
   ui.lightboxClose.addEventListener("click", closeLightbox);
   ui.lightbox.addEventListener("click", (ev) => {
+    // 拖完图那一下松手也会发 click（落在背景上就会被当成「关层」），
+    // 所以这一只整体吃掉，不挑 target——否则背着一张图拖完还得再点一次才关得上
+    if (lb.moved) {
+      lb.moved = false;
+      return;
+    }
     if (ev.target === ui.lightbox) closeLightbox();
   });
+  // 大图解码完 naturalWidth 才准（开着层时量到的都是 0，1:1 与百分比会跟着偏）；
+  // 用户还没动过就顺势回到适应，动过了只把新量到的那一档补进渲染（倍率按原始口径不变，
+  // 不抢他正在看的细节，但标签也不能继续说谎）
+  ui.lightboxImg.addEventListener("load", () => {
+    lbMeasure();
+    if (!lb.touched) lbReset();
+    else lbRender();
+  });
+  // 视口变了，CSS 装出来的那一档（fit）与盒位置都得重量；直接退回适应，不猜新位置
+  window.addEventListener("resize", () => {
+    if (ui.lightbox.hidden) return;
+    lbMeasure();
+    lbReset();
+  });
+  // 滚轮以指针为锚缩放。必须 passive:false：被动监听器里 preventDefault 会被浏览器
+  // 忽略（并在控制台报告警），这一下就会漏给页面滚动
+  ui.lightbox.addEventListener(
+    "wheel",
+    (ev) => {
+      ev.preventDefault();
+      lbZoomAt(lb.zoom * Math.exp(-ev.deltaY * LB_WHEEL_K), lbAnchor(ev));
+    },
+    { passive: false }
+  );
+  // 双击与拖拽两个手势在「单张」与「平铺」下语义完全一样，写一份绑到两个面上：
+  // 平铺时那张图被 visibility 藏了（pointer-events 也不接），鼠标实际落在画布上
+  const lbOnDbl = (ev) => lbToggleDbl(ev);
+  const lbOnDown = (ev) => {
+    // 只在比适应窗口大的时候接管鼠标，否则适应状态下拖图无意义还抢鼠标
+    if (lbScale() <= 1.001) return;
+    ev.preventDefault();
+    lb.moved = false;
+    lb.drag = { x: ev.clientX || 0, y: ev.clientY || 0, ox: lb.x, oy: lb.y };
+  };
+  ui.lightboxImg.addEventListener("dblclick", lbOnDbl);
+  ui.lightboxImg.addEventListener("mousedown", lbOnDown);
+  // 顺带一个后果：平铺下整屏都是画布，点空白处永远命不中 `ev.target === lightbox`，
+  // 「点背景关层」自然失效，退出靠 ×、Esc 或再按一次田
+  if (ui.lightboxTileStage) {
+    ui.lightboxTileStage.addEventListener("dblclick", lbOnDbl);
+    ui.lightboxTileStage.addEventListener("mousedown", lbOnDown);
+  }
+  window.addEventListener("mousemove", (ev) => {
+    if (!lb.drag) return;
+    const dx = (ev.clientX || 0) - lb.drag.x;
+    const dy = (ev.clientY || 0) - lb.drag.y;
+    if (Math.abs(dx) + Math.abs(dy) < LB_DRAG_SLOP) return;
+    lb.touched = true;
+    lb.moved = true;
+    lb.x = lb.drag.ox + dx;
+    lb.y = lb.drag.oy + dy;
+    lbRender();
+    if (ui.lightbox.classList) ui.lightbox.classList.add("is-dragging");
+  });
+  window.addEventListener("mouseup", () => {
+    if (!lb.drag) return;
+    lb.drag = null;
+    if (ui.lightbox.classList) ui.lightbox.classList.remove("is-dragging");
+  });
+  if (ui.lightboxIn) ui.lightboxIn.addEventListener("click", () => lbStep(LB_STEP_IN));
+  if (ui.lightboxOut) ui.lightboxOut.addEventListener("click", () => lbStep(LB_STEP_OUT));
+  if (ui.lightboxFit) ui.lightboxFit.addEventListener("click", lbToFit);
+  if (ui.lightboxOne) ui.lightboxOne.addEventListener("click", lbToOne);
+  if (ui.lightboxTile) ui.lightboxTile.addEventListener("click", () => lbSetTiled());
   window.addEventListener("keydown", (ev) => {
     if (ev.key === "Escape") closeLightbox();
     // 放大状态下 ⌘C 等于「把这张图当文件复制」，不另设按钮
@@ -1419,6 +1823,41 @@ if (ui.lightbox && ui.lightboxClose) {
       if (ui.lightbox.hidden) return;
       ev.preventDefault();
       if (lightboxPath) copyPathAsFile(lightboxPath);
+      return;
+    }
+    if (ui.lightbox.hidden) return;
+    // 聊天输入框里打 “-”“0” 是要输字符，不是缩图；聚焦在输入控件里就让开
+    const tag = ((ev.target && ev.target.tagName) || "").toLowerCase();
+    if (tag === "input" || tag === "textarea") return;
+    const k = (ev.key || "").toLowerCase();
+    // + 与 = 同义：⌘+ 在 webview 里给的是 "+"，直接按则往往是 "="
+    if (k === "+" || k === "=") {
+      ev.preventDefault();
+      lbStep(LB_STEP_IN);
+    } else if (k === "-" || k === "_") {
+      ev.preventDefault();
+      lbStep(LB_STEP_OUT);
+    } else if (k === "0") {
+      ev.preventDefault();
+      lbToFit();
+    } else if (k === "1") {
+      ev.preventDefault();
+      lbToOne();
+    } else if (k === "t") {
+      ev.preventDefault();
+      lbSetTiled();
+    } else if (k === "arrowleft") {
+      ev.preventDefault();
+      lbPan(-LB_PAN_KEY, 0);
+    } else if (k === "arrowright") {
+      ev.preventDefault();
+      lbPan(LB_PAN_KEY, 0);
+    } else if (k === "arrowup") {
+      ev.preventDefault();
+      lbPan(0, -LB_PAN_KEY);
+    } else if (k === "arrowdown") {
+      ev.preventDefault();
+      lbPan(0, LB_PAN_KEY);
     }
   });
 }
@@ -1454,7 +1893,27 @@ ui.btnNewChat?.addEventListener("click", togglePick);
 ui.stream.addEventListener("pointerdown", hidePick);
 ui.btnSettings.addEventListener("click", () => {
   ui.settings.classList.toggle("is-open");
+  // 打开时读一次最新值：收起时没人看这几项，不值得时刻维护
+  if (ui.settings.classList.contains("is-open")) refreshRecvPrefs();
 });
+
+/* 本机接收那一段：开关即时存，失败就退回磁盘上那份 */
+if (ui.notifyChk) {
+  ui.notifyChk.addEventListener("change", async () => {
+    const on = ui.notifyChk.checked;
+    paintNotifySwitch(on);
+    if (!(await saveRecvPrefs({ notify: on }))) await refreshRecvPrefs();
+  });
+}
+if (ui.btnAudition) {
+  // 试听无视开关直接响（这一声就是用来分清「没消息」与「这台机器放不出声」的）
+  ui.btnAudition.addEventListener("click", () => {
+    invoke("play_notify_sound").catch((err) => toast(errText(err), "error"));
+  });
+}
+if (ui.btnInboxChoose) ui.btnInboxChoose.addEventListener("click", chooseInboxDir);
+if (ui.btnInboxReset) ui.btnInboxReset.addEventListener("click", resetInboxDir);
+if (ui.btnInboxReveal) ui.btnInboxReveal.addEventListener("click", revealInboxDir);
 
 /* 搜索：输入就筛。不加防抖——纯内存遍历几百个气泡，比等防抖窗口更快出结果 */
 if (ui.search) {

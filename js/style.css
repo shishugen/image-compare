@@ -375,6 +375,49 @@ body {
   font-size: 11px;
 }
 
+/* 侧栏行拖向图窗时跟手的那枚小牌。pointer-events: none 不能省：它盖在指针底下，
+   不屏蔽鼠标事件就会把自己当成落点，永远命中不到底下的窗。
+   落点高亮直接复用 .pane.drag-over（与从 Finder 拖文件进来同一套反馈） */
+.strip-ghost {
+  position: fixed;
+  left: 0;
+  top: 0;
+  z-index: 500;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 220px;
+  padding: 4px 8px 4px 4px;
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  background: rgba(8, 9, 12, 0.9);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+  color: var(--text);
+  font-size: 12px;
+  pointer-events: none;
+  /* 牌挂在指针上方并居左对齐，不致于压住自己正要选的那个落点 */
+  transform: translate(-8px, -130%);
+}
+
+.strip-ghost img {
+  width: 28px;
+  height: 28px;
+  border-radius: 5px;
+  object-fit: cover;
+}
+
+.strip-ghost .sg-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 拖拽期间整页禁选：按住行横向拖本来会开始选文字，光标也得说明这是拖不是选 */
+body.is-strip-drag {
+  user-select: none;
+  cursor: grabbing;
+}
+
 .stage {
   flex: 1 1 auto;
   display: flex;
@@ -655,7 +698,12 @@ body.layout-4 .stage .only-grid {
   display: flex;
 }
 
-body.layout-2 .stage .only-multi {
+/* B 窗在 2/4 两档都要在（上面注释写的就是这层意思）。三档重构时这里只留了
+   layout-2，于是 4 图下网格只放得下 A/C/D 三个窗、第四格空着，而 JS 的
+   LAYOUT_KEYS[4] 包着 b —— 它把交替浏览的下一张送到看不见的 B 窗，
+   看着就是「图载入了却展示不了」 */
+body.layout-2 .stage .only-multi,
+body.layout-4 .stage .only-multi {
   display: flex;
 }
 
@@ -702,6 +750,9 @@ body:not(.layout-2) .splitter {
 }
 
 .nav-btn {
+  /* 未读角标要贴着本按钮右上角，所以按钮必须是定位祖先：
+     少了这一行，绝对定位会挂到 .nav 上，角标跑到整条导航栏的顶上 */
+  position: relative;
   width: 40px;
   height: 40px;
   display: flex;
@@ -727,6 +778,35 @@ body:not(.layout-2) .splitter {
   background: #2f3846;
   border-color: var(--accent);
   color: #fff;
+}
+
+/* 左侧「传输」上的未读总数：与会话行那个 .s-badge 同色同形，
+   一个界面里「未读」只该有一种颜色（图标角标那边是系统画的，颜色改不了） */
+.nav-badge {
+  position: absolute;
+  top: -2px;
+  right: -2px;
+  z-index: 1;
+  min-width: 14px;
+  padding: 0 3px;
+  border-radius: 7px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 9px;
+  line-height: 14px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  /* 角标不吃点击：它贴在按钮角落里，默认会把悬停与点击从按钮上抢走 */
+  pointer-events: none;
+  /* 描一圈导航底色，否则贴在 40px 按钮边上会糊成一团 */
+  box-shadow: 0 0 0 1.5px var(--bg-panel);
+}
+
+/* 这一条严格说是多余的：[hidden] { display: none !important } 那条全局规则本来就能赢过
+   .nav-badge 上的任何 display。写下来只为跟 .chat-pick[hidden] / .stream-older[hidden] 同一套
+   写法：角标该不该藏，看它自己这一段就够了，不必先去发现那条 !important */
+.nav-badge[hidden] {
+  display: none;
 }
 
 .nav-ico {
@@ -1127,6 +1207,23 @@ textarea.input {
   gap: 6px;
 }
 
+/* 抽屉内部的小段落标题。配对设置抽屉里堆了六七段东西，
+   全靠这一块分开（drawer-head 那个 `<b>` 只能当整窗标题） */
+.set-sub {
+  margin-top: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+/* 收件目录是当前生效的绝对路径，可能很长而且不带空格 ——
+   不强制拆行会把抽屉撑出横向滚动条，用户反而看不到自己选到哪去了 */
+.inbox-dir {
+  font-size: 12px;
+  color: var(--text-dim);
+  word-break: break-all;
+}
+
 .field {
   display: flex;
   flex-direction: column;
@@ -1267,6 +1364,30 @@ textarea,
 
 .msg.is-sending .msg-meta {
   color: var(--accent);
+}
+
+/* 待发（离线排队）：空心圆点 —— 实心绿是「在线 / 已送达」，实心红是「离线 / 失败」，
+   这一颗还没落地，所以只描边不填心，跟会话栏那套点语言对得上 */
+.msg.is-queued .msg-meta {
+  color: #e6b450;
+}
+
+.msg.is-queued .msg-meta::before {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 5px;
+  border: 1px solid #e6b450;
+  border-radius: 50%;
+  vertical-align: 1px;
+}
+
+/* 排队中的气泡：还没开始传，虚线边 + 略暗（进度条是 JS 直接给 .bar 上 hidden 属性藏掉的，
+   这里不重复声明：只靠 CSS 的话，写自检的仿真环境里根本测不到那条规则有没有生效）*/
+.msg.is-queued .bubble {
+  border-style: dashed;
+  opacity: 0.82;
 }
 
 .bubble {
@@ -1552,6 +1673,8 @@ textarea,
   gap: 10px;
   background: rgba(8, 9, 12, 0.86);
   cursor: zoom-out;
+  /* 放大、平移超出屏幕的部分直接裁掉，不要让固定层把窗口撑出滚动条 */
+  overflow: hidden;
 }
 
 .lightbox img {
@@ -1560,9 +1683,88 @@ textarea,
   object-fit: contain;
   border-radius: var(--radius);
   cursor: default;
+  /* 缩放的原点定在左上角，与 `lightbox-zoom` 那套 25%~800% / 锚点公式对得上
+     （变换只改视觉，不改布局盒，所以打开时量到的盒整层开着期间都有效） */
+  transform-origin: 0 0;
+}
+
+/* 放大图后拖拽的手势反馈 */
+.lightbox.is-zoomable img {
+  cursor: grab;
+}
+
+.lightbox.is-dragging img {
+  cursor: grabbing;
+  /* 拖动时选中图片（拖拽选区）会把光标变成文本选择那套，体验上很怪 */
+  user-select: none;
+}
+
+/* 田字平铺的画布：铺满整层，格子尺寸与位置由 JS 按当前的倍率/平移量写 background-*。
+   默认不显示；开启时单张那张图只藏不删（visibility）——它的布局盒还得留着给
+   lbMeasure 重量，不然平铺状态下改窗口尺寸就量不到「适应那一档」是多宽了 */
+.lb-tile {
+  display: none;
+}
+
+.lightbox.is-tiled .lb-tile {
+  display: block;
+  position: absolute;
+  inset: 0;
+  /* 压在控件条/关闭按钮/说明行（都是 2）之下，但要在单张图之上 */
+  z-index: 1;
+  background-repeat: repeat;
+}
+
+.lightbox.is-tiled img {
+  visibility: hidden;
+  pointer-events: none;
+}
+
+/* 平铺下同样的拖拽反馈（图被藏起来了，鼠标落在画布上） */
+.lightbox.is-zoomable .lb-tile {
+  cursor: grab;
+}
+
+.lightbox.is-dragging .lb-tile {
+  cursor: grabbing;
+  user-select: none;
+}
+
+/* 缩放控件条：绝对定位，不参加 flex 布局——多占一行会把居中的图顶上去。
+   z-index 不能省：图一带上 transform 就自成层叠上下文，绘制顺序改成按 DOM 先后算，
+   而它在 HTML 里排在这些控件之后——不显式压一层，放大后的图就把「−」与百分比整个盖住 */
+.lb-tools {
+  position: absolute;
+  top: 10px;
+  right: 52px;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  /* 图铺到右上角时，没底色就只看得到字缝 */
+  padding: 3px 6px;
+  border-radius: 999px;
+  background: rgba(8, 9, 12, 0.62);
+}
+
+.lb-zoom {
+  /* 定宽：25% 跳到 800% 不能让整条控件左右抖 */
+  min-width: 44px;
+  text-align: center;
+  color: var(--text-dim);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.lb-txt {
+  padding: 0 8px;
+  font-size: 12px;
 }
 
 .lb-cap {
+  /* 也要压住：它在图之后但是静态元素，带 transform 的图照样盖得住它 */
+  position: relative;
+  z-index: 2;
   max-width: 90vw;
   color: var(--text-dim);
   font-size: 12px;
@@ -1575,6 +1777,8 @@ textarea,
   position: absolute;
   top: 10px;
   right: 14px;
+  /* 同 `.lb-tools`：它在 HTML 里排在图之前，不压一层会被放大后的图盖住关不掉 */
+  z-index: 2;
   width: 30px;
   height: 30px;
   border: 1px solid var(--border);

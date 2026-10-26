@@ -296,6 +296,8 @@ pub fn run() {
             }
             let hub = net::start(&app.handle().clone(), store.clone())?;
             app.manage(store);
+            // 冷启动先设一次角标：历史里本来就有未读的话，不该等到下一条新消息才亮
+            hub.emit_sessions();
             app.manage(hub);
             Ok(())
         })
@@ -318,6 +320,8 @@ pub fn run() {
             net::session_focus,
             net::session_delete,
             net::reveal_in_folder,
+            net::inbox_dir,
+            net::play_notify_sound,
             net::save_path_as,
             net::pick_folder,
             net::pick_send_files,
@@ -338,6 +342,21 @@ pub fn run() {
         .expect("error while building tauri application");
 
     app.run(|app_handle, event| {
+        // 关窗即清零角标。macOS 上关掉最后一个窗进程也不退（tao 没实现
+        // applicationShouldTerminateAfterLastWindowClosed，按 AppKit 默认不退），
+        // 此时窗已销毁、set_badge_* 拿不到窗，角标就会冻在最后那个数字上 ——
+        // 一个点不开又不会自己消失的红数字比没有更误导人。
+        // 这个回调本身就在主线程上跑，所以直接调 apply_badge，不再包 run_on_main_thread。
+        if let tauri::RunEvent::WindowEvent {
+            label,
+            event: tauri::WindowEvent::CloseRequested { .. },
+            ..
+        } = &event
+        {
+            if label == "main" {
+                net::badge::apply_badge(app_handle, 0);
+            }
+        }
         // macOS：Finder 的“打开方式”、双击默认应用、拖到 Dock 图标都汇到这里
         #[cfg(target_os = "macos")]
         if let tauri::RunEvent::Opened { urls } = &event {

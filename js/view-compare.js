@@ -12,6 +12,7 @@
  * ========================================================================== */
 
 import {
+  assetSrc,
   copyPathAsFile,
   currentView,
   el,
@@ -59,6 +60,8 @@ const ui = {
   stripCount: el("fs-count"),
   stripTip: el("fs-tip"),
   stripList: el("fs-list"),
+  // 从侧栏往图窗里拖行时跟手的那枚牌（长什么样在 index.html + style.css）
+  stripGhost: el("strip-ghost"),
   btnStrip: el("btn-strip"),
   btnStripClose: el("btn-strip-close"),
   // 设置抽屉：布局与同步在这里只是上面那几个控件的镜像，滚轮行为则只剩这里一个入口
@@ -567,25 +570,49 @@ ui.picker.addEventListener("change", () => {
  *   1 图 —— 只看一张：只有 A 窗可见，点一行就是换掉那一张，不留对照位。
  *           这个模式下 B/C/D 都藏起来，想回到对照就按 2 或 4（列表与当前项都在）。
  *
- * 小图的内存口径（为什么不是一片真缩略图）：项目刻意不带 image 依赖
- * （Cargo.toml 里连 arboard 都关了默认特性就是为了不拖进整套图片解码），
- * Rust 侧出不了真缩略图；而 read_image 回的是整图 base64（上限 80MB），
- * 一个目录几百张绝不可能一次全读。所以只给「当前项 ±STRIP_DECODE_WINDOW」
- * 和滚进视口的行申请，超过 STRIP_AUTO_MAX 的不自动解，并且拿 LRU 卡总量。
+ * 小图的内存口径（2026-10-26 改过一轮）：asset 协议能用时，侧栏小图就是直接指本地
+ * 文件的地址（assetSrc()），一个字节也不往 JS 里搬，±1 窗口、体积闸门、LRU 三道全部不参与，
+ * 只剩「滚进视口才挂」这一道（IntersectionObserver 负责，滚出去就把位图摘掉）。
+ * 下面那几个 STRIP_* 只服务于退路：纯浏览器里调试（没有 convertFileSrc）或转地址失败时，
+ * 只能走 read_image 拿整图 base64（上限 80MB），那时才需要闸门：只给「当前项
+ * ±STRIP_DECODE_WINDOW」与滚进视口的行申请，超过 STRIP_AUTO_MAX 的不自动解，拿 LRU 卡总量。
+ * Rust 侧始终出不了真缩略图（刻意不带 image 依赖，Cargo.toml 里连 arboard 都关了默认特性）。
  * ------------------------------------------------------------------------ */
-const STRIP_DECODE_WINDOW = 1; // 当前项前后各解几张（1 → 最多 3 张在解码）
-const STRIP_LRU_MAX = 8; // 内存里最多留几张整图 data URL
+const STRIP_DECODE_WINDOW = 1; // 退路里的窗口：当前项前后各解几张（1 → 最多 3 张在解码）
+const STRIP_LRU_MAX = 8; // 退路里内存最多留几张整图 data URL
 const STRIP_AUTO_MAX = 4 * 1024 * 1024; // 体积闸门：与传输视图的 PREVIEW_AUTO_MAX 同口径
 const STRIP_INFLIGHT_MAX = 3; // 同时发出去的 read_image 封顶
 const STRIP_DIR_MAX = 2000; // 与 Rust 的 FOLDER_MAX_ITEMS 对齐，后端截断时说明一声
 const STRIP_NAME_MAX = 16; // 侧栏名称列的显示上限：190px 侧栏里名称列只剩 ~102px，12px 字号下正好放得下 16 字符
+
+/** asset 这条路是不是在这台机器上走不通：只要有一张 403/404 就当成系统性的（scope 没覆盖到它、
+ *  或 Windows 那边 canonicalize 后的路径与 glob 对不上），整列直接退回 read_image。
+ *  只认一次、不退回去反复撞墙：否则每滚一回视口就多一次失败请求 + 一行日志 */
+let assetDead = false;
+
+/** 取 asset 地址，但先看 assetDead 脸色（assetSrc 自己不管这个） */
+function assetFor(path) {
+  return assetDead ? null : assetSrc(path);
+}
+
+/** 某个 asset 地址取不到文件：从此不再试这条路，并把这一行交给退路重画一次。
+ *  这一行无论如何都要重画：每张图的 error 是各自报上来的，只治第一张会把其余那几张留在破图上 */
+function thumbAssetFailed(i, row) {
+  const first = !assetDead;
+  assetDead = true;
+  if (first) {
+    console.warn("[asset] 这个 asset 地址取不到文件，侧栏整列退回 read_image（多半是 tauri.conf.json 的 assetProtocol.scope 没覆盖到它）");
+  }
+  dropThumb(row); // 不先把破图摘了，ensureThumb 开头那句「已经有 img 就返」会直接退回去
+  ensureThumb(i, false);
+}
 
 const browse = {
   dir: "", // 列表是哪个目录（同目录不重发 IPC）
   items: [], // [{ path, name, size }]，已按自然序排好
   idx: -1, // 正在看的是第几项
   sel: -1, // 侧栏键盘选中行：↑↓ 一动就把那一张显示出来（与点行完全同一条路）
-  slot: null, // 上一次浏览落在哪个窗（a/b），下一次去对面
+  slot: null, // 上一次浏览落在哪个窗（a/b/c/d），下一次去可见序列里它的下一个
   open: false, // 侧栏显不显示
   userClosed: false, // 用户自己收过一回就别再自动弹出来抢地方
   inflight: false, // 连点时别两个请求抢着写同一个窗
@@ -633,28 +660,34 @@ function formatBytes(n) {
   return Math.max(1, Math.round(n / 1024)) + "KB";
 }
 
-/** 严格交替：上次落在 a/b 哪个这次就去对面。还没浏览过去「活动窗的对面」，
- *  刚手动打开的那张不能被第一次浏览顺手顶掉。
- *  单图布局只剩 A 一个窗，没有对面可去 —— 点列表就是换掉那一张 */
+/** 浏览落窗：可见窗序列（a→b→c→d，按当前档位裁）里「上一个用过的窗」的下一个，到末尾绕回第一个。
+ *  两图下就是原来的严格交替（行为一字不差）；四图下 A→B→C→D→A，屏幕上始终是连着的四张对照；
+ *  单图只剩 A 一个窗，点列表就是换掉那一张。
+ *  还没浏览过去（slot 不在序列里）时从活动窗的下一个起 —— 刚手动打开的那张不能被第一次浏览顺手顶掉 */
 function nextBrowseSlot() {
-  if (layout === "1") return "a";
-  if (browse.slot === "a") return "b";
-  if (browse.slot === "b") return "a";
-  const cur = activePane && (activePane.key === "a" || activePane.key === "b") ? activePane.key : "a";
-  return cur === "a" ? "b" : "a";
+  const seq = LAYOUT_KEYS[layout] || LAYOUT_KEYS[2];
+  const cur = seq.includes(browse.slot)
+    ? browse.slot
+    : activePane && seq.includes(activePane.key)
+      ? activePane.key
+      : null;
+  if (cur === null) return seq[0];
+  return seq[(seq.indexOf(cur) + 1) % seq.length];
 }
 
-const otherKey = (k) => (k === "a" ? "b" : "a");
+/** 除了刚落进去那个，可见序列里还剩哪些窗留着前面的几张（状态行要说这个） */
+const otherKeys = (k) => (LAYOUT_KEYS[layout] || LAYOUT_KEYS[2]).filter((x) => x !== k);
 
 /**
- * 填完图窗之后的接线处：browse.slot 记成「刚放进去那个窗」，下一次浏览就去对面
+ * 填完图窗之后的接线处：browse.slot 记成「刚放进去那个窗」，下一次浏览就去序列里下一个
  * —— 这样第一次浏览绝不会把刚打开的那张顶掉。
  * 五个载入入口（⌘O、单击空窗、拖文件进窗、⌘V、外部打开）都走 fillPanes，
  * 所以只在这一处接线。
  */
 function noteLoaded(pane, src) {
   if (!pane) return;
-  if (pane.key === "a" || pane.key === "b") browse.slot = pane.key;
+  // 只有落在当前档的可见序列里才记账：往隐藏窗里塞一张不该搅动浏览的轮转
+  if ((LAYOUT_KEYS[layout] || LAYOUT_KEYS[2]).includes(pane.key)) browse.slot = pane.key;
   const path = typeof src === "string" ? src : pane.meta?.path || "";
   ensureFolderList(path);
 }
@@ -800,10 +833,16 @@ function buildStrip() {
     row.appendChild(thumb);
     row.appendChild(main);
     row.addEventListener("click", () => {
+      // 刚拖完的这一下不算点行（松手还在侧栏里时，浏览器照样会补一个 click）
+      if (stripDrag.swallow) {
+        stripDrag.swallow = false;
+        return;
+      }
       // 点完把焦点给侧栏：接着按 ↑↓ 就能连着翻，不用回工具栏找按钮
       focusStrip();
       browseTo(i);
     });
+    row.addEventListener("mousedown", (ev) => onRowDown(ev, i));
     list.appendChild(row);
     stripRows.push(row);
     if (stripIO) stripIO.observe(row);
@@ -831,20 +870,152 @@ function markStrip() {
   if (row && typeof row.scrollIntoView === "function") row.scrollIntoView({ block: "nearest" });
 }
 
+/* ---------------------- 行 → 图窗：自己拿鼠标画的拖拽 ----------------------
+ * 为什么不用 HTML5 的 draggable / dataTransfer：Tauri 开着 dragDropEnabled，macOS 上
+ * 那条通道只认从 Finder 递进来的文件路径，页面内的 draggable 会被原生拦截吃掉
+ *（对比视图里那个 vp.addEventListener("drop") 就是因此只在浏览器下跑）。
+ * 所以这趟全程指针事件：按下先只记起点，移动不够阈值就还是一次普通「点行」。 */
+const STRIP_DRAG_SLOP = 4;
+const stripDrag = {
+  armed: false, //   按下了行，还没够上拖拽阈值
+  on: false, //      已经在拖
+  index: -1, //      拖的是 browse.items 里第几行
+  sx: 0,
+  sy: 0, //          按下时的起点，用来算移动够没够
+  pane: null, //     当前悬在哪个可见窗上
+  swallow: false, // 这趟拖完紧跟的那次 click 不能当成点行
+};
+
+/** 落点命中：只看当前档的可见窗（两图下绝不可能把图塞进看不见的 C/D）。
+ *  拿的是鼠标事件的 CSS 像素坐标，不用 paneAt()：那个是为 Tauri 原生拖拽服务的，
+ *  还要猜一次物理/逻辑像素，这里用不着也不能用 */
+function paneAtPoint(x, y) {
+  return (
+    visiblePanes().find((p) => {
+      const r = p.viewport.getBoundingClientRect();
+      return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+    }) || null
+  );
+}
+
+/** 手里那枚牌：能直接指本地文件就带上图（没缓存也无害），否则用 LRU 里那份，
+ *  两样都没有就只写文件名——绝不为了拖一下现读盘 */
+function paintGhost(it) {
+  const g = ui.stripGhost;
+  if (!g || !g.style) return;
+  const img = g.querySelector ? g.querySelector("img") : null;
+  const label = g.querySelector ? g.querySelector(".sg-name") : null;
+  if (img) {
+    const src = assetFor(it.path) || thumbCache.get(it.path);
+    if (src) img.setAttribute("src", src);
+    else img.removeAttribute("src");
+    img.hidden = !src; // 没图时不留个空 img，那是个碎图标
+  }
+  if (label) label.textContent = it.name || baseOf(it.path);
+}
+
+function startStripDrag(x, y) {
+  const it = browse.items[stripDrag.index];
+  if (!it) return;
+  stripDrag.on = true;
+  // 只要真的起过拖，这之后紧跟的 click 就不算点行了：松手落在侧栏里时浏览器
+  // 照样会在同一行上补一个 click，那一下会把用户已经作废的一页又翻出来
+  stripDrag.swallow = true;
+  paintGhost(it);
+  if (ui.stripGhost) ui.stripGhost.hidden = false;
+  document.body.classList.add("is-strip-drag");
+  moveStripDrag(x, y);
+}
+
+function moveStripDrag(x, y) {
+  const g = ui.stripGhost;
+  if (g && g.style) {
+    g.style.left = `${x}px`;
+    g.style.top = `${y}px`;
+  }
+  const pane = paneAtPoint(x, y);
+  if (pane === stripDrag.pane) return;
+  stripDrag.pane = pane;
+  // 高亮复用 .drag-over：从 Finder 拖文件进来与从侧栏拖行过去，同一个“松开就载入”的样子
+  for (const p of visiblePanes()) p.root.classList.toggle("drag-over", p === pane);
+}
+
+/** 收拾现场。dropAt=true 就交给当前悬停的那个窗（没悬在窗上就是什么都没发生） */
+function endStripDrag(dropAt) {
+  const idx = stripDrag.index;
+  const pane = stripDrag.pane;
+  stripDrag.armed = false;
+  stripDrag.on = false;
+  stripDrag.index = -1;
+  stripDrag.pane = null;
+  const g = ui.stripGhost;
+  if (g) {
+    g.hidden = true;
+    const img = g.querySelector ? g.querySelector("img") : null;
+    if (img) img.removeAttribute("src");
+  }
+  document.body.classList.remove("is-strip-drag");
+  for (const p of Object.values(panes)) p.root.classList.remove("drag-over");
+  if (!dropAt || !pane || !browse.items[idx]) return;
+  // 落到哪格就是哪格，那一格原有的图直接被替掉（与其他载入入口一致，不弹确认）；
+  // fillPanes 会顺手把 activePane / 浏览轮转起点 / 侧栏当前项都对齐到这一张
+  fillPanes([browse.items[idx].path], pane.key);
+}
+
+/** 行上按下：只记起点。不 preventDefault，否则后面那个 click 就没了 */
+function onRowDown(ev, index) {
+  if (ev.button !== 0) return;
+  stripDrag.swallow = false; // 新按下的一行算新一轮，旧的“吞 click”标记不能继续吃
+  stripDrag.armed = true;
+  stripDrag.index = index;
+  stripDrag.sx = ev.clientX || 0;
+  stripDrag.sy = ev.clientY || 0;
+}
+
+window.addEventListener("mousemove", (ev) => {
+  if (!stripDrag.armed && !stripDrag.on) return;
+  // 拖出窗口外松手时 mouseup 根本不会来，靠 buttons 归零兜底，免得牌与禁选状态卡在屏幕上
+  if (ev.buttons === 0) {
+    endStripDrag(true);
+    return;
+  }
+  if (!stripDrag.on) {
+    if (Math.hypot(ev.clientX - stripDrag.sx, ev.clientY - stripDrag.sy) < STRIP_DRAG_SLOP) return;
+    startStripDrag(ev.clientX, ev.clientY);
+    return; // 按下那帧不先跟手，牌只在跨阈时亮一次
+  }
+  moveStripDrag(ev.clientX, ev.clientY);
+});
+
+window.addEventListener("mouseup", () => {
+  // 没按在行上就一律不管：图窗自己的平移、分隔条的拖动都靠 mouseup 收尾
+  if (!stripDrag.armed && !stripDrag.on) return;
+  if (stripDrag.on) {
+    endStripDrag(true);
+    return;
+  }
+  stripDrag.armed = false;
+  stripDrag.index = -1;
+});
+
 /** 该行在不在「当前项附近」这个自动窗口里（窗口外一律不主动读盘）。
  *  体积闸门不在这里判：过大的要给「大」字占位，见 ensureThumb */
 function inDecodeWindow(i) {
   return browse.idx >= 0 && !!browse.items[i] && Math.abs(i - browse.idx) <= STRIP_DECODE_WINDOW;
 }
 
-function paintThumb(row, dataUrl) {
+/** 画小图：src 可以是 asset 地址，也可以是退路里那份整图 data URL，两者对 <img> 来说一样 */
+function paintThumb(row, src, onErr) {
   const box = row && row.querySelector ? row.querySelector(".fs-thumb") : null;
   if (!box) return;
   box.textContent = "";
   const img = document.createElement("img");
   img.alt = "";
   img.loading = "lazy";
-  img.src = dataUrl;
+  img.src = src;
+  // asset 地址拿得到但取不到文件（403/404）时，WebView 只会留个破图：单靠
+  // assetSrc() 回 null 那一道退路挡不住，所以这里给 asset 图补一个 onErr
+  if (onErr && img.addEventListener) img.addEventListener("error", onErr);
   box.appendChild(img);
 }
 
@@ -888,6 +1059,13 @@ async function ensureThumb(i, force) {
   if (!row || !it || browse.bad.has(it.path)) return;
   const box = row.querySelector(".fs-thumb");
   if (!box || box.querySelector("img")) return;
+  // 首选：直接拿本地文件的 asset 地址。WebView 自己按需缩放解码，不过 JS 的手，
+  // 所以 ±1 窗口、4MB 体积闸门、LRU 这三道在这里都不参与，只有 IO 那一道（滚进来才调到这里）
+  const direct = assetFor(it.path);
+  if (direct) {
+    paintThumb(row, direct, () => thumbAssetFailed(i, row));
+    return;
+  }
   const cached = thumbCache.get(it.path);
   // 已经读过盘的就直接画：这一趟不花任何解码代价，跟在不不在窗口里无关
   if (cached) {
@@ -1007,10 +1185,11 @@ async function browseTo(index) {
   setPicked(pane);
   markStrip();
   requestNearThumbs();
+  const held = otherKeys(key).map((x) => `${x.toUpperCase()} 窗`);
   setStatus(
     layout === "1"
       ? `第 ${index + 1}/${browse.items.length} 张`
-      : `第 ${index + 1}/${browse.items.length} 张→${key.toUpperCase()} 窗，${otherKey(key).toUpperCase()} 窗留着上一张`
+      : `第 ${index + 1}/${browse.items.length} 张→${key.toUpperCase()} 窗，${held.join("/")}留着${held.length > 1 ? "前面几张" : "上一张"}`
   );
   // 这趟期间又被按过去的：直接追到最新那一张，中间那些不停下来看
   if (browse.wanted !== null && browse.wanted !== index) {
@@ -1457,10 +1636,10 @@ el("btn-clear").addEventListener("click", () => {
   // 清空一切：隐藏窗里的图不跟着布局切换留尾，免得下次切回来“莫名多出图”
   for (const p of Object.values(panes)) p.clear();
   refreshZoom();
-  // 列表保留（还是那个目录），但当前项没了：下一次浏览从 A 起（slot 写 b 就是这个意思）
+  // 列表保留（还是那个目录），但当前项没了：slot 记在序列最后一个，下一次浏览绕回第一个（A）
   browse.idx = -1;
   browse.sel = -1;
-  browse.slot = "b";
+  browse.slot = (LAYOUT_KEYS[layout] || LAYOUT_KEYS[2]).slice(-1)[0];
   markStrip();
 });
 
@@ -1512,6 +1691,14 @@ function copyTargets() {
 
 window.addEventListener("keydown", (ev) => {
   if (currentView() !== "compare") return;
+  // 拖到一半按 Esc：这趟作废就到此为止，不能再让同一个 Esc 去收侧栏 / 关抽屉（拦在
+  // 本处理函数最开头靠的是下面那句 return；同一个 window 上的其它监听 stopPropagation 管不着）
+  // 松手后紧跟的那一下 click 也一并吐掉（startStripDrag 已记下 swallow，这里不再补）
+  if (ev.key === "Escape" && stripDrag.on) {
+    ev.preventDefault();
+    endStripDrag(false);
+    return;
+  }
   const t = ev.target;
   if (t && (EDITABLE.has(t.tagName) || t.isContentEditable)) return;
 

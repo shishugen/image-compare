@@ -12,7 +12,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["devtools"] }
+tauri = { version = "2", features = ["protocol-asset", "devtools"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
@@ -45,6 +45,8 @@ windows = {
     "Win32_System_DataExchange",
     "Win32_System_Memory",
     "Win32_System_Ole",
+    # 收消息那一声「叮」：MessageBeep 走系统提示音，不引新 crate，只多一个特性
+    "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Shell",
   ],
 }

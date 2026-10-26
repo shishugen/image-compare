@@ -6,7 +6,7 @@
 
 use super::Hub;
 use crate::http;
-use crate::store::{self, Message, Peer, Session};
+use crate::store::{self, Message, Peer, Session, Store};
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
@@ -184,6 +184,9 @@ pub fn spawn_heartbeat(hub: Arc<Hub>) {
             }
             // 已经不在线也没被再探测的设备（刚解绑），计数器不能留着
             fails.retain(|k, _| bound.contains(k));
+            // 待发队列只挂在这一拍上：在线状态就是在这里改的，补发紧接着跑。
+            // 不靠「离线转在线」的边沿 —— 重启后头一拍、解绑后头一次探测都会假触发
+            hub.spawn_due_flush();
             std::thread::sleep(Duration::from_millis(HEARTBEAT_MS));
         }
     });
@@ -196,17 +199,29 @@ pub fn send_text(hub: &Arc<Hub>, peer: &Peer, sess: &Session, text: String) -> R
         dir: "out".into(),
         kind: "text".into(),
         text: Some(text.clone()),
-        name: None,
-        size: None,
-        path: None,
         state: "sending".into(),
         ts: store::now_ms(),
         peer: peer.id.clone(),
         sid: sess.id.clone(),
+        ..Default::default()
     };
     hub.store.append_message(&msg)?;
     hub.emit("msg-updated", serde_json::json!({ "message": msg }));
+    // 当场发不出去就是「失败」：这条没进过队列，retry 保持 0、也不留原因文案，
+    // 与补发那条路（超上限才失败）共用 retry() 但含义分得清
+    try_send_text(hub, peer, sess, &msg).map_err(|e| finalize_failed(hub, &msg, e, false, false))
+}
 
+/// 把一条文字投给 `peer`（不建气泡，状态收尾由调用方决定）。
+/// 在线直发与离线补发共用这一段，两条路的协议与签名口径只有一份
+pub(crate) fn try_send_text(
+    hub: &Arc<Hub>,
+    peer: &Peer,
+    sess: &Session,
+    msg: &Message,
+) -> Result<Message, String> {
+    let text = msg.text.clone().unwrap_or_default();
+    // ts 用当初那一刻：补发的消息在对端显示的仍是用户写它的时间
     let body = serde_json::json!({ "msg_id": msg.id, "ts": msg.ts, "text": text })
         .to_string()
         .into_bytes();
@@ -226,41 +241,66 @@ pub fn send_text(hub: &Arc<Hub>, peer: &Peer, sess: &Session, text: String) -> R
         Duration::from_secs(10),
     );
     match resp {
-        Ok(r) if r.ok() => {
-            let done = Message {
-                state: "sent".into(),
-                ..msg.clone()
-            };
-            hub.store.append_message(&done)?;
-            hub.emit("msg-updated", serde_json::json!({ "message": done }));
-            Ok(done)
-        }
-        Ok(r) => Err(finalize_failed(hub, &msg, format!("对端返回 {}", r.status))),
-        Err(e) => Err(finalize_failed(hub, &msg, e)),
+        Ok(r) if r.ok() => Ok(mark_sent(hub, msg)),
+        Ok(r) => Err(format!("对端返回 {}", r.status)),
+        Err(e) => Err(e),
     }
 }
 
-/// 失败也要留下记录：messages.jsonl 是追加式，同 ID 以最后一条为准
-fn finalize_failed(hub: &Arc<Hub>, msg: &Message, err: String) -> String {
-    let failed = Message {
-        state: "failed".into(),
+/// 投成功：同 ID 再追一行 sent。计数与原因一并清掉，否则下次断线时
+/// 「第 4 次失败」会接在一个已经成功的消息后面往下算
+fn mark_sent(hub: &Arc<Hub>, msg: &Message) -> Message {
+    let done = Message {
+        state: "sent".into(),
+        retry: 0,
+        reason: None,
         ..msg.clone()
     };
-    let _ = hub.store.append_message(&failed);
-    hub.emit("msg-updated", serde_json::json!({ "message": failed }));
+    if let Err(e) = hub.store.append_message(&done) {
+        eprintln!("[net] 落库送达状态失败: {e}");
+    }
+    hub.emit("msg-updated", serde_json::json!({ "message": done }));
+    done
+}
+
+/// 投之前先把气泡标成「传输中」：一条排队几小时的消息不能还在显示「待发」
+fn mark_sending(hub: &Arc<Hub>, msg: &Message) {
+    let t = Message {
+        state: "sending".into(),
+        ..msg.clone()
+    };
+    let _ = hub.store.append_message(&t);
+    hub.emit("msg-updated", serde_json::json!({ "message": t }));
+}
+
+/// 失败也要留下记录：messages.jsonl 是追加式，同 ID 以最后一条为准。
+/// `allow_retry` 才走计数（只有进过队列的消息才有「第几次」这回事），
+/// `hard` 是一次都不该再试的错（比如文件已经不在了）
+fn finalize_failed(hub: &Arc<Hub>, msg: &Message, err: String, allow_retry: bool, hard: bool) -> String {
+    if allow_retry {
+        super::retry_with(hub, msg, &err, hard);
+    } else {
+        let failed = Message {
+            state: "failed".into(),
+            reason: Some(err.clone()),
+            ..msg.clone()
+        };
+        let _ = hub.store.append_message(&failed);
+        hub.emit("msg-updated", serde_json::json!({ "message": failed }));
+    }
     err
 }
 
-/// 发送一批路径（文件或文件夹）到同一个对话框。文件夹会递归成多个 PUT，共用一个气泡与 batch id。
-pub fn send_paths(hub: &Arc<Hub>, peer: &Peer, sess: &Session, paths: Vec<String>) -> Result<Vec<Message>, String> {
-    let mut out = Vec::new();
-    for p in paths {
-        out.push(send_one(hub, peer, sess, Path::new(&p))?);
-    }
-    Ok(out)
-}
-
-fn send_one(hub: &Arc<Hub>, peer: &Peer, sess: &Session, path: &Path) -> Result<Message, String> {
+/// 一个要发出去的路径该长成什么气泡：kind 按当下是文件还是目录定，
+/// 大小现算。在线直发与离线入队共用它，两条路的气泡口径必须一致
+///（排队那条要是各写一份，将来改字段一定会漏改一处）
+pub(crate) fn outbound_bubble(
+    _device: &store::Device,
+    peer: &Peer,
+    sess: &Session,
+    path: &Path,
+    state: &str,
+) -> Result<Message, String> {
     let meta = fs::symlink_metadata(path).map_err(|e| format!("读不到 {} : {e}", path.display()))?;
     if meta.file_type().is_symlink() {
         return Err(format!("跳过符号链接: {}", path.display()));
@@ -270,7 +310,132 @@ fn send_one(hub: &Arc<Hub>, peer: &Peer, sess: &Session, path: &Path) -> Result<
         .map(|s| s.to_string_lossy().to_string())
         .ok_or_else(|| format!("{} 没有文件名", path.display()))?;
     let is_dir = meta.is_dir();
-    let batch = uuid::Uuid::new_v4().simple().to_string();
+    Ok(Message {
+        // 待发阶段先占一个 ID：补发时把它当 batch id 用，两边的气泡才对得上
+        id: uuid::Uuid::new_v4().simple().to_string(),
+        dir: "out".into(),
+        kind: if is_dir { "folder".into() } else { "file".into() },
+        name: Some(name),
+        // 目录没有「一个大小」可显示，留空比写个当下算出来的总和诚实
+        //（补发时 send_one 会按那一刻的真实总量覆盖）
+        size: if is_dir { None } else { Some(meta.len()) },
+        path: Some(path.to_string_lossy().to_string()),
+        state: state.into(),
+        ts: store::now_ms(),
+        peer: peer.id.clone(),
+        sid: sess.id.clone(),
+        ..Default::default()
+    })
+}
+
+/// 补发一个对话框里挂着的那几条。只在这一个线程里跑（会话级许可已拿到），
+/// 所以同一框的顺序天然是「旧的先走」
+pub(crate) fn flush_session(hub: &Arc<Hub>, sess: &Session, ids: &[String]) {
+    let pending = hub.store.pending_messages();
+    for id in ids {
+        let Some(msg) = pending.iter().find(|m| m.id == *id) else {
+            continue; // 已经被投出去或被别的写覆盖了一行，跳过就是对的
+        };
+        let Some(peer) = hub.peer_by_id(&msg.peer) else {
+            // 解绑了：不投也不计数 —— 那台被亲手加回来时这几条还得接着投
+            continue;
+        };
+        if !peer.online {
+            continue;
+        }
+        let r = match msg.kind.as_str() {
+            // 文字这里必须自己补上失败收尾：try_send_text 只报错不计数，
+            // 少了这一步那条发不出去的文字会永远挂着「待发」、每一拍都重投一次
+            //（计数与上限全白设）。文件那条在 try_send_file 里已经做过了（它还要分硬错误）
+            "text" => try_send_text(hub, &peer, sess, msg)
+                .map_err(|e| finalize_failed(hub, msg, e, true, false)),
+            _ => try_send_file(hub, &peer, sess, msg),
+        };
+        if let Err(e) = r {
+            eprintln!("[net] 补发 {id} 失败: {e}");
+        }
+    }
+}
+
+/// 一条待发消息归属的会话已经不在了（用户删了那个框）：直接标失败落库，
+/// 不能让它永远挂着「待发」
+pub(crate) fn abandon_session_msgs(store: &Store, sid: &str, ids: &[String]) {
+    let why = "这个对话框已经被删了";
+    for m in store.pending_messages().iter().filter(|m| m.sid_of() == sid) {
+        if !ids.contains(&m.id) {
+            continue;
+        }
+        let _ = super::retry(store, m, why, true);
+    }
+}
+
+/// 补发一条排队的文件/文件夹。send_one 会自己再算一遍总量并展开目录
+///（排队期间可能又塞了东西进去），完成后把气泡改成同 ID 的 sent
+fn try_send_file(hub: &Arc<Hub>, peer: &Peer, sess: &Session, msg: &Message) -> Result<Message, String> {
+    let Some(p) = msg.path.as_deref() else {
+        return Err(finalize_failed(hub, msg, "这条记录没有本机路径，发不出去".into(), true, true));
+    };
+    let path = Path::new(p);
+    if fs::symlink_metadata(path).is_err() {
+        // 路径没了不是网络问题，重试三次只会白跑三趟
+        return Err(finalize_failed(
+            hub,
+            msg,
+            format!("要发的 {} 已经不在这个位置了", path.display()),
+            true,
+            true,
+        ));
+    }
+    mark_sending(hub, msg);
+    // 排了几个小时队的气泡不能跳到当下：ts 以入队那一刻为准
+    let sent_ts = msg.ts;
+    match send_one(hub, peer, sess, path, Some(msg)) {
+        Ok(done) => {
+            let done = Message {
+                ts: sent_ts,
+                ..done
+            };
+            Ok(mark_sent(hub, &done))
+        }
+        Err(e) => Err(finalize_failed(hub, msg, e, true, false)),
+    }
+}
+
+/// 发送一批路径（文件或文件夹）到同一个对话框。文件夹会递归成多个 PUT，共用一个气泡与 batch id。
+pub fn send_paths(hub: &Arc<Hub>, peer: &Peer, sess: &Session, paths: Vec<String>) -> Result<Vec<Message>, String> {
+    let mut out = Vec::new();
+    for p in paths {
+        out.push(send_one(hub, peer, sess, Path::new(&p), None)?);
+    }
+    Ok(out)
+}
+
+/// `queued` 是从待发队列里拉出来的那一条：复用它的气泡（同一个 id、同一行历史），
+/// 不再新建 —— 否则补发一个文件夹会在对方界面上多出一条重复气泡
+fn send_one(
+    hub: &Arc<Hub>,
+    peer: &Peer,
+    sess: &Session,
+    path: &Path,
+    queued: Option<&Message>,
+) -> Result<Message, String> {
+    let meta = fs::symlink_metadata(path).map_err(|e| format!("读不到 {} : {e}", path.display()))?;
+    if meta.file_type().is_symlink() {
+        return Err(format!("跳过符号链接: {}", path.display()));
+    }
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .ok_or_else(|| format!("{} 没有文件名", path.display()))?;
+    let is_dir = meta.is_dir();
+    // 进待发队列的那一条已经有一个 id 了，补发时拿它当 batch id：进度事件带的就是
+    // batch id，另造一个 UUID 会让前端找不到对应气泡（它找不到时会先占一个「接收中」
+    // 的**入向**气泡，等于自己发文件却凭空多出一个对方发来的气泡）。
+    // 直发那一路本来就是 id = batch，两条路到这里口径一致
+    let batch = match queued {
+        Some(m) => m.id.clone(),
+        None => uuid::Uuid::new_v4().simple().to_string(),
+    };
 
     // 先算总量，才能给出跨文件的累计进度
     let items: Vec<(PathBuf, String)> = if is_dir {
@@ -288,21 +453,37 @@ fn send_one(hub: &Arc<Hub>, peer: &Peer, sess: &Session, path: &Path) -> Result<
         .map(|(f, _)| fs::metadata(f).map(|m| m.len()).unwrap_or(0))
         .sum();
 
-    let msg = Message {
-        id: batch.clone(),
-        dir: "out".into(),
-        kind: if is_dir { "folder".into() } else { "file".into() },
-        text: None,
-        name: Some(name.clone()),
-        size: Some(total),
-        path: Some(path.to_string_lossy().to_string()),
-        state: "sending".into(),
-        ts: store::now_ms(),
-        peer: peer.id.clone(),
-        sid: sess.id.clone(),
+    let msg = match queued {
+        // 排队期间这个文件夹可能又被塞了东西、那张图可能变大了：气泡上的大小与类型
+        // 要以补发这一刻算出的总量为准（入队时那个数只是当时的一眼，
+        // 文件夹入队时干脆没大小）。这里不另追一行也不推事件：
+        // 底下那份 done 会把这个新值一并落库
+        Some(m) => Message {
+            size: Some(total),
+            kind: if is_dir { "folder".into() } else { "file".into() },
+            name: Some(name.clone()),
+            ..m.clone()
+        },
+        None => {
+            let fresh = Message {
+                id: batch.clone(),
+                dir: "out".into(),
+                kind: if is_dir { "folder".into() } else { "file".into() },
+                text: None,
+                name: Some(name.clone()),
+                size: Some(total),
+                path: Some(path.to_string_lossy().to_string()),
+                state: "sending".into(),
+                ts: store::now_ms(),
+                peer: peer.id.clone(),
+                sid: sess.id.clone(),
+                ..Default::default()
+            };
+            hub.store.append_message(&fresh)?;
+            hub.emit("msg-updated", serde_json::json!({ "message": fresh }));
+            fresh
+        }
     };
-    hub.store.append_message(&msg)?;
-    hub.emit("msg-updated", serde_json::json!({ "message": msg }));
 
     let mut sent_acc: u64 = 0;
     let mut last_emit = 0i64;
@@ -337,7 +518,13 @@ fn send_one(hub: &Arc<Hub>, peer: &Peer, sess: &Session, path: &Path) -> Result<
         match res {
             Ok(n) => sent_acc += n,
             Err(e) => {
-                return Err(finalize_failed(hub, &msg, format!("发送 {rel} 失败: {e}")));
+                return Err(finalize_failed(
+                    hub,
+                    &msg,
+                    format!("发送 {rel} 失败: {e}"),
+                    queued.is_some(),
+                    false,
+                ));
             }
         }
     }

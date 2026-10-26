@@ -278,7 +278,7 @@ pub struct Message {
     pub size: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
-    /// "sending" | "sent" | "failed"
+    /// "queued" | "sending" | "sent" | "failed"
     pub state: String,
     pub ts: i64,
     /// 对端设备 ID：这条消息是谁发的（取自签过名的 X-Device，伪造不了）
@@ -288,6 +288,36 @@ pub struct Message {
     /// 上一版根本没有这个字段，所以老历史只能按 `peer` 归到基础对话，不做猜测式改写
     #[serde(default)]
     pub sid: String,
+    /// 这条待发消息**连续**补发失败了几次（`state == "queued"` 才有意义）。
+    /// 计数必须落盘：只在内存里记的话，重启一次计数就归零，
+    /// 那个一直发不出去的大文件夹会永远重试下去。
+    #[serde(default)]
+    pub retry: u32,
+    /// 最后一次失败的原因，气泡悬停时原样给用户看
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// 新增字段全靠这里兜底：构造点写 `..Default::default()`，
+/// 不用再回去改十几处 `Message { .. }`
+impl Default for Message {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            dir: "out".into(),
+            kind: "text".into(),
+            text: None,
+            name: None,
+            size: None,
+            path: None,
+            state: "sent".into(),
+            ts: 0,
+            peer: String::new(),
+            sid: String::new(),
+            retry: 0,
+            reason: None,
+        }
+    }
 }
 
 impl Message {
@@ -300,6 +330,27 @@ impl Message {
             &self.sid
         }
     }
+}
+
+/// JSONL 去重：同一个 id 以最后写的那一行为准，但**保持首次出现的顺序** ——
+/// 前端按这个顺序铺气泡，改状态不能让一条消息跳到列表末尾。
+/// 坏行只跳过这一行，不让整份历史读不出来。
+fn dedup_lines(txt: &str) -> Vec<Message> {
+    let mut order: Vec<String> = Vec::new();
+    let mut latest: std::collections::HashMap<String, Message> = std::collections::HashMap::new();
+    for line in txt.lines().filter(|l| !l.trim().is_empty()) {
+        let Ok(msg) = serde_json::from_str::<Message>(line) else {
+            continue;
+        };
+        if !latest.contains_key(&msg.id) {
+            order.push(msg.id.clone());
+        }
+        latest.insert(msg.id.clone(), msg);
+    }
+    order
+        .into_iter()
+        .filter_map(|id| latest.remove(&id))
+        .collect()
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -341,10 +392,13 @@ pub fn fav_depth(nodes: &[FavNode], id: &str) -> usize {
  * 界面偏好（prefs.json）
  * ------------------------------------------------------------------------ */
 
-/// 对比视图的三个偏好项。字段名保持单词 snake_case，与前端读法一致。
+/// 用户选的默认值：布局与 1:1 这些是工具栏上的即时开关，每次改动顺手落盘，
+/// 下次启动就是它 —— 所以这里只有几项，不做会话快照。
 ///
-/// 存的是「用户选的默认值」：布局与 1:1 这些是工具栏上的即时开关，
-/// 每次改动顺手落盘，下次启动就是它 —— 所以这里只有三项，不做会话快照。
+/// 后两项属于传输视图的「本机接收」，存在同一份 prefs.json 里：读写通路
+/// （`set_prefs` 的局部更新 + normalize + 原子写）是现成的，为两个字段再开
+/// 第三份配置文件与第三套 CRUD 不值得。代价是两个抽屉共享一份数据，
+/// 靠「只传自己关心的字段」互不覆盖。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Preferences {
     /// 布局："1" 单图浏览 / "2" 两图并排 / "4" 四图 2×2
@@ -356,6 +410,13 @@ pub struct Preferences {
     /// 滚轮行为："zoom" | "pan"
     #[serde(default = "default_wheel")]
     pub wheel: String,
+    /// 收到对端消息时是否响一声
+    #[serde(default = "default_notify")]
+    pub notify: bool,
+    /// 收件目录，空串 = 用 `<数据目录>/inbox`。存绝对路径原文（不 canonicalize，
+    /// 免得把一个合法的软链目录换成它指向的地方，用户看到的路径就变了）
+    #[serde(default)]
+    pub inbox: String,
 }
 
 fn default_sync() -> bool {
@@ -366,14 +427,20 @@ fn default_wheel() -> String {
     "zoom".into()
 }
 
+fn default_notify() -> bool {
+    true
+}
+
 impl Default for Preferences {
-    /// 出厂态就是前端 HTML 里写死的那一份（两图 + 同步开 + 滚轮缩放），
-    /// 两边不一致会让「读到空」与「读到默认」表现出差别，没必要
+    /// 出厂态就是前端 HTML 里写死的那一份（两图 + 同步开 + 滚轮缩放 + 响一声 +
+    /// 默认收件目录），两边不一致会让「读到空」与「读到默认」表现出差别，没必要
     fn default() -> Self {
         Self {
             layout: "2".into(),
             sync: true,
             wheel: default_wheel(),
+            notify: default_notify(),
+            inbox: String::new(),
         }
     }
 }
@@ -388,6 +455,12 @@ impl Preferences {
         }
         if self.wheel != "zoom" && self.wheel != "pan" {
             self.wheel = default_wheel();
+        }
+        // 相对路径必须丢掉：它会被当成相对于**进程当前目录**去建，而那个目录
+        // 从 Finder 双击启动和从 cargo 启动完全不是一个地方，落盘点位变得不可预期。
+        // 这里只能静默回默认（读取路径上没有可报错的出口），拦下脏值靠 set_prefs
+        if !self.inbox.is_empty() && !Path::new(&self.inbox).is_absolute() {
+            self.inbox.clear();
         }
     }
 }
@@ -409,8 +482,16 @@ impl Store {
         self.dir.join(name)
     }
 
+    /// 收到东西落在哪。每次落盘会多读一遍 prefs.json（不到 1KB，比同一次的
+    /// sha256 便宜几个数量级），换来「改了目录立刻生效」——不加缓存，
+    /// 缓存要么动 `Store` 的无状态形态，要么让设置看起来没生效。
     pub fn inbox_dir(&self) -> PathBuf {
-        self.dir.join("inbox")
+        let d = self.load_prefs().inbox;
+        if d.is_empty() {
+            self.dir.join("inbox")
+        } else {
+            PathBuf::from(d)
+        }
     }
 
     /// 粘贴进来的图片/位图落在这里（它们本来没有“原文件”，必须造一个）。
@@ -519,26 +600,32 @@ impl Store {
             Ok(t) => t,
             Err(_) => return Vec::new(),
         };
-        let mut order: Vec<String> = Vec::new();
-        let mut latest: std::collections::HashMap<String, Message> = std::collections::HashMap::new();
-        for line in txt.lines().filter(|l| !l.trim().is_empty()) {
-            // 手改坏了一行也只跳过这一行，不让整份历史读不出来
-            let Ok(msg) = serde_json::from_str::<Message>(line) else {
-                continue;
-            };
-            if !latest.contains_key(&msg.id) {
-                order.push(msg.id.clone());
-            }
-            latest.insert(msg.id.clone(), msg);
-        }
-        let mut merged: Vec<Message> = order
-            .into_iter()
-            .filter_map(|id| latest.remove(&id))
-            .collect();
+        let mut merged = dedup_lines(&txt);
         if merged.len() > limit {
             merged = merged.split_off(merged.len() - limit);
         }
         merged
+    }
+
+    /// 待发（离线排队）的、本机发出去的消息，按首次出现的顺序
+    /// （补发扫描与「pending」计数都读它）。
+    /// 判「最新状态」必须按**全部**行去重：一条补发成功的消息是先写 `queued`
+    /// 再追加同 id 的 `sent`，只挑含 queued 的行去重的话，`sent` 那行会被漏掉，
+    /// 这条早就发出去的消息就会一直赖在队列里反复重投。
+    /// 所以这里只做一次廉价的子串预筛：整个文件一行 `"queued"` 都没有（队列空，
+    /// 也就是绝大多数时候）就直接返空，免得每秒一次的扫描把整份历史反序列化一遍。
+    pub fn pending_messages(&self) -> Vec<Message> {
+        let txt = match fs::read_to_string(self.file("messages.jsonl")) {
+            Ok(t) => t,
+            Err(_) => return Vec::new(),
+        };
+        if !txt.contains("\"queued\"") {
+            return Vec::new();
+        }
+        dedup_lines(&txt)
+            .into_iter()
+            .filter(|m| m.dir == "out" && m.state == "queued")
+            .collect()
     }
 
     /// 修历史坏数据：早期版本把收件箱消息的 `path` 按名字长度硬截过（还会削掉 `.jpg`），
@@ -786,6 +873,7 @@ mod tests {
             ts: 1,
             peer: peer.into(),
             sid: sid.into(),
+            ..Default::default()
         };
         assert_eq!(条("", "a").sid_of(), "a", "上一版没有这个字段，只能归基础对话");
         assert_eq!(条("u1", "a").sid_of(), "u1", "新话题按带的会话 ID 算");
@@ -809,6 +897,7 @@ mod tests {
             layout: "1".into(),
             sync: false,
             wheel: "pan".into(),
+            ..Preferences::default()
         })
         .unwrap();
         let back = s.load_prefs();
@@ -823,6 +912,9 @@ mod tests {
         assert_eq!(p.layout, "4");
         assert!(p.sync, "缺 sync 字段应该按出厂态给开");
         assert_eq!(p.wheel, "zoom");
+        // 上一版 prefs.json 里根本没有这两项：缺字段就当出厂态（响一声 + 默认收件目录）
+        assert!(p.notify, "缺 notify 字段不能变成静默");
+        assert!(p.inbox.is_empty(), "缺 inbox 字段就是默认收件目录");
 
         // 前端不认的布局与滚轮值：存进去就该被清掉（没有 CSS 的布局会让四个窗都不显示）
         for bad_layout in ["3", "", "8", "两图"] {
@@ -835,6 +927,40 @@ mod tests {
         // 整份被改坏也不能报错，回出厂态（偏好读不出来不值得挂掉界面初始化）
         std::fs::write(s.file("prefs.json"), "不是 JSON").unwrap();
         assert_eq!(s.load_prefs(), Preferences::default());
+        let _ = std::fs::remove_dir_all(&s.dir);
+    }
+
+    #[test]
+    fn 收件目录按prefs生效脏值退回默认() {
+        let s = 临时存储("inbox-dir");
+        std::fs::create_dir_all(&s.dir).unwrap();
+        assert_eq!(
+            s.inbox_dir(),
+            s.dir.join("inbox"),
+            "没改过就是数据目录下的 inbox"
+        );
+
+        let other = std::env::temp_dir().join(format!("imgcmp-other-{}", std::process::id()));
+        s.save_prefs(&Preferences {
+            inbox: other.to_string_lossy().to_string(),
+            ..Preferences::default()
+        })
+        .unwrap();
+        assert_eq!(s.inbox_dir(), other, "改过之后必须原样生效，不拿默认目录顶");
+
+        // 相对路径不能当目录用：它会被当成相对于进程当前目录去建，
+        // 那个位置从 Finder 启动和从 cargo 启动完全不是一个地方
+        s.save_prefs(&Preferences {
+            inbox: "recv/今日".into(),
+            ..Preferences::default()
+        })
+        .unwrap();
+        assert_eq!(
+            s.inbox_dir(),
+            s.dir.join("inbox"),
+            "手改出来的相对路径要退回默认目录"
+        );
+        let _ = std::fs::remove_dir_all(&other);
         let _ = std::fs::remove_dir_all(&s.dir);
     }
 
@@ -951,7 +1077,7 @@ mod tests {
             state: "sent".into(),
             ts: 1,
             peer: String::new(),
-            sid: String::new(),
+            ..Default::default()
         };
         s.append_message(&base).unwrap();
         s.append_message(&Message {
@@ -998,7 +1124,7 @@ mod tests {
             state: "sending".into(),
             ts: 1,
             peer: String::new(),
-            sid: String::new(),
+            ..Default::default()
         };
         s.append_message(&base).unwrap();
         s.append_message(&Message {
@@ -1017,6 +1143,64 @@ mod tests {
         assert_eq!(msgs[0].id, "m1");
         assert_eq!(msgs[0].state, "sent");
         assert_eq!(msgs[1].id, "m2");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 待发队列跳重启还在且不抢历史的位置() {
+        let dir = std::env::temp_dir().join(format!("imgcmp-pending-{}", now_ms()));
+        let s = Store::new(dir.clone());
+        let base = Message {
+            id: "m1".into(),
+            dir: "out".into(),
+            kind: "text".into(),
+            text: Some("甲".into()),
+            state: "queued".into(),
+            ts: 1,
+            peer: "a".into(),
+            sid: "a".into(),
+            ..Default::default()
+        };
+        s.append_message(&base).unwrap();
+        // 用户又写了一条（当场就送达了）
+        s.append_message(&Message {
+            id: "m2".into(),
+            state: "sent".into(),
+            ts: 2,
+            ..base.clone()
+        })
+        .unwrap();
+        // 补发成功之前：这条待发必须能被队列读到，重启也不丢
+        let mid = Store::new(dir.clone());
+        let queued: Vec<String> = mid
+            .pending_messages()
+            .iter()
+            .map(|m| m.id.clone())
+            .collect();
+        assert_eq!(queued, vec!["m1"], "重开进程后待发队列不能凭空变空");
+
+        // 补发成功：同 id 再追一行 —— 首现位置不能动，否则那条气泡会跳到列表末尾
+        s.append_message(&Message {
+            state: "sent".into(),
+            retry: 0,
+            reason: None,
+            ..base.clone()
+        })
+        .unwrap();
+
+        let back = Store::new(dir.clone());
+        assert!(
+            back.pending_messages().is_empty(),
+            "投出去的那条不该还挂在队列里"
+        );
+        let msgs = back.read_messages(100);
+        assert_eq!(
+            msgs.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["m1", "m2"],
+            "状态更新不能让消息换位置"
+        );
+        assert_eq!(msgs[0].state, "sent");
+        assert_eq!(msgs[0].retry, 0, "送达后计数与原因都得清掉");
         let _ = fs::remove_dir_all(&dir);
     }
 }

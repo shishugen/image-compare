@@ -7,14 +7,16 @@
 //! 会话（对话框）以 `Session.id` 为主键：一台对端的基础对话就用它的设备 ID，
 //! 同一台再开的对话用另造的 UUID，并随消息带 `X-Session` 过去 —— 同一个框在两边是同一个。
 
+pub mod badge;
 pub mod client;
 pub mod discover;
 pub mod server;
+pub mod sound;
 
 use crate::store::{self, Device, Message, PeersFile, Peer, Session, SessionsFile, Store};
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -27,6 +29,9 @@ pub const PORT_TRIES: u16 = 10;
 const HISTORY_LIMIT: usize = 500;
 /// 首屏铺多少条：像微信那样先只看最近几条，滚到顶再补上一页
 const HISTORY_PAGE: usize = 10;
+/// 一条待发消息最多自动补发几次。没有上限的话，一个发不出去的
+/// 大文件夹会在对端每次上线时反复重传，把带宽和 CPU 全吃在同一个死信上
+const MAX_RETRY: u32 = 3;
 
 /// mDNS 浏览到的候选设备，尚未通过 /ping 校验
 #[derive(Clone, Serialize)]
@@ -88,6 +93,12 @@ pub struct Hub {
     discovered: Mutex<HashMap<String, Discovered>>,
     /// 接收中的批次累计，收完（X-Last）就取走
     batches: Mutex<HashMap<String, BatchAcc>>,
+    /// 上一次响过的那条消息 ID。发送端 retry 与离线补录会把同一条再投一遍，
+    /// 聊天记录靠后写覆盖看不出重复，但声音会叠起来
+    last_notify: Mutex<String>,
+    /// 正在补发消息的会话 ID。一个对话框一次只能有一个补发者在跑，
+    /// 否则同一队列会被两个线程各读一份、投两遍，顺序也交叉了
+    flushing: Mutex<HashSet<String>>,
     /// 接收服务起不来之类的错误，原样显示给用户
     net_error: Mutex<Option<String>>,
     pub stop: AtomicBool,
@@ -131,6 +142,8 @@ impl Hub {
             sessions: Mutex::new(sessions),
             discovered: Mutex::new(HashMap::new()),
             batches: Mutex::new(HashMap::new()),
+            last_notify: Mutex::new(String::new()),
+            flushing: Mutex::new(HashSet::new()),
             net_error: Mutex::new(None),
             stop: AtomicBool::new(false),
         }))
@@ -269,7 +282,7 @@ impl Hub {
         if let Err(e) = self.store.save_sessions(&f) {
             eprintln!("[net] 保存会话改名失败: {e}");
         }
-        self.emit("sessions-changed", self.sessions_json());
+        self.emit_sessions();
     }
 
     pub fn set_peer_online(&self, id: &str, online: bool) {
@@ -407,7 +420,7 @@ impl Hub {
             eprintln!("[net] 保存会话失败: {e}");
         }
         if created {
-            self.emit("sessions-changed", self.sessions_json());
+            self.emit_sessions();
         }
         created
     }
@@ -449,7 +462,7 @@ impl Hub {
         if let Err(e) = self.store.save_sessions(&f) {
             eprintln!("[net] 保存会话失败: {e}");
         }
-        self.emit("sessions-changed", self.sessions_json());
+        self.emit_sessions();
         Ok(id)
     }
 
@@ -468,7 +481,7 @@ impl Hub {
             g.clone()
         };
         self.store.save_sessions(&f)?;
-        self.emit("sessions-changed", self.sessions_json());
+        self.emit_sessions();
         Ok(())
     }
 
@@ -509,8 +522,46 @@ impl Hub {
             g.clone()
         };
         self.store.save_sessions(&f)?;
-        self.emit("sessions-changed", self.sessions_json());
+        self.emit_sessions();
         Ok(())
+    }
+
+    /// 会话列表的唯一出口：算一遍、推给前端、顺手把图标角标设成同一个数。
+    ///
+    /// 三件事共用这一份 payload 是刻意的 —— 「会话栏每行的数字」和「图标上的数字」
+    /// 一旦分成两次计算，就会在不同线程读到不同版本的历史里长出不一致。
+    /// 角标不叫前端自己推：窗口关掉后前端没人跑，角标会冻在旧数字上。
+    pub fn emit_sessions(&self) {
+        let payload = self.sessions_json();
+        self.emit("sessions-changed", payload.clone());
+        let total = badge::badge_total(&payload);
+        // 两份句柄：一份用来排任务，一份进闭包。AppHandle 是 Arc 包装，clone 不贵，
+        // 但借用检查不允许同一个值既借给方法又移进闭包
+        let scheduler = self.app.clone();
+        let badge_app = scheduler.clone();
+        // 这一层包装不能省：badge/overlay 的实现在 tao 里用的是 unchecked 主线程标记，
+        // 而调用这里的可能正是接收服务那个后台线程
+        if let Err(e) =
+            scheduler.run_on_main_thread(move || badge::apply_badge(&badge_app, total))
+        {
+            eprintln!("[badge] 主线程任务排队失败: {e}");
+        }
+    }
+
+    /// 落库一条新的入向消息后响一声。开关与去重都在这里，调用点只管说「到了一条」。
+    ///
+    /// 与角标不同，这里不需要跳主线程：`afplay` 是起子进程，`MessageBeep` 是线程安全的
+    /// Win32 调用，在接收服务那个后台线程上直接播就行。窗口关着也响 —— 发声的是进程，不是页面。
+    pub fn notify_arrived(&self, id: &str) {
+        let enabled = self.store.load_prefs().notify;
+        let last = self.last_notify.lock().expect("last_notify 锁中毒").clone();
+        if !sound::should_play(enabled, &last, id) {
+            return;
+        }
+        *self.last_notify.lock().expect("last_notify 锁中毒") = id.to_string();
+        // 日志与声音一对一对得上，出问题时才能分清「没响」是没消息、被关了、还是播不出
+        eprintln!("[sound] 叮 {id}");
+        sound::play(id);
     }
 
     /// 会话列表：每个框自己的未读数、最后一条时间与摘要，加上所属那台的在线态。
@@ -616,6 +667,102 @@ impl Hub {
             .unwrap_or_default()
     }
 
+    /* ---- 离线排队与补发 ---- */
+
+    /// 拿一个会话的补发许可。拿不到说明这一台已经有人在投，直接跳过
+    fn acquire_flush(&self, sid: &str) -> bool {
+        self.flushing
+            .lock()
+            .expect("flushing 锁中毒")
+            .insert(sid.to_string())
+    }
+
+    fn release_flush(&self, sid: &str) {
+        self.flushing.lock().expect("flushing 锁中毒").remove(sid);
+    }
+
+    /// 把一条文字存成待发。不报错、当场就返给前端（气泡要立刻铺出来）
+    pub fn queue_text(&self, sess: &Session, peer: &Peer, text: &str) -> Result<Message, String> {
+        let msg = Message {
+            id: uuid::Uuid::new_v4().simple().to_string(),
+            dir: "out".into(),
+            kind: "text".into(),
+            text: Some(text.to_string()),
+            state: "queued".into(),
+            ts: store::now_ms(),
+            peer: peer.id.clone(),
+            sid: sess.id.clone(),
+            ..Default::default()
+        };
+        self.enqueue(&msg)
+    }
+
+    /// 把一批路径存成待发：只存**本机路径**不做内容快照（复制一份进 pastebox 会占双份
+    /// 磁盘，而且收件箱会落一个用户以为早删掉的旧版本）。文件夹也不预先展开，
+    /// 补发那一刻才递归 —— 排队期间它可能又被塞了几张进去
+    pub fn queue_paths(&self, sess: &Session, peer: &Peer, paths: &[String]) -> Result<Vec<Message>, String> {
+        let mut out = Vec::new();
+        for p in paths {
+            let path = std::path::Path::new(p);
+            // 这一步只读 metadata 给气泡起名与算大小；当场读不到就直接报错，
+            // 不把它塞进队列里等几天后再「发现发不出去」
+            out.push(client::outbound_bubble(&self.device_snapshot(), peer, sess, path, "queued")?);
+        }
+        for m in &out {
+            self.enqueue(m)?;
+        }
+        Ok(out)
+    }
+
+    fn enqueue(&self, msg: &Message) -> Result<Message, String> {
+        self.store.append_message(msg)?;
+        self.emit("msg-updated", serde_json::json!({ "message": msg }));
+        Ok(msg.clone())
+    }
+
+    /// 待发条数：给前端当提示用（也免得日志里看不出队列到底有没有在工作）
+    pub fn pending_count(&self) -> usize {
+        self.store.pending_messages().len()
+    }
+
+    /// 该补发哪些对话框、各投哪几条（会话 ID + 消息 ID），口径见 `flush_targets`。
+    /// 只看「队列非空」与「那台在线」两件事，会话本身还在不在留给投递时再查 ——
+    /// 那时要能顺手把死信落库
+    fn flush_plan(&self) -> Vec<(String, Vec<String>)> {
+        let pending = self.store.pending_messages();
+        if pending.is_empty() {
+            return Vec::new();
+        }
+        let busy = self.flushing.lock().expect("flushing 锁中毒").clone();
+        flush_targets(&pending, &peer_ids_online(&self.peers_snapshot()), &busy)
+    }
+
+    /// 心跳每一拍调一次。队列空（绝大多数时候）就直接走，不碰任何锁与线程
+    pub fn spawn_due_flush(self: &Arc<Self>) {
+        for (sid, ids) in self.flush_plan() {
+            // 先查会话再占许可：会话没了就把那几条直接标失败，
+            // 不能让它们永远挂着「待发」
+            let Some(sess) = self.session_by_id(&sid) else {
+                client::abandon_session_msgs(&self.store, &sid, &ids);
+                continue;
+            };
+            self.clone().spawn_flush(&sess, ids);
+        }
+    }
+
+    /// 把一个对话框的补发丢进阻塞线程。拿不到许可就不丢 —— 已经有人在投这一框
+    pub fn spawn_flush(self: &Arc<Self>, sess: &Session, ids: Vec<String>) {
+        if !self.acquire_flush(&sess.id) {
+            return;
+        }
+        let hub = self.clone();
+        let sess = sess.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            client::flush_session(&hub, &sess, &ids);
+            hub.release_flush(&sess.id);
+        });
+    }
+
     pub fn emit(&self, event: &str, payload: Value) {
         if let Err(e) = self.app.emit(event, payload) {
             eprintln!("[net] 推送 {event} 失败: {e}");
@@ -641,6 +788,8 @@ impl Hub {
             // 焦点：当前那个对话框的会话 ID（不再等于设备 ID，一台可以有多个框）
             "active": self.active_snapshot(),
             "discovered": self.discovered_json(),
+            // 还挂着多少条待发消息（对端上线后会自动补发）
+            "pending": self.pending_count(),
             "error": self.net_error.lock().expect("net_error 锁中毒").clone(),
             "server_ok": self.port_snapshot() != 0,
         })
@@ -819,6 +968,73 @@ pub(crate) fn auto_bind_targets(
         .collect()
 }
 
+/// 现在发得出去（在线）的那几台设备 ID
+fn peer_ids_online(peers: &[Peer]) -> Vec<String> {
+    peers
+        .iter()
+        .filter(|p| p.online)
+        .map(|p| p.id.clone())
+        .collect()
+}
+
+/// 待发队列该怎么分组：
+/// - 按对话框（`sid_of()`，老消息没有 sid 就归那台的基础对话）分组，
+///   组内按 ts 升序 —— 排队期间用户可能又写了新的，补发必须按原始顺序
+/// - 跳过**正在补发**的那个对话框：一个框一次只容一个投递者
+/// - 那台现在还不在线 / 已经不登记了（解绑）的不投。解绑只是不再主动连它，
+///   队列不能顺手删掉：那台被亲手加回来时这几条还得接着投
+pub(crate) fn flush_targets(
+    pending: &[Message],
+    online: &[String],
+    busy: &HashSet<String>,
+) -> Vec<(String, Vec<String>)> {
+    let mut order: Vec<String> = Vec::new();
+    let mut group: HashMap<String, Vec<Message>> = HashMap::new();
+    for m in pending {
+        let sid = m.sid_of().to_string();
+        if !online.iter().any(|p| p == &m.peer) || busy.contains(&sid) {
+            continue;
+        }
+        if !group.contains_key(&sid) {
+            order.push(sid.clone());
+        }
+        group.entry(sid).or_default().push(m.clone());
+    }
+    order
+        .into_iter()
+        .map(|sid| {
+            let mut v = group.remove(&sid).unwrap_or_default();
+            v.sort_by_key(|m| m.ts);
+            (sid, v.into_iter().map(|m| m.id).collect())
+        })
+        .collect()
+}
+
+/// 一条待发消息补发失败后的落库：没到上限就还是「待发」（计数与原因留着），
+/// 到上限才转「失败」。补发与投递两条路都走这里，口径只有一份
+pub(crate) fn retry(store: &Store, msg: &Message, err: &str, hard: bool) -> Message {
+    let n = msg.retry + 1;
+    let done = Message {
+        state: if hard || n >= MAX_RETRY {
+            "failed".into()
+        } else {
+            "queued".into()
+        },
+        retry: n,
+        reason: Some(err.to_string()),
+        ..msg.clone()
+    };
+    let _ = store.append_message(&done);
+    done
+}
+
+/// 同一件事，但要把新状态推给界面（气泡上的「第 N 次尝试失败」得当场变）
+pub(crate) fn retry_with(hub: &Hub, msg: &Message, err: &str, hard: bool) -> Message {
+    let done = retry(&hub.store, msg, err, hard);
+    hub.emit("msg-updated", serde_json::json!({ "message": done.clone() }));
+    done
+}
+
 /// 话题名：同一台第 2 个框起带编号。两个框都叫「甲机」是分不清的
 fn topic_name(base: &str, n: usize) -> String {
     if n <= 1 {
@@ -908,9 +1124,18 @@ fn migrate_sessions(f: &mut SessionsFile, peers: &HashMap<String, Peer>, history
 
 /// 发送目标：`to` 是**会话 ID**，不传就取当前会话（收藏视图「发给对端」走这条）。
 /// 会话里带着所属那台，真正的地址从 peers 表拿 —— 一台有几个框都用同一个对端，只是落点不同。
-/// 空 peer（未标记）从来不在会话表里，天然落进「没有这个会话」分支 ——
+/// 空 peer（未标记）从来不在会话表里，天然落进 `Missing` ——
 /// 它只用来查看历史，本来就不该能发东西
-fn require_target(hub: &Hub, to: Option<&str>) -> Result<(Session, Peer), String> {
+enum Target {
+    /// 那台在线，直接投
+    Ready(Session, Peer),
+    /// 那台登记过但眼下不在线：进队列
+    Queued(Session, Peer),
+    /// 会话不在了，或那台压根没添加过 —— 连地址都没有，没法排队，只能报错
+    Missing,
+}
+
+fn target_of(hub: &Hub, to: Option<&str>) -> Result<Target, String> {
     let id = match to.filter(|s| !s.is_empty()) {
         Some(t) => t.to_string(),
         None => hub.active_snapshot(),
@@ -921,10 +1146,16 @@ fn require_target(hub: &Hub, to: Option<&str>) -> Result<(Session, Peer), String
     let sess = hub
         .session_by_id(&id)
         .ok_or_else(|| "这个会话已经不在了：先在左侧选一个聊天框".to_string())?;
-    match hub.peer_by_id(&sess.peer) {
-        None => Err("这台对端还没有添加：请先配对，或等它给你发一条消息".into()),
-        Some(p) if !p.online => Err(format!("对端「{}」离线，稍后重试", p.display_name())),
-        Some(p) => Ok((sess, p)),
+    Ok(classify_target(&sess, hub.peer_by_id(&sess.peer).as_ref()))
+}
+
+/// 「离线也能发」的唯一判定，拆出来是因为 Hub 要 AppHandle、单测里造不出来。
+/// 没登记的那台连地址都没有，排不了队；登记过但眼下不在线的进队列
+fn classify_target(sess: &Session, peer: Option<&Peer>) -> Target {
+    match peer {
+        None => Target::Missing,
+        Some(p) if !p.online => Target::Queued(sess.clone(), p.clone()),
+        Some(p) => Target::Ready(sess.clone(), p.clone()),
     }
 }
 
@@ -935,11 +1166,16 @@ pub fn prepare_store(app: &AppHandle) -> Result<Arc<Store>, String> {
         .app_data_dir()
         .map_err(|e| format!("取 app_data_dir 失败: {e}"))?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建数据目录 {} 失败: {e}", dir.display()))?;
-    std::fs::create_dir_all(dir.join("inbox")).map_err(|e| format!("创建收件箱失败: {e}"))?;
+    let store = Arc::new(Store::new(dir));
+    // 收件目录可以被改到数据目录之外（prefs.json 里的 `inbox`），所以得问 store 要、
+    // 不能继续硬写 `dir.join("inbox")`；粘贴暂存不跟着改，那是本机自己造的文件
+    std::fs::create_dir_all(store.inbox_dir()).map_err(|e| format!("创建收件箱失败: {e}"))?;
     // 粘贴的图片要有个落点（与收件箱分开，免得混进“别人发来的东西”里）
-    std::fs::create_dir_all(dir.join("pastebox")).map_err(|e| format!("创建粘贴暂存失败: {e}"))?;
-    eprintln!("[net] 数据目录 {}", dir.display());
-    Ok(Arc::new(Store::new(dir)))
+    std::fs::create_dir_all(store.pastebox_dir())
+        .map_err(|e| format!("创建粘贴暂存失败: {e}"))?;
+    eprintln!("[net] 数据目录 {}", store.dir.display());
+    eprintln!("[net] 收件目录 {}", store.inbox_dir().display());
+    Ok(store)
 }
 
 /// 拉起三个后台线程。在 setup 里调用，此时 AppHandle 已可用。
@@ -960,8 +1196,9 @@ pub fn net_status(hub: State<'_, Arc<Hub>>) -> Value {
     hub.status_json()
 }
 
-/// 文字消息：同步等对端 2xx 才算「已送达」，所以放 blocking 线程里跑。
-/// `to` 是目标**会话 ID**，不传就发给当前会话
+/// 发一条文字：同步等对端 2xx 才算「已送达」，所以放 blocking 线程里跑。
+/// `to` 是目标**会话 ID**，不传就发给当前会话。
+/// 对端离线不再当场报错：存成待发返给前端，它上线后由心跳那一拍自动补发
 #[tauri::command]
 pub async fn send_text(
     hub: State<'_, Arc<Hub>>,
@@ -975,10 +1212,21 @@ pub async fn send_text(
     if text.len() as u64 > store::MAX_BODY_BYTES {
         return Err("单条文字超过 1MB，请拆分后发送".into());
     }
-    let (sess, peer) = require_target(&hub, to.as_deref())?;
-    tauri::async_runtime::spawn_blocking(move || client::send_text(&hub, &peer, &sess, text))
-        .await
-        .map_err(|e| format!("发送任务被中断: {e}"))?
+    match target_of(&hub, to.as_deref())? {
+        Target::Ready(sess, peer) => {
+            tauri::async_runtime::spawn_blocking(move || client::send_text(&hub, &peer, &sess, text))
+                .await
+                .map_err(|e| format!("发送任务被中断: {e}"))?
+        }
+        Target::Queued(sess, peer) => {
+            let msg = hub.queue_text(&sess, &peer, &text)?;
+            // 对方其实在线（只是 last_seen 还陈着）时这一拍就得投出去，
+            // 不能等下一次心跳 —— 用户看到的是「秒发」而不是「排队」
+            hub.clone().spawn_flush(&sess, vec![msg.id.clone()]);
+            Ok(msg)
+        }
+        Target::Missing => Err("这台对端还没有添加：请先配对，或等它给你发一条消息".into()),
+    }
 }
 
 #[tauri::command]
@@ -991,10 +1239,20 @@ pub async fn send_paths(
     if paths.is_empty() {
         return Err("没有要发送的文件".into());
     }
-    let (sess, peer) = require_target(&hub, to.as_deref())?;
-    tauri::async_runtime::spawn_blocking(move || client::send_paths(&hub, &peer, &sess, paths))
-        .await
-        .map_err(|e| format!("发送任务被中断: {e}"))?
+    match target_of(&hub, to.as_deref())? {
+        Target::Ready(sess, peer) => {
+            tauri::async_runtime::spawn_blocking(move || client::send_paths(&hub, &peer, &sess, paths))
+                .await
+                .map_err(|e| format!("发送任务被中断: {e}"))?
+        }
+        Target::Queued(sess, peer) => {
+            let msgs = hub.queue_paths(&sess, &peer, &paths)?;
+            let ids: Vec<String> = msgs.iter().map(|m| m.id.clone()).collect();
+            hub.clone().spawn_flush(&sess, ids);
+            Ok(msgs)
+        }
+        Target::Missing => Err("这台对端还没有添加：请先配对，或等它给你发一条消息".into()),
+    }
 }
 
 /// 从按时间排好的历史里切出一页 `[start, end)`。
@@ -1090,6 +1348,30 @@ pub fn session_focus(hub: State<'_, Arc<Hub>>, id: String) -> Value {
 pub fn session_delete(hub: State<'_, Arc<Hub>>, id: String) -> Result<Value, String> {
     hub.remove_session(&id)?;
     Ok(hub.sessions_json())
+}
+
+/// 当前生效的收件目录。`custom` = 用户改过没有，前端据此置灰「恢复默认」。
+///
+/// 这里顺手建一次目录：新目录本来要等第一个文件落进来才建，而用户很可能
+/// 先点「打开目录」——那时候路径不存在，只会拿到一句“路径不存在”，看不出是没建
+#[tauri::command]
+pub fn inbox_dir(store: State<'_, Arc<Store>>) -> Value {
+    let p = store.inbox_dir();
+    if let Err(e) = std::fs::create_dir_all(&p) {
+        eprintln!("[net] 收件目录 {} 建不出来: {e}", p.display());
+    }
+    json!({
+        "path": p.to_string_lossy(),
+        "custom": !store.load_prefs().inbox.is_empty(),
+    })
+}
+
+/// 「试听」：无视开关直接响一声，也不参与去重（点一次就该响一次）。
+/// 这一声就是用来确认「这台机器到底放不放得出声」的
+#[tauri::command]
+pub fn play_notify_sound() {
+    eprintln!("[sound] 试听");
+    sound::play("audition");
 }
 
 /// 打开收件箱目录（在系统文件管理器里定位到具体文件）
@@ -1211,14 +1493,15 @@ fn copy_tree(from: &std::path::Path, to: &std::path::Path) -> Result<(), String>
     Ok(())
 }
 
-/// 发送用的文件夹选择（不加任何扩展名过滤，什么目录都能选）
+/// 文件夹选择（不加任何扩展名过滤，什么目录都能选）。发送与选收件目录共用一个，
+/// 差的只是标题 —— 再来一个一模一样的命令只会多一处要同步的注册点
 #[tauri::command]
-pub async fn pick_folder(app: AppHandle) -> Result<Option<String>, String> {
+pub async fn pick_folder(app: AppHandle, title: Option<String>) -> Result<Option<String>, String> {
     use tauri_plugin_dialog::DialogExt;
     let (tx, rx) = tokio::sync::oneshot::channel::<Option<tauri_plugin_dialog::FilePath>>();
     app.dialog()
         .file()
-        .set_title("选择要发送的文件夹")
+        .set_title(title.unwrap_or_else(|| "选择要发送的文件夹".into()))
         .pick_folder(move |folder| {
             let _ = tx.send(folder);
         });
@@ -1255,7 +1538,7 @@ mod tests {
             ts,
             peer: peer.into(),
             // 上一版的消息：没有会话 ID，按 sid_of 归到那台的基础对话
-            sid: String::new(),
+            ..Default::default()
         }
     }
 
@@ -1658,5 +1941,84 @@ mod tests {
         // 只有空 peer 的旧消息也不建（进「未标记」虚拟会话看）
         assert!(!migrate_sessions(&mut f, &映射(&[]), &[String::new()]));
         assert!(f.sessions.is_empty());
+    }
+
+    #[test]
+    fn 离线的那台进队列而不是报错() {
+        let sess = Session {
+            id: "a".into(),
+            peer: "a".into(),
+            name: "甲".into(),
+            created: 1,
+            read: 0,
+        };
+        let mut off = 对端("a", "甲");
+        off.online = false;
+        assert!(matches!(classify_target(&sess, Some(&off)), Target::Queued(_, _)));
+        let on = 对端("a", "甲");
+        assert!(matches!(classify_target(&sess, Some(&on)), Target::Ready(_, _)));
+        // 没登记过的那台连地址都没有：仍然当场报错，排队毫无意义
+        assert!(matches!(classify_target(&sess, None), Target::Missing));
+    }
+
+    #[test]
+    fn 补发按会话分组各自按原始顺序一个框只留一个投递者() {
+        let 待 = |id: &str, peer: &str, sid: &str, ts: i64| Message {
+            state: "queued".into(),
+            dir: "out".into(),
+            ts,
+            ..话题消息(id, peer, sid, "out", ts)
+        };
+        let pending = vec![
+            // 甲机的话题框：故意倒着写，补发必须把顺序理回去
+            待("晚", "a", "ua", 30),
+            待("早", "a", "ua", 10),
+            // 甲机的基础对话（老消息没有 sid，按 peer 归）：不能插到上面那个框中间
+            待("基础", "a", "", 20),
+            // 乙机现在不在线：整组不投
+            待("乙机", "b", "", 40),
+        ];
+        let online: Vec<String> = vec!["a".into()];
+        let got = flush_targets(&pending, &online, &HashSet::new());
+        let ids: Vec<Vec<String>> = got.iter().map(|(_, v)| v.clone()).collect();
+        assert_eq!(ids, vec![vec!["早", "晚"], vec!["基础"]], "按 ts 升序，且不串框：{ids:?}");
+        // 那个框已经有人在投：整组跳过，否则同一队列会被投两遍
+        let busy: HashSet<String> = ["ua".to_string()].into_iter().collect();
+        let again = flush_targets(&pending, &online, &busy);
+        assert_eq!(again.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>(), vec!["a"]);
+    }
+
+    #[test]
+    fn 补发三次不中才停手且原因留着() {
+        let dir = std::env::temp_dir().join(format!("imgcmp-retry-{}", store::now_ms()));
+        let s = Store::new(dir.clone());
+        let base = Message {
+            state: "queued".into(),
+            text: Some("一句".into()),
+            ..消息("m", "a", "out", 1)
+        };
+        s.append_message(&base).unwrap();
+        // 前三次还是「待发」：对端再上线还能接着试
+        let one = retry(&s, &base, "连不上", false);
+        assert_eq!((one.state.as_str(), one.retry, one.reason.as_deref()), ("queued", 1, Some("连不上")));
+        // 没到上限的那次：重开一份 Store 也还得看得出它仍在队列里、计数与原因都跟着
+        let mid = Store::new(dir.clone());
+        assert_eq!(mid.pending_messages().len(), 1, "没到上限的还得等下一拍补发");
+        assert_eq!(mid.read_messages(100)[0].retry, 1);
+        assert_eq!(mid.read_messages(100)[0].reason.as_deref(), Some("连不上"));
+        let two = retry(&s, &one, "连不上", false);
+        assert_eq!(two.state, "queued");
+        let three = retry(&s, &two, "连不上", false);
+        assert_eq!(three.state, "failed", "到上限就该停手：否则一个大文件夹会每次上线都重传一遍");
+        assert_eq!(three.reason.as_deref(), Some("连不上"));
+        // 硬错误（文件已经不在这个位置了）一次就停，重试三次只会白跑三趟
+        let hard = retry(&s, &base, "路径没了", true);
+        assert_eq!((hard.state.as_str(), hard.retry), ("failed", 1));
+        // 落库的是最新那一行：重试记录都追加在同一个 id 上，最后一条是 failed
+        // 就意味着这一条已经停手，不该还在队列里被反复重投
+        let back = Store::new(dir.clone());
+        assert!(back.pending_messages().is_empty(), "停手的消息必须从队列里下来");
+        assert_eq!(back.read_messages(100).iter().find(|m| m.id == "m").unwrap().state, "failed");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

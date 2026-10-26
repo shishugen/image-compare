@@ -18,6 +18,8 @@
         </button>
         <button class="nav-btn" data-goto="transfer" title="局域网传输（⌘2）">
           <span class="nav-ico">⇄</span><span class="nav-txt">传输</span>
+          <!-- 所有会话的未读总数，与图标角标同一个数（见 view-transfer.js 的 renderNavBadge） -->
+          <span class="nav-badge" id="nav-badge-xfer" hidden></span>
         </button>
         <button class="nav-btn" data-goto="fav" title="文字收藏（⌘3）">
           <span class="nav-ico">☆</span><span class="nav-txt">收藏</span>
@@ -276,9 +278,9 @@
                     id="xfer-input"
                     class="input compose-input"
                     rows="2"
-                    placeholder="写点什么，Enter 发送、Shift+Enter 换行；把文件拖进窗口或 ⌘V 粘贴即发送"
+                    placeholder="写点什么，Enter 发送、Shift+Enter 换行；把文件拖进窗口或 ⌘V 粘贴即发送（对方离线也能发，会排队自动补发）"
                   ></textarea>
-                  <button id="btn-xfer-send" class="btn btn-primary" disabled title="当前会话离线时不可发送">发送</button>
+                  <button id="btn-xfer-send" class="btn btn-primary" disabled title="对方离线时也能发：先存本机排队，它上线后自动补发；只有还没配对的发不出去">发送</button>
                 </div>
 
                 <!-- 拖拽悬停遮罩：像微信那样，看到提示就可以松手 -->
@@ -306,6 +308,33 @@
                     </label>
                     <button id="btn-pair-save" class="btn btn-primary">保存口令与设备名</button>
                     <p class="hint">口令只存本机，用于互认与请求签名。局域网内是明文传输，别用来传敏感文件。</p>
+
+                    <!-- 本机接收：这两项与对比视图那几项存在同一份 prefs.json 里，
+                         各自只传自己关心的字段（set_prefs 是局部更新），不会互相盖掉 -->
+                    <div class="set-sub">本机接收</div>
+                    <label class="field">
+                      <span>收到消息时</span>
+                      <label class="switch">
+                        <input id="chk-notify-sound" type="checkbox" checked />
+                        <span class="switch-track"><span class="switch-thumb"></span></span>
+                        <span class="switch-text" id="sw-notify-text">响一声</span>
+                      </label>
+                    </label>
+                    <div class="drawer-acts">
+                      <button id="btn-notify-audition" class="btn btn-ghost" title="无视开关直接响一声，用来确认这台机器放不放得出声">试听</button>
+                    </div>
+                    <p class="hint">响的是本进程，窗口关着也响；一整个文件夹收完只响一声，同一条消息重发不重响。</p>
+
+                    <label class="field">
+                      <span>收件目录（新收到的文件落这里）</span>
+                      <code class="inbox-dir" id="inbox-dir-value">读取中…</code>
+                    </label>
+                    <div class="drawer-acts">
+                      <button id="btn-inbox-choose" class="btn">选择…</button>
+                      <button id="btn-inbox-reset" class="btn btn-ghost">恢复默认</button>
+                      <button id="btn-inbox-reveal" class="btn btn-ghost" title="在访达 / 资源管理器里打开这个目录">打开目录</button>
+                    </div>
+                    <p class="hint">只影响<strong>新收到</strong>的文件；之前收到的留在老目录里，聊天记录照样能预览、另存、定位。改到外置盘或网络盘上之后，盘一拔掉那些气泡就打不开了。</p>
 
                     <div class="cand-box" id="xfer-candidates"></div>
 
@@ -407,10 +436,30 @@
 
     <input id="file-picker" type="file" accept="image/*" multiple hidden />
 
-    <!-- 聊天缩略图点开的放大层：复用同一份 data URL，不再走一次磁盘读取 -->
+    <!-- 从浏览侧栏往某个图窗里拖那一行时「手里拿的那件东西」：位置跟鼠标走，
+         只在这趟拖拽期间出现。pointer-events: none 是必需的，不然它会挡住落点命中 -->
+    <div class="strip-ghost" id="strip-ghost" hidden>
+      <img alt="" />
+      <span class="sg-name"></span>
+    </div>
+
+    <!-- 聊天缩略图点开的放大层：复用同一份 data URL，不再走一次磁盘读取。
+         图可以滚轮/按钮放大缩小（口径与对比视图一致：25%~800%，100% = 原始像素），
+         控件条绝对定位，不能参加 flex 布局——多一行就会把居中的图顶上去 -->
     <div class="lightbox" id="img-lightbox" hidden>
       <button class="lb-close" id="lightbox-close" title="关闭（Esc）">×</button>
+      <div class="lb-tools" id="lightbox-tools">
+        <button class="btn btn-icon" id="lightbox-out" title="缩小（-）">−</button>
+        <span class="lb-zoom" id="lightbox-zoom">100%</span>
+        <button class="btn btn-icon" id="lightbox-in" title="放大（+）">+</button>
+        <button class="btn lb-txt" id="lightbox-fit" title="适应窗口（0）">适应</button>
+        <button class="btn lb-txt" id="lightbox-one" title="原始像素 1:1（1）">1:1</button>
+        <button class="btn lb-txt" id="lightbox-tile" title="田字平铺（T）：同一张图按当前尺寸铺四份，中间十字就是接缝检验处；再按回单张">田</button>
+      </div>
       <img id="lightbox-img" alt="" />
+      <!-- 田字平铺的画布：用 background repeat 而不是四个 img 拼，因为四个 img 在非整数倍
+           缩放的格子之间会被浏览器画出亚像素亮缝，那条缝是渲染造的，反而会被当成图没接上 -->
+      <div class="lb-tile" id="lightbox-tile-stage"></div>
       <div class="lb-cap" id="lightbox-cap"></div>
     </div>
 

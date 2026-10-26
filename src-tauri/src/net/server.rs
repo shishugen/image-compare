@@ -191,6 +191,8 @@ fn handle(hub: Arc<Hub>, mut req: tiny_http::Request) -> Result<(), String> {
                 Ok(msg) => {
                     let id = msg.id.clone();
                     hub.emit("msg-in", serde_json::json!({ "message": msg }));
+                    // 响一声放在推事件之后：声音是给用户当下看的，不能排在落库前面拖住响应
+                    hub.notify_arrived(&id);
                     answer(req, 200, &serde_json::json!({ "ok": true, "msg_id": id }))
                 }
                 Err(e) => answer(req, 400, &serde_json::json!({ "ok": false, "error": e })),
@@ -253,6 +255,7 @@ fn handle_text(hub: &Arc<Hub>, body: &[u8], from: &Sender) -> Result<Message, St
         ts: parsed.ts,
         peer: from.dev_id.clone(),
         sid,
+        ..Default::default()
     };
     hub.store
         .append_message(&msg)
@@ -358,7 +361,12 @@ fn handle_file(
                     &sid,
                 );
                 let _ = hub.store.append_message(&msg);
+                // 下面把 msg 整体搬进了事件载荷，id 得先存一份
+                let fid = msg.id.clone();
                 hub.emit("xfer-done", serde_json::json!({ "message": msg }));
+                // 一个文件夹只在这里响一声：整批收完才落这一条消息，
+                // 不需要为「几十个文件别叫几十声」再加时间节流
+                hub.notify_arrived(&fid);
             }
             answer(
                 req,
@@ -503,6 +511,7 @@ fn build_inbox_message(
         ts: store::now_ms(),
         peer: dev_id.to_string(),
         sid: sid.to_string(),
+        ..Default::default()
     }
 }
 

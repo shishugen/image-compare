@@ -40,6 +40,27 @@ export function listen(event, handler) {
     });
 }
 
+/**
+ * 本地文件 → 能直接挂到 <img src> 上的地址（Tauri 的 asset 协议）。
+ * 拿不到地址就回 null（纯浏览器里调试、或注入包里没这个函数），调用方得有自己的退路。
+ * 这个函数在注入包里挂在 __TAURI__.core 与 __TAURI_INTERNALS__ 两处，都认一下；
+ * mac/linux 得到 `asset://localhost/<encodeURIComponent(路径)>`，Windows/Android 是
+ * `http://asset.localhost/<...>` —— 两样都要在 CSP 的 img-src 里放行，且 tauri.conf.json
+ * 里 assetProtocol 要 enable 并且 scope 要盖到这些路径（三道缺一处就是缩略图整片空白）。
+ */
+export function assetSrc(path) {
+  const w = typeof window === "undefined" ? null : window;
+  const fn = w?.__TAURI__?.core?.convertFileSrc || w?.__TAURI_INTERNALS__?.convertFileSrc;
+  if (typeof fn !== "function" || !path) return null;
+  try {
+    return fn(String(path)) || null;
+  } catch (err) {
+    // 转不出地址不是大事：回到原来的路（走 IPC 读整图），绝不能让侧栏整片空着
+    console.warn("[asset] convertFileSrc 失败，退回 read_image:", err?.message || err);
+    return null;
+  }
+}
+
 /* --------------------------------------------------------------------------
  * 视图切换：body[data-view] 决定哪个视图可见，也决定拖拽落到哪里
  * ------------------------------------------------------------------------ */

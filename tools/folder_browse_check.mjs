@@ -191,6 +191,16 @@ function seedPane(key) {
   return root;
 }
 for (const k of ["a", "b", "c", "d"]) seedPane(k);
+// 拖行时手里那枚牌：index.html 里它带 hidden 出厂，底下是 img + .sg-name 两个孩子
+(() => {
+  const g = byId("strip-ghost");
+  g.hidden = true;
+  const img = mkEl("img");
+  const name = mkEl("span");
+  name.classSet.add("sg-name");
+  g.appendChild(img);
+  g.appendChild(name);
+})();
 // index.html 里侧栏与那句提示都是带着 hidden 出厂的，桩得照这个初始态起
 byId("filmstrip").hidden = true;
 byId("fs-tip").hidden = true;
@@ -264,6 +274,13 @@ const BETA = "/tmp/shot/BETA";
 const GAMMA = "/tmp/shot/GAMMA";
 const LONG = "/tmp/shot/LONG";
 const HUGE = "/tmp/shot/HUGE";
+const SPACE = "/tmp/shot/有 空格&符号"; // 验 asset 地址里的路径转义
+// DELTA / EPS 是第 16 节专用的「干净目录」：前面任何用例都没碰过它们，LRU 里必然没有这几张。
+// 少了这一层，「asset 模式下一次 IPC 也不发」和「退路模式下窗口外不读」都会被缓存命中蒙过去，
+// 断言看着绿、其实什么都没验。
+const DELTA = "/tmp/shot/DELTA";
+const EPS = "/tmp/shot/EPS";
+const ZETA = "/tmp/shot/ZETA"; // 第 17 节专用：asset 能转地址但取不到文件
 const img = (name, size) => ({ name, size });
 const sub = (name, kids) => ({ name, dir: true, kids });
 
@@ -273,6 +290,8 @@ const sub = (name, kids) => ({ name, dir: true, kids });
 // [0]big.png(过大) [1]IMG_2 [2]IMG_10 [3]IMG_100 [4]scan.tif
 // GAMMA: [0]g1 [1]g2 [2]g3_big(过大) [3]g4 [4]g5 [5]gone
 const world = {
+  // asset 协议可不可用，用例自己开关：关掉时桩回空串，assetSrc() 就当「转不出地址」退回 read_image
+  assetOn: false,
   fs: {
     [ALPHA]: {
       entries: [
@@ -286,6 +305,37 @@ const world = {
       ],
     },
     [BETA]: { entries: [img("beta_1.png", 700), img("beta_10.png", 900), img("beta_2.png", 800)] },
+    [SPACE]: { entries: [img("第一 张.png", 900), img("second x.jpg", 1200)] },
+    // [0]a1 [1]a2 [2]a3_big(6MB) [3]a4 [4]a5 —— 自然序与 GAMMA 那组同形，下标照抄
+    [DELTA]: {
+      entries: [
+        img("a1.png", 1000),
+        img("a2.png", 2000),
+        img("a3_big.png", 6 * 1024 * 1024),
+        img("a4.png", 3000),
+        img("a5.png", 4000),
+      ],
+    },
+    // 同上形状，专给退路那两条断言用（这里必须一次缓存都没有）
+    [EPS]: {
+      entries: [
+        img("e1.png", 1000),
+        img("e2.png", 2000),
+        img("e3_big.png", 6 * 1024 * 1024),
+        img("e4.png", 3000),
+        img("e5.png", 4000),
+      ],
+    },
+    // [0]z1 [1]z2 [2]z3 [3]z4 [4]z5 —— 全小图，第 17 节拿它们验「asset 取不到文件」的自愈
+    [ZETA]: {
+      entries: [
+        img("z1.png", 1000),
+        img("z2.png", 2000),
+        img("z3.png", 3000),
+        img("z4.png", 4000),
+        img("z5.png", 5000),
+      ],
+    },
     [GAMMA]: {
       entries: [
         img("g1.png", 1000),
@@ -299,6 +349,7 @@ const world = {
     // 只有当前这一张的目录
     ["/tmp/shot/ONLY"]: { entries: [img("only.png", 300)] },
     // 真实世界里的长名样本（用户截图上那几条）：区分点全在尾部
+    
     [LONG]: {
       entries: [
         img("Generate_Amazon_background_image_2K_20261025150443.jpg", 2_900_000),
@@ -404,7 +455,13 @@ async function invokeStub(cmd, args) {
 
 const tauriEvents = [];
 window.__TAURI__ = {
-  core: { invoke: invokeStub },
+  core: {
+    invoke: invokeStub,
+    // 真实实现就是拼这个串（mac：asset://localhost/<encodeURIComponent(路径)>），
+    // 而且挂在 __TAURI__.core 与 __TAURI_INTERNALS__ 两处，这里只桩前者，
+    // assetSrc() 的两处取值都有合约盯着
+    convertFileSrc: (p) => (world.assetOn ? `asset://localhost/${encodeURIComponent(p)}` : ""),
+  },
   event: {
     listen: (name, handler) => {
       tauriEvents.push([name, handler]);
@@ -514,6 +571,59 @@ async function clickEmptyPane(paneKey) {
 }
 const mark = () => calls.length;
 
+/* ---------------- 行 → 窗拖拽要用到的三件：真实矩形 + 窗口事件 + 牌 ---------------- */
+/** 桩里四个窗的画布矩形全压在原点，命中判定分不出格：这里按布局给它们盖屏幕位置。
+ *  只改 getBoundingClientRect，clientWidth/Height 不动（适应档尺寸靠它，别扯到算法上） */
+function setPaneRect(k, left, top, w, h) {
+  const vp = byId("pane-" + k).querySelector(".viewport");
+  vp.getBoundingClientRect = () => ({
+    left,
+    top,
+    right: left + w,
+    bottom: top + h,
+    width: w,
+    height: h,
+  });
+}
+/** 往 window 上派一个鼠标事件（拖拽的三个监听都挂在 window 上） */
+function fireWin(type, ev = {}) {
+  const e = {
+    type,
+    clientX: 0,
+    clientY: 0,
+    button: 0,
+    buttons: 1, // 鼠标上移动 = 左键还按着
+    prevented: false,
+    preventDefault() {
+      this.prevented = true;
+    },
+    stopPropagation() {},
+    ...ev,
+  };
+  for (const [t, fn] of winListeners) if (t === type) fn(e);
+  return e;
+}
+/** 在行的第 sx/sy 像素上按下左键 */
+function rowDown(row, sx, sy) {
+  row.dispatchEvent({ type: "mousedown", button: 0, buttons: 1, clientX: sx, clientY: sy, preventDefault() {} });
+}
+const ghost = () => byId("strip-ghost");
+/** 一次真实的点行：按下 → 不动 → 松手 → click（拖拽之后只有这条路才能再点动，
+ *  因为起过拖的那一下会把紧跟着的 click 吐掉） */
+function clickRow(i, sx = 30, sy = 30) {
+  const r = rows()[i];
+  rowDown(r, sx, sy);
+  fireWin("mouseup", { clientX: sx, clientY: sy });
+  click(r);
+}
+const ghostImg = () => ghost().querySelector("img");
+/** 某行小图真正挂上去的地址（paintThumb 写的是 img.src 属性，不是 setAttribute） */
+const thumbSrc = (i) => thumbOf(i)?.querySelector("img")?.src || "";
+const thumbImg = (i) => thumbOf(i)?.querySelector("img") || null;
+/** 这趟一共走了多少次 read_image（asset 那条路应该是 0） */
+const totalReads = () => [...world.reads.values()].reduce((a, b) => a + b, 0);
+const ghostName = () => ghost().querySelector(".sg-name").text;
+
 let failed = 0;
 function check(name, ok, extra = "") {
   console.log(`${ok ? "PASS" : "FAIL"}  ${name}${extra ? "  " + extra : ""}`);
@@ -595,15 +705,34 @@ check(
   `${transformOf("a")} vs ${transformOf("b")}`
 );
 
-/* ===================== 4) 四图布局：浏览只动 A/B，C/D 不参与 ===================== */
+/* ===================== 4) 四图布局：浏览按 A→B→C→D→A 轮，四张同时在屏上 ===================== */
 key("4");
 await settle();
-check("切到四图后 C/D 是空的", srcOf("c") === "" && srcOf("d") === "" && byId("st-info-c").text.includes("未载入"));
-const beforeGrid = shot();
-key("]");
+check("切到四图后 C/D 是空的（切布局不搬图）", srcOf("c") === "" && srcOf("d") === "" && byId("st-info-c").text.includes("未载入"));
+click(byId("btn-clear"));
 await settle();
-check("四图布局下浏览仍然只写 A/B 之一", changedPanes(beforeGrid).length === 1 && changedPanes(beforeGrid).every((k) => k === "a" || k === "b"), changedPanes(beforeGrid).join(","));
-check("C/D 的图没被浏览动过", srcOf("c") === "" && srcOf("d") === "");
+const gslots = [];
+for (const i of [0, 1, 2, 3, 4]) {
+  const before = shot();
+  click(rows()[i]);
+  await settle();
+  gslots.push(changedPanes(before).join(""));
+}
+check(
+  "连点五项走出 a→b→c→d→a：与两图那套是同一条规则，只是序列长了",
+  gslots.join(",") === "a,b,c,d,a",
+  gslots.join(",")
+);
+check(
+  "四张同时在屏上：每个窗都有一份，不只看 A/B",
+  ["a", "b", "c", "d"].every((k) => srcOf(k) !== "") && new Set(["a", "b", "c", "d"].map(srcOf)).size === 4,
+  ["a", "b", "c", "d"].map((k) => srcOf(k).split("/").pop()).join(",")
+);
+check(
+  "状态行说清了其余三格留着前面几张",
+  /第 \d\/5 张→A 窗，B 窗\/C 窗\/D 窗留着前面几张/.test(statusText()),
+  statusText()
+);
 key("2");
 await settle();
 
@@ -919,6 +1048,293 @@ byId("chk-sync").checked = false;
 key("c", { meta: true });
 await settle();
 check("关掉同步就只带活动窗那一张", lastCopy()?.length === 1, JSON.stringify(lastCopy()));
+
+/* ===================== 15) 把侧栏那一行拖到指定的那个窗 ===================== */
+key("2");
+click(byId("btn-clear"));
+await settle();
+await openViaCmdO([`${ALPHA}/IMG_2.png`]); // A = IMG_2，同时把 ALPHA 列表建起来
+await settle();
+// 桩里四个窗全压在原点，命中判定分不出格：按屏幕实际位置盖一遍（按下点 30,30 在两格之外）
+setPaneRect("a", 400, 100, 500, 400);
+setPaneRect("b", 900, 100, 500, 400);
+setPaneRect("c", 400, 500, 500, 400);
+setPaneRect("d", 900, 500, 500, 400);
+check(
+  "ALPHA 列表已就位（下面都按这一份下标写）",
+  rowNames().join(",") === "big.png,IMG_2.png,IMG_10.png,IMG_100.png,scan.tif",
+  rowNames().join(",")
+);
+
+/* —— 按下没超过阈值：那还是一次普通点行 —— */
+let dBefore = shot();
+rowDown(rows()[2], 30, 30);
+fireWin("mousemove", { clientX: 33, clientY: 32, buttons: 1 }); // 只走 3.6px
+fireWin("mouseup", { clientX: 33, clientY: 32 });
+click(rows()[2]);
+await settle();
+check(
+  "移动没超过 4px 就仍是一次点行：照旧走轮转落窗",
+  changedPanes(dBefore).join(",") === "b" && srcOf("b") === `${ALPHA}/IMG_10.png`,
+  `${changedPanes(dBefore).join(",")} | ${srcOf("b")}`
+);
+check("没超阈值全程不亮牌也不加禁选类", ghost().hidden === true && !body.classSet.has("is-strip-drag"));
+
+/* —— 越过阈值：牌亮起来、跟手、按可见窗描边 —— */
+rowDown(rows()[3], 30, 30);
+fireWin("mousemove", { clientX: 30, clientY: 45, buttons: 1 }); // 15px > 4
+check(
+  "超阈值就认定是拖：牌亮出来、跟到指针处、整页禁选",
+  ghost().hidden === false &&
+    ghost().style.left === "30px" &&
+    ghost().style.top === "45px" &&
+    body.classSet.has("is-strip-drag"),
+  JSON.stringify(ghost().style)
+);
+check(
+  "牌上写的是那一行的文件名，图只在与缓存一致时挂（不留空 img）",
+  ghostName() === "IMG_100.png" && (ghostImg().attributes.src ? !ghostImg().hidden : ghostImg().hidden === true),
+  `${ghostName()} | hidden:${ghostImg().hidden}`
+);
+fireWin("mousemove", { clientX: 1100, clientY: 200, buttons: 1 }); // 进 B 窗
+check(
+  "指针进 B 窗：只有 B 描边（drag-over 与从 Finder 拖文件进来同一套）",
+  byId("pane-b").classSet.has("drag-over") && !byId("pane-a").classSet.has("drag-over")
+);
+dBefore = shot();
+fireWin("mouseup", { clientX: 1100, clientY: 200 });
+await settle();
+check(
+  "松手落进 B：非空窗也被直接换掉，A 不动",
+  changedPanes(dBefore).join(",") === "b" && srcOf("b") === `${ALPHA}/IMG_100.png`,
+  `${changedPanes(dBefore).join(",")} | ${srcOf("b")}`
+);
+check(
+  "收场干净：牌隐、禁选摘、描边清、img 不留残 src",
+  ghost().hidden === true &&
+    !body.classSet.has("is-strip-drag") &&
+    !byId("pane-b").classSet.has("drag-over") &&
+    !ghostImg().attributes.src
+);
+dBefore = shot();
+click(rows()[0]); // 拖完浏览器可能补一个 click：那一下不该翻页
+await settle(); // 不给这一句的话，真偷走了浏览也照样照不出（负向验证时踩过）
+check(
+  "真起过拖之后补来的 click 不吃浏览",
+  changedPanes(dBefore).length === 0 && srcOf("a") === `${ALPHA}/IMG_2.png`,
+  changedPanes(dBefore).join(",")
+);
+dBefore = shot();
+clickRow(0); // 重新按下就复位：下一次点行照常
+await settle();
+check(
+  "吐一次就复位：接着按下再点同一行照常浏览（轮转起点已被拖拽改到了 B）",
+  changedPanes(dBefore).join(",") === "a" && srcOf("a") === `${ALPHA}/big.png`,
+  `${changedPanes(dBefore).join(",")} | ${srcOf("a")}`
+);
+
+/* —— 落点只看当前档的可见窗 —— */
+rowDown(rows()[2], 30, 30);
+fireWin("mousemove", { clientX: 600, clientY: 600, buttons: 1 }); // 两图下 C 的矩形里
+check(
+  "两图下指针压在 C 的矩形里也不描边（paneAtPoint 只遍历可见窗）",
+  ["a", "b", "c", "d"].every((k) => !byId("pane-" + k).classSet.has("drag-over"))
+);
+dBefore = shot();
+fireWin("mouseup", { clientX: 600, clientY: 600 });
+await settle();
+check("松在没有可见窗的地方：什么都没发生", changedPanes(dBefore).length === 0, changedPanes(dBefore).join(","));
+
+/* —— 半途 Esc 作废 —— */
+// 上面几段把侧栏收过就不再自动弹，这里先开回来：不然「Esc 有没有去收侧栏」根本观察不到
+click(byId("btn-strip"));
+await settle();
+dBefore = shot();
+rowDown(rows()[4], 30, 30);
+fireWin("mousemove", { clientX: 30, clientY: 60, buttons: 1 });
+const esc = key("Escape");
+await settle();
+check(
+  "拖到一半按 Esc：这趟作废，牌隐、禁选摘",
+  ghost().hidden === true && !body.classSet.has("is-strip-drag")
+);
+check("Esc 被拖拽吃掉，没继续往下走去收侧栏", esc.prevented === true && strip().hidden === false, `prevented:${esc.prevented} hidden:${strip().hidden}`);
+fireWin("mouseup", { clientX: 30, clientY: 60 });
+click(rows()[4]);
+await settle();
+check("Esc 作废后补来的 click 同样不吃浏览", changedPanes(dBefore).length === 0, changedPanes(dBefore).join(","));
+
+/* —— 四图下拖 C/D，以及“拖一次就是把轮转起点挪到哪” —— */
+key("4");
+await settle();
+rowDown(rows()[1], 30, 30);
+fireWin("mousemove", { clientX: 30, clientY: 60, buttons: 1 });
+fireWin("mousemove", { clientX: 600, clientY: 600, buttons: 1 });
+check("四图下指针进 C 窗：C 描边", byId("pane-c").classSet.has("drag-over") && !byId("pane-a").classSet.has("drag-over"));
+dBefore = shot();
+fireWin("mouseup", { clientX: 600, clientY: 600 });
+await settle();
+check("空着的 C 窗收下这一张", srcOf("c") === `${ALPHA}/IMG_2.png` && changedPanes(dBefore).join(",") === "c", srcOf("c"));
+rowDown(rows()[4], 30, 30);
+fireWin("mousemove", { clientX: 30, clientY: 60, buttons: 1 });
+fireWin("mousemove", { clientX: 700, clientY: 700, buttons: 1 }); // 还在 C 那一格
+dBefore = shot();
+fireWin("mouseup", { clientX: 700, clientY: 700 });
+await settle();
+check(
+  "再拖一张到同一个窗：原有的直接被替掉，不弹确认",
+  srcOf("c") === `${ALPHA}/scan.tif` && changedPanes(dBefore).join(",") === "c",
+  srcOf("c")
+);
+dBefore = shot();
+clickRow(0);
+await settle();
+check(
+  "拖拽也把轮转起点记成了落点窗：下一次浏览走它的下一格（C→D）",
+  changedPanes(dBefore).join(",") === "d" && srcOf("d") === `${ALPHA}/big.png`,
+  `${changedPanes(dBefore).join(",")} | ${srcOf("d")}`
+);
+
+/* ===================== 16) asset 协议开着：视口内的行全都挂图，一个字节不走 IPC ===================== */
+world.assetOn = true;
+key("2");
+click(byId("btn-clear"));
+await settle();
+await openViaCmdO([`${DELTA}/a2.png`]); // DELTA: [0]a1 [1]a2 [2]a3_big(6MB) [3]a4 [4]a5（LRU 里一张都没有）
+await settle();
+check("DELTA 列表已就位", rowNames().length === 5, rowNames().join(","));
+const rd16 = totalReads();
+io.fire(rows().map((r) => ({ target: r, isIntersecting: true }))); // 整列都算滚进视口
+await settle();
+check(
+  "视口内的行全都挂上了图（不再只有当前项 ±1）",
+  rows().every((_, i) => hasThumb(i)),
+  rows().map((_, i) => (hasThumb(i) ? "1" : "0")).join("")
+);
+check(
+  "挂的是本地文件的 asset 地址，不是整图 data URL",
+  thumbSrc(3).startsWith("asset://localhost/"),
+  thumbSrc(3)
+);
+// 光比较总数不够咬得住：开目录时「当前项 ±1」那几张在退路下本来就会读，那几回发生在 rd16 之前。
+// 所以这里另外盯 a1 —— 它落在老窗口里，退路下必然被读一回，asset 模式下必须是零次。
+// （2026-10-26 变异测试：只比总数的话，把 asset 早退删掉这条照样绿。）
+check(
+  "一个字节也没走 IPC：整列挂图期间 read_image 一次没多发",
+  totalReads() === rd16 && !world.reads.get(`${DELTA}/a1.png`),
+  `${rd16} -> ${totalReads()} | a1 读了 ${world.reads.get(`${DELTA}/a1.png`) || 0} 回`
+);
+check(
+  "4MB 闸门不参与：6MB 那张也直接挂上，不给「大」字占位",
+  hasThumb(2) && thumbSrc(2).includes(encodeURIComponent("a3_big.png")) && pendingOf(2) === "",
+  `${thumbSrc(2)} | 占位:${pendingOf(2)}`
+);
+io.fire([{ target: rows()[3], isIntersecting: false }]);
+check("滚出视口照样摘图（省内存那一道留着，只是不再需要 LRU）", !hasThumb(3));
+
+/* —— 路径里带空格与非 ASCII：得原样转义进地址 —— */
+await openViaCmdO([`${SPACE}/第一 张.png`]);
+await settle();
+io.fire(rows().map((r) => ({ target: r, isIntersecting: true })));
+await settle();
+const iHan = rows().findIndex((r) => r.dataset.path === `${SPACE}/第一 张.png`);
+const iLat = rows().findIndex((r) => r.dataset.path === `${SPACE}/second x.jpg`);
+check(
+  "中文与空格都能解回原路径（转义不能把地址串打断）",
+  thumbSrc(iHan) === `asset://localhost/${encodeURIComponent(`${SPACE}/第一 张.png`)}` &&
+    decodeURIComponent(thumbSrc(iLat).split("asset://localhost/")[1]) === `${SPACE}/second x.jpg`,
+  thumbSrc(iLat)
+);
+// 拖那一行起拖（指针仍在两格矩形之外，不会真载入）：牌上该直接挂上 asset 地址
+rowDown(rows()[iHan], 30, 30);
+fireWin("mousemove", { clientX: 30, clientY: 60, buttons: 1 });
+check(
+  "牌上的图也不依赖 LRU 里有没有那份缓存：asset 地址直接挂",
+  ghostImg().attributes.src === `asset://localhost/${encodeURIComponent(`${SPACE}/第一 张.png`)}` &&
+    ghostImg().hidden === false,
+  JSON.stringify(ghostImg().attributes)
+);
+fireWin("mouseup", { clientX: 30, clientY: 60 });
+await settle();
+
+/* —— 转不出地址时，老闸门必须还在（那是纯浏览器调试与 convertFileSrc 缺失的退路） —— */
+world.assetOn = false;
+click(byId("btn-clear"));
+await settle();
+await openViaCmdO([`${EPS}/e2.png`]); // EPS 同样是干净目录：窗口外的行是真没读，不是读的缓存
+await settle();
+io.fire(rows().map((r) => ({ target: r, isIntersecting: true })));
+await settle();
+check(
+  "退路里仍是老口径：±1 窗口内的读盘、窗口外的不读、6MB 那只给「大」字",
+  hasThumb(1) && !hasThumb(3) && pendingOf(2) === "大",
+  `1:${hasThumb(1)} 3:${hasThumb(3)} 2占位:${pendingOf(2)}`
+);
+check("退路里挂的是 data URL（整图 base64）而不是 asset 地址", thumbSrc(1).startsWith("data:"), thumbSrc(1).slice(0, 24));
+
+/* ============ 17) asset 转得出地址但取不到文件（403）：整列退回 read_image，只认一次 ============ */
+world.assetOn = true; // 转地址照样成功，只是文件拿不到 —— 这里手动打 error 事件模拟
+key("2");
+click(byId("btn-clear"));
+await settle();
+await openViaCmdO([`${ZETA}/z2.png`]); // ZETA: [0]z1 [1]z2 [2]z3 [3]z4 [4]z5（全小图，LRU 里一张都没有）
+await settle();
+io.fire(rows().map((r) => ({ target: r, isIntersecting: true })));
+await settle();
+check(
+  "起手确认整列挂的是 asset 地址（下面只把其中一张打成 403）",
+  rows().every((_, i) => thumbSrc(i).startsWith("asset://localhost/")),
+  rows().map((_, i) => (thumbSrc(i).startsWith("asset://") ? "1" : "0")).join("")
+);
+const rd17 = totalReads();
+const warns = [];
+const realWarn = console.warn;
+console.warn = (...a) => warns.push(a.map(String).join(" "));
+thumbImg(0)?.dispatchEvent({ type: "error", target: thumbImg(0) });
+await settle();
+console.warn = realWarn;
+check(
+  "取不到文件的那一行改由 read_image 画出 data URL（不是留个破图）",
+  thumbSrc(0).startsWith("data:"),
+  thumbSrc(0).slice(0, 22)
+);
+check("这一行确实回去读了一回盘", totalReads() === rd17 + 1, `${rd17} -> ${totalReads()}`);
+check("退路信号只打一次日志", warns.length === 1, `${warns.length} 条`);
+
+// 已经挂上 asset 的其他行会各自报 error：窗口外那一张不能留在破图上
+const rd17b = totalReads();
+const warns2 = [];
+console.warn = (...a) => warns2.push(a.map(String).join(" "));
+thumbImg(4)?.dispatchEvent({ type: "error", target: thumbImg(4) });
+await settle();
+console.warn = realWarn;
+check(
+  "第二张坏图同样被治好（asset 地址抹掉），但按老闸门不越窗口读盘，这格就空着",
+  !thumbSrc(4).startsWith("asset:") && !hasThumb(4) && pendingOf(4) === "",
+  `src:${thumbSrc(4)} 占位:${pendingOf(4)}`
+);
+check("第二张不再重复刷日志", warns2.length === 0, `${warns2.length} 条`);
+check("自愈那一行没多读盘（窗口外不读就是对的）", totalReads() === rd17b, `${rd17b} -> ${totalReads()}`);
+
+// 认栽之后新滚进来的行：直接走退路，压根不再试 asset
+io.fire([{ target: rows()[2], isIntersecting: false }]);
+io.fire([{ target: rows()[2], isIntersecting: true }]);
+await settle();
+check(
+  "认栽后新挂的行不再试 asset：窗口内的 z3 直接读盘给 data URL",
+  thumbSrc(2).startsWith("data:"),
+  thumbSrc(2).slice(0, 22)
+);
+// 牌也不该再去拿 asset 地址（z2 刚作为大图读过，LRU 里有）
+rowDown(rows()[1], 30, 30);
+fireWin("mousemove", { clientX: 30, clientY: 60, buttons: 1 });
+check(
+  "牌上也不挂 asset 地址了：只用退路里那份缓存，没有就只写名字",
+  !String(ghostImg().attributes.src || "").startsWith("asset:"),
+  JSON.stringify(ghostImg().attributes)
+);
+fireWin("mouseup", { clientX: 30, clientY: 60 });
+await settle();
 
 console.log(failed ? `\n${failed} 项未通过` : "\n全部通过");
 process.exit(failed ? 1 : 0);

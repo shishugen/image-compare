@@ -70,6 +70,9 @@ function mkEl(tag = "div") {
     scrollTop: 0,
     scrollHeight: 0,
     clientHeight: 0,
+    // 用例挂一个数组上去就能追「这个元素被写过哪些文案」（状态行会被下一句提示抢掉，
+    // 只看最后一句拿不到 toast）；不挂就一切照旧
+    log: null,
   };
   el.classList = {
     add: (...c) => c.forEach((x) => el.classSet.add(x)),
@@ -97,6 +100,7 @@ function mkEl(tag = "div") {
     set: (v) => {
       el.text = String(v);
       el.children.length = 0;
+      if (el.log) el.log.push(el.text);
     },
   });
   Object.defineProperty(el, "innerHTML", {
@@ -107,6 +111,16 @@ function mkEl(tag = "div") {
     },
   });
   el.addEventListener = (type, fn) => el.listeners.push([type, fn]);
+  el.attributes = {};
+  el.setAttribute = (k, v) => {
+    el.attributes[k] = String(v);
+  };
+  el.removeAttribute = (k) => {
+    delete el.attributes[k];
+    if (k === "src") el.src = "";
+  };
+  // 桩里不做布局：默认零盒，用例自己盖（放大层的缩放要拿它当「打开那一刻量到的盒」）
+  el.getBoundingClientRect = () => ({ left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0 });
   el.appendChild = (node) => {
     node.parentNode = el;
     el.children.push(node);
@@ -316,11 +330,24 @@ function focus(id) {
 }
 
 const calls = [];
+/* 本机接收那两项：桩里就一份内存 prefs，set_prefs 的局部更新语义照 Rust 抄
+   （传来的字段覆盖，没传的保持原值；收件目录只认绝对路径与空串） */
+const prefs = { layout: "2", sync: true, wheel: "zoom", notify: true, inbox: "" };
+const DEFAULT_INBOX = "/本机数据目录/inbox";
+// pick_folder 的返回值：用例改成一条路径就等于「用户在原生对话框里选了它」，
+// 改回 null 就是「点了取消」
+let pickAnswer = null;
+const plays = []; // 试听被点了几次
+const revealed = []; // reveal_in_folder 收到过哪些路径
 window.__TAURI__.core.invoke = async (cmd, args = {}) => {
   calls.push([cmd, args]);
   switch (cmd) {
     case "net_status":
       return statusPayload();
+    case "read_image":
+      // 缩略图与放大层吃的是同一份 data URL（不二次读盘）；像素尺寸由用例直接盖在
+      // lightbox-img 上，桩里不做真解码
+      return { path: args.path, data_url: `data:image/jpeg;base64,${Buffer.from(args.path).length}` };
     case "sessions":
       return sessionsPayload();
     case "session_focus":
@@ -385,20 +412,53 @@ window.__TAURI__.core.invoke = async (cmd, args = {}) => {
       const to = args.to || world.active;
       // X-Session 就是拿这个会话 ID 发的，落库的 peer 仍是所属那台
       const sess = world.sessions.find((s) => s.id === to);
+      const peer = world.peers.find((p) => p.id === (sess ? sess.peer : to));
+      // 与 Rust 的 target_of 同口径：没登记过这台当场就拒（连地址都没有，队列也排不了）；
+      // 登记了但离线 → 落一条 queued 立刻返回，什么时候投出去是心跳的事
+      if (!peer) throw new Error("这台对端还没有添加：请先配对，或等它给你发一条消息");
       const m = {
         id: `out${++seq}`,
         dir: "out",
         kind: "text",
         text: args.text,
-        state: "sent",
+        state: peer.online ? "sent" : "queued",
         ts: Date.now(),
         peer: sess ? sess.peer : to,
         sid: to,
+        retry: 0,
+        reason: null,
       };
       // client.rs 落库后会推一条 msg-updated，气泡就是这么进流的
       world.hist.push(m);
       emit("msg-updated", { message: m });
       return m;
+    }
+    case "send_paths": {
+      // 与 Rust 的 queue_paths 同口径：只存本机路径与当下的大小，不抄内容；
+      // 在线时直接进 sending，离线的先挂 queued，补发那一刻才递归文件夹
+      const to = args.to || world.active;
+      const sess = world.sessions.find((s) => s.id === to);
+      const peer = world.peers.find((p) => p.id === (sess ? sess.peer : to));
+      if (!peer) throw new Error("这台对端还没有添加：请先配对，或等它给你发一条消息");
+      return args.paths.map((p, i) => {
+        const m = {
+          id: `outp${++seq}_${i}`,
+          dir: "out",
+          kind: String(p).endsWith(".jpg") ? "file" : "folder",
+          name: String(p).split("/").pop(),
+          path: p,
+          size: 2048,
+          state: peer.online ? "sending" : "queued",
+          ts: Date.now(),
+          peer: sess ? sess.peer : to,
+          sid: to,
+          retry: 0,
+          reason: null,
+        };
+        world.hist.push(m);
+        emit("msg-updated", { message: m });
+        return m;
+      });
     }
     case "unbind_peer":
       world.peers = world.peers.filter((p) => p.id !== args.peer);
@@ -441,6 +501,28 @@ window.__TAURI__.core.invoke = async (cmd, args = {}) => {
       world.ignored = world.ignored.filter((i) => i !== "X");
       return statusPayload();
     }
+    case "get_prefs":
+      return { ...prefs };
+    case "set_prefs": {
+      // 与 Rust 同口径：没传来的字段一律不碰（两个抽屉共写一份 prefs.json 就靠这个）
+      if ("notify" in args) prefs.notify = !!args.notify;
+      if ("inbox" in args) {
+        const v = String(args.inbox);
+        if (v && !v.startsWith("/")) throw new Error(`收件目录必须是绝对路径: ${v}`);
+        prefs.inbox = v;
+      }
+      return { ...prefs };
+    }
+    case "inbox_dir":
+      return { path: prefs.inbox || DEFAULT_INBOX, custom: !!prefs.inbox };
+    case "pick_folder":
+      return pickAnswer;
+    case "play_notify_sound":
+      plays.push("audition");
+      return null;
+    case "reveal_in_folder":
+      revealed.push(String(args.path || ""));
+      return null;
     default:
       return null;
   }
@@ -513,6 +595,9 @@ mkdirSync(tmp, { recursive: true });
 writeFileSync(join(tmp, "package.json"), JSON.stringify({ type: "module" }));
 for (const f of ["api.js", "view-transfer.js"]) copyFileSync(join(here, "..", "js", f), join(tmp, f));
 await import(join(tmp, "view-transfer.js"));
+// 同一个 api.js 实例（按 URL 去重）：拖拽的落点与悬停都靠它分流到传输视图的处理者，
+// 真机里是 view-compare.js 里的原生拖拽监听在调它们，那个文件不在本自检范围里
+const api = await import(join(tmp, "api.js"));
 
 /* ------------------------------- 小工具 ------------------------------- */
 const flush = () => new Promise((r) => setTimeout(r, 0));
@@ -983,6 +1068,718 @@ check(
   "添加没成功就不会多开一个发不出去的框",
   world.sessions.filter((s) => s.peer === "C").length === 2,
   world.sessions.filter((s) => s.peer === "C").map((s) => s.id).join(",")
+);
+
+/* 19) 离线也能发：已配对 + 离线 → 当场入队；未配对 → 仍然拦着 */
+// 一台登记过但 now 不在线的（last_seen 陈在那儿，心跳还没报回来越正常不过）
+world.peers = world.peers.filter((p) => p.id !== "B");
+world.peers.push({
+  id: "B",
+  name: "乙机",
+  alias: "",
+  host: "10.0.0.20",
+  port: 45789,
+  online: false,
+  last_seen: at(1, 9),
+});
+emit("peers-changed", statusPayload());
+await settle();
+const bItem = await openChatWith("乙机 · 10.0.0.20");
+check("离线的那台也能开出一个对话框", !!bItem && !!rowOf("B"), String(bItem?.text));
+click(rowOf("B"));
+await settle();
+const stMsg = byId("st-msg");
+// 状态行会被 runSend 收尾时的 refreshStatus 立刻改回「本机接收端口 …」，
+// 光看最后那一句拿不到 toast，所以这一句起先记下它被写过哪些文案
+const statusLog = [];
+stMsg.log = statusLog;
+check(
+  "离线会话的发送/文件按钮都不再禁用（禁不禁只看这台加没加过）",
+  ["btn-xfer-send", "btn-xfer-file", "btn-xfer-folder"].every((i) => byId(i).disabled === false),
+  ["btn-xfer-send", "btn-xfer-file", "btn-xfer-folder"].map((i) => String(byId(i).disabled)).join(",")
+);
+
+since = calls.length;
+byId("xfer-input").value = "离线也能写的一句";
+click(byId("btn-xfer-send"));
+await settle();
+const qCalls = takeCalls("send_text", since);
+check(
+  "离线时这句话仍会交给后端（不是在前端就被吞掉）",
+  qCalls.length === 1 && qCalls[0][1].to === "B",
+  JSON.stringify(qCalls[0] && qCalls[0][1])
+);
+let qbub = bubbles().find((b) => b.classSet.has("is-queued"));
+check("入队的气泡挂上待发样式且写着「待发」", !!qbub && qbub.textContent.includes("待发"), String(qbub?.textContent));
+check(
+  "待发的悬停说明说的是排队，不是发不出去",
+  !!qbub && /排队/.test(qbub.title) && /上线后会自动补发/.test(qbub.title),
+  String(qbub?.title)
+);
+check(
+  "入队后的提示是「已排队」而不是「已送达」",
+  statusLog.some((t) => /排队/.test(t)) && !statusLog.some((t) => /已送达/.test(t)),
+  statusLog.join(" | ")
+);
+
+// 补发成功：后端同 id 追一行 sent（队列里的顺序位置由 Rust 的 dedup 保持）
+const qMsg = world.hist.find((m) => m.id === qbub.dataset.id);
+since = calls.length;
+emit("msg-updated", { message: { ...qMsg, state: "sent", retry: 0, reason: null } });
+await settle();
+qbub = bubbles().find((b) => b.dataset.id === qMsg.id);
+check(
+  "补发成功后待发样式掉下来",
+  !!qbub && !qbub.classSet.has("is-queued") && !qbub.textContent.includes("待发"),
+  String(qbub?.textContent)
+);
+check("状态变化不重新 invoke 任何发送命令", takeCalls("send_text", since).length === 0);
+
+// 补发没中：还是待发，但得让人看见已经白试了几次、为什么没出去
+emit("msg-updated", { message: { ...qMsg, state: "queued", retry: 2, reason: "连不上" } });
+await settle();
+qbub = bubbles().find((b) => b.dataset.id === qMsg.id);
+check(
+  "补发中时仍是待发，并把第几次与原因挂到悬停上",
+  !!qbub && qbub.classSet.has("is-queued") && /第 2 次尝试失败：连不上/.test(qbub.title),
+  String(qbub?.title)
+);
+// 到上限转失败：待发样式得下来，不然用户以为还在排队
+emit("msg-updated", { message: { ...qMsg, state: "failed", retry: 3, reason: "连不上" } });
+await settle();
+qbub = bubbles().find((b) => b.dataset.id === qMsg.id);
+check(
+  "到上限转失败后不再挂着待发样式",
+  !!qbub && !qbub.classSet.has("is-queued") && qbub.classSet.has("is-failed"),
+  String(qbub?.className)
+);
+
+// 拖拽遮罩：离线时不能拦，未配对才拦
+api.routeDropHover("over");
+check(
+  "离线时拖文件进来不遮住（拦下只会让人以为发不出去）",
+  byId("xfer-drop-hint").classSet.has("is-blocked") === false && /排队/.test(byId("xfer-drop-text").text),
+  byId("xfer-drop-text").text
+);
+since = calls.length;
+api.routeDrop(["/tmp/甲.jpg", "/tmp/一个文件夹"]);
+await settle();
+const sp = takeCalls("send_paths", since);
+check(
+  "离线时拖进来的东西走 send_paths 排队（一件文件一个文件夹）",
+  sp.length === 1 && sp[0][1].paths.length === 2 && sp[0][1].to === "B",
+  JSON.stringify(sp[0] && sp[0][1])
+);
+const qBubs = bubbles().filter((b) => b.classSet.has("is-queued"));
+check("排队的那批气泡都挂着待发", qBubs.length === 2, String(qBubs.length));
+check(
+  "排队的气泡不显示进度条（它只能停在 0%，看着像卡住了）",
+  qBubs.every((b) => b.querySelectorAll(".bar").every((x) => x.hidden === true)),
+  JSON.stringify(qBubs.map((b) => b.querySelectorAll(".bar").map((x) => x.hidden)))
+);
+check(
+  "排队提示不会渗进会话栏那一行（行上只摆名字与摘要）",
+  rows().every((r) => !/待发|排队/.test(r.textContent)),
+  rows().map((r) => r.textContent).join(" | ").slice(0, 200)
+);
+
+// 补发开始：先转「传输中」（进度条放回来）再走进度。进度事件带的是 batch id，
+// 而补发一个排队的文件时那个 id 必须就是待发气泡自己的 id ——
+// 前端拿不到对应气泡时会先占一个「接收中」的入向气泡，自己发文件却多出一个对方发来的
+const fBub = qBubs[0];
+const fRec = world.hist.find((m) => m.id === fBub.dataset.id);
+const nAll = bubbles().length;
+const nIn = bubbles().filter((b) => b.classSet.has("msg-in")).length;
+emit("msg-updated", { message: { ...fRec, state: "sending" } });
+await settle();
+emit("xfer-progress", { msg_id: fRec.id, dir: "out", peer: "B", sid: "B", sent: 512, total: 2048, name: fRec.name });
+await settle();
+const fb = bubbles().find((b) => b.dataset.id === fRec.id);
+check(
+  "补发一开始待发样式下来、进度条放回来",
+  !!fb && !fb.classSet.has("is-queued") && fb.querySelectorAll(".bar")[0].hidden === false,
+  String(fb?.className)
+);
+check(
+  "进度落在那条待发气泡自己上，没另占一个入向气泡",
+  bubbles().length === nAll &&
+    bubbles().filter((b) => b.classSet.has("msg-in")).length === nIn &&
+    fb.querySelectorAll(".bar")[0].children[0].style.width === "25%",
+  `${bubbles().length}/${nAll} 进度=${fb?.querySelectorAll(".bar")[0].children[0].style.width}`
+);
+
+// 未配对：仍然拦在前端，一条都不发（连地址都没有，排队也排不了）
+click(rowOf(""));
+await settle();
+api.routeDropHover("over");
+check(
+  "未配对时遮罩拦下并说明先配对",
+  byId("xfer-drop-hint").classSet.has("is-blocked") === true && /先配对/.test(byId("xfer-drop-text").text),
+  byId("xfer-drop-text").text
+);
+since = calls.length;
+byId("xfer-input").value = "想发给未标记的那台";
+click(byId("btn-xfer-send"));
+api.routeDrop(["/tmp/另一.jpg"]);
+await settle();
+check(
+  "未配对的会话一个字、一个文件都不会发出去",
+  takeCalls("send_text", since).length === 0 && takeCalls("send_paths", since).length === 0,
+  JSON.stringify(calls.slice(since).map(([c]) => c))
+);
+
+/* ------------------------- 19.5 放大层的缩放 -------------------------
+   一张 1600×1200 的大图被 CSS 装成 400×300（起点 100,60）：那一档就是 25%。
+   桩里不做布局，所以盒与像素都由用例直接盖上去，剩下的全是纯算术 */
+const lbImg = byId("lightbox-img");
+const LB = () => byId("img-lightbox");
+const lbPct = () => byId("lightbox-zoom").text;
+/** 从 style.transform 读回实际生效的平移与倍数（没挂 transform 就是 1,0,0） */
+function lbTf() {
+  const raw = lbImg.style.transform || "";
+  const mT = /translate\(([-\d.e+]+)px, ([-\d.e+]+)px\)/.exec(raw);
+  const mS = /scale\(([-\d.e+]+)\)/.exec(raw);
+  return { raw, x: mT ? Number(mT[1]) : 0, y: mT ? Number(mT[2]) : 0, s: mS ? Number(mS[1]) : 1 };
+}
+/** 未变换盒里 (200,100) 那个像素现在落在屏幕哪里——锚点不跳就看它 */
+const screenOf = (q) => {
+  const t = lbTf();
+  return 100 + t.x + t.s * q;
+};
+/** 窗口事件得手动发给注册者（桩里没真正的 window） */
+function fireWin(type, extra = {}) {
+  const ev = { type, preventDefault() {}, stopPropagation() {}, ...extra };
+  for (const [t, fn] of winListeners) if (t === type) fn(ev);
+}
+const lbKey = (key, tagName = "DIV") => fireWin("keydown", { key, target: { tagName } });
+const lbWheel = (deltaY, cx, cy) => LB().dispatchEvent({ type: "wheel", deltaY, clientX: cx, clientY: cy, preventDefault() {} });
+const lbDbl = (cx, cy) => lbImg.dispatchEvent({ type: "dblclick", clientX: cx, clientY: cy, preventDefault() {} });
+const lbDown = (cx, cy) => lbImg.dispatchEvent({ type: "mousedown", clientX: cx, clientY: cy, preventDefault() {} });
+/** 背景上的一击（真 DOM 里是冒泡到 .lightbox，target 仍是原元素） */
+const lbBgClick = (node = LB()) => LB().dispatchEvent({ type: "click", target: node, preventDefault() {} });
+
+function fakeBox(natural, w) {
+  lbImg.naturalWidth = natural;
+  lbImg.naturalHeight = natural;
+  lbImg.getBoundingClientRect = () => ({ left: 100, top: 60, right: 100 + w, bottom: 60 + w, width: w, height: w });
+}
+
+fakeBox(1600, 400);
+// 先入历史再切会话：已经在当前会话上再点一次不会重绘，拿不到这张新气泡
+const bigId = push("A", at(10, 0), {
+  dir: "out",
+  kind: "file",
+  text: "",
+  name: "大图.jpg",
+  path: "/tmp/大图.jpg",
+  size: 3 * 1024 * 1024,
+});
+click(rowOf("A"));
+await settle();
+const bigBubble = bubbles().find((b) => b.dataset.id === bigId);
+const thumbBox = bigBubble && bigBubble.querySelectorAll(".thumb-box")[0];
+check(
+  "图片气泡把原图读出来了（缩放全靠这份 data URL，不二次读盘）",
+  !!thumbBox && thumbBox.classSet.has("thumb-ready"),
+  String(thumbBox && thumbBox.className)
+);
+click(thumbBox);
+await settle();
+check(
+  "打开放大层就是适应档：不挂 transform，百分比按原始像素报 25%",
+  LB().hidden === false && lbTf().raw === "" && lbPct() === "25%",
+  `${lbTf().raw} ${lbPct()}`
+);
+
+// 指针在 (300,160)，正对盒内 (200,100) 那个像素
+lbWheel(-100, 300, 160);
+check(
+  "滚轮放大后指针下那个像素还在指针下（锚点不跳）",
+  lbTf().s > 1 && Math.abs(screenOf(200) - 300) < 1e-9,
+  lbTf().raw
+);
+check("滚轮放大后百分比跟着涨", lbPct() === "30%", lbPct());
+
+click(byId("lightbox-one"));
+check(
+  "1:1 = 原始像素，transform 在适应之上再放大 4 倍",
+  lbTf().s === 4 && lbPct() === "100%",
+  `${lbTf().raw} ${lbPct()}`
+);
+check("比适应大了才有东西可拖，光标切成可拖", LB().classSet.has("is-zoomable"), String(LB().className));
+for (let i = 0; i < 30; i++) click(byId("lightbox-in"));
+check("一路按 + 也钉在 800% 上限", lbPct() === "800%" && lbTf().s === 32, `${lbPct()} ${lbTf().raw}`);
+for (let i = 0; i < 40; i++) click(byId("lightbox-out"));
+check(
+  "一路按 − 收到 25% 下限，正好回到适应那一档（不会把图缩成点）",
+  lbPct() === "25%" && lbTf().s === 1 && Math.abs(lbTf().x) < 1e-6,
+  `${lbPct()} ${lbTf().raw}`
+);
+
+lbDbl(300, 160);
+check(
+  "双击从适应跳到 1:1，仍以点击处为锚",
+  lbTf().s === 4 && lbPct() === "100%" && Math.abs(screenOf(200) - 300) < 1e-9,
+  lbTf().raw
+);
+lbDbl(300, 160);
+check("再双击回适应，平移量一起清掉", lbPct() === "25%" && lbTf().raw === "", lbTf().raw);
+
+// 拖拽平移：先放大到 1:1，按住拖 40,30（拿拖之前的平移量做基准，前面几步缩放已经把它带偏过）
+click(byId("lightbox-one"));
+const baseTf = lbTf();
+lbDown(300, 160);
+fireWin("mousemove", { clientX: 340, clientY: 190 });
+const dragTf = lbTf();
+check(
+  "拖拽位移等于鼠标差，并在拖的时候挂 is-dragging",
+  Math.abs(dragTf.x - (baseTf.x + 40)) < 1e-9 && Math.abs(dragTf.y - (baseTf.y + 30)) < 1e-9 && LB().classSet.has("is-dragging"),
+  `${dragTf.raw} 基准=${baseTf.raw}`
+);
+fireWin("mouseup");
+check("松手就停（is-dragging 摘掉）", !LB().classSet.has("is-dragging"), String(LB().className));
+lbBgClick();
+check("拖完那一下的 click 被吃掉，不会误关层", LB().hidden === false, String(LB().hidden));
+lbBgClick();
+check("再点背景才真的关层", LB().hidden === true, String(LB().hidden));
+
+// 适应档下不接管鼠标：没东西可平移，别抢用户的拖动
+const stillTf = lbTf();
+lbDown(300, 160);
+fireWin("mousemove", { clientX: 400, clientY: 260 });
+check("图比屏幕小时拖图不产生位移", lbTf().raw === stillTf.raw, `${lbTf().raw} 基准=${stillTf.raw}`);
+fireWin("mouseup");
+
+// 重开：上一张的倍率与平移都不带过来
+lbWheel(-300, 300, 160);
+click(thumbBox);
+await settle();
+check(
+  "重开回到适应档，平移量清零",
+  lbTf().raw === "" && lbPct() === "25%",
+  `${lbTf().raw} ${lbPct()}`
+);
+
+// 键盘
+lbKey("1");
+check("键盘 1 = 1:1", lbPct() === "100%", lbPct());
+lbKey("0");
+check("键盘 0 = 适应", lbPct() === "25%" && lbTf().raw === "", lbPct());
+lbKey("=");
+check("键盘 = 与 + 同义，放大一档", lbPct() === "31%", lbPct());
+lbKey("-", "TEXTAREA");
+check("焦点在输入框里时不抢键（聊天框里打 “-”是输字符）", lbPct() === "31%", lbPct());
+const beforeKey = lbTf().x;
+lbKey("ArrowRight");
+check("方向键平移一步 40px", Math.abs(lbTf().x - (beforeKey + 40)) < 1e-9, lbTf().raw);
+
+// 大图解码完才量得准：没动过就顺势回适应，动过了不抢用户的视野
+fakeBox(0, 400);
+click(thumbBox);
+await settle();
+check("naturalWidth 还没就绪时不拿 0 去除，先当 1:1 处理", lbPct() === "100%" && lbTf().raw === "", lbPct());
+fakeBox(1600, 400);
+lbImg.dispatchEvent({ type: "load", preventDefault() {} });
+check(
+  "解码完成后补量一次，回到真正的适应档",
+  lbPct() === "25%" && lbTf().raw === "",
+  `${lbPct()} ${lbTf().raw}`
+);
+click(byId("lightbox-in"));
+const heldPct = lbPct();
+lbImg.dispatchEvent({ type: "load", preventDefault() {} });
+check("用户已经缩放过，load 补量不把他正在看的细节抢回适应", lbPct() === heldPct, lbPct());
+// 更边缘的一种：图还没解码完用户就缩了，此时 fit 还是兜底的 1，倍数与标签对不上
+fakeBox(0, 400);
+click(thumbBox);
+await settle();
+lbKey("=");
+check("解码未完时先按兜底那一档走（不拿 0 去除）", lbPct() === "125%" && lbTf().s === 1.25, `${lbPct()} ${lbTf().raw}`);
+fakeBox(1600, 400);
+lbImg.dispatchEvent({ type: "load", preventDefault() {} });
+check(
+  "补量后原始口径不变（仍报 125%），transform 换成真正的 5 倍",
+  lbPct() === "125%" && lbTf().s === 5,
+  `${lbPct()} ${lbTf().raw}`
+);
+fireWin("resize");
+check("窗口变了退回适应（基准盒重量，不猜新位置）", lbPct() === "25%" && lbTf().raw === "", lbPct());
+
+// 一路拖出屏幕：图中心被收在视口里，不会拖到全黑找不到北
+window.innerWidth = 1000;
+window.innerHeight = 800;
+click(byId("lightbox-one"));
+lbDown(300, 160);
+fireWin("mousemove", { clientX: -4000, clientY: -4000 });
+const clamped = lbTf();
+check(
+  "拖出屏幕时图中心被钉在视口边内，不会拖到全黑",
+  Math.abs(100 + clamped.x + clamped.s * 200 - 60) < 1e-9 && Math.abs(60 + clamped.y + clamped.s * 200 - 60) < 1e-9,
+  lbTf().raw
+);
+fireWin("mouseup");
+window.innerWidth = 0;
+window.innerHeight = 0;
+
+/* ---- 田字平铺（拿四份看接缝）---- */
+const tileStage = byId("lightbox-tile-stage");
+/** 从写进 style 的 background-* 读回实际生效的格子尺寸与十字交点位置 */
+function tileBox() {
+  const sz = /([\d.]+)px ([\d.]+)px/.exec(tileStage.style.backgroundSize || "");
+  const ps = /([-\d.]+)px ([-\d.]+)px/.exec(tileStage.style.backgroundPosition || "");
+  return {
+    w: sz ? Number(sz[1]) : 0,
+    h: sz ? Number(sz[2]) : 0,
+    kx: ps ? Number(ps[1]) : 0,
+    ky: ps ? Number(ps[2]) : 0,
+    img: tileStage.style.backgroundImage || "",
+  };
+}
+/** 屏幕点 px 落在格子里的位置（平铺下的锚点不变式就看它） */
+const tileU = (px) => {
+  const t = tileBox();
+  return t.w ? (px - t.kx) / t.w : 0;
+};
+const tileDown = (cx, cy) => tileStage.dispatchEvent({ type: "mousedown", clientX: cx, clientY: cy, preventDefault() {} });
+
+lbKey("0");
+click(byId("lightbox-tile"));
+const t0 = tileBox();
+check(
+  "点「田」挂上 is-tiled，画布拿的是与单张同一份 data URL（不二次读盘）",
+  LB().classSet.has("is-tiled") && /^url\("data:image\/jpeg/.test(t0.img),
+  t0.img.slice(0, 26)
+);
+check(
+  "适应档下格子尺寸 = 单张渲染尺寸，十字交点钉在单张图中心（四份围绕屏幕正中拼）",
+  t0.w === 400 && t0.h === 400 && t0.kx === 300 && t0.ky === 260,
+  JSON.stringify(t0)
+);
+
+const uBefore = tileU(500);
+click(byId("lightbox-in"));
+const t1 = tileBox();
+check(
+  "平铺下放大一档：格子里那块内容仍留在原屏幕位置（与单张同一条锚点不变式）",
+  Math.abs(tileU(500) - uBefore) < 1e-9 && t1.w === 500,
+  `格宽=${t1.w} u ${uBefore} → ${tileU(500)}`
+);
+
+// 平铺下鼠标落在画布上（那张图被 visibility 藏了），手势要绑到两个面上
+tileDown(300, 160);
+fireWin("mousemove", { clientX: 340, clientY: 190 });
+const t2 = tileBox();
+check(
+  "拖画布就能把十字移到隔壁那条缝上",
+  Math.abs(t2.kx - (t1.kx + 40)) < 1e-9 && Math.abs(t2.ky - (t1.ky + 30)) < 1e-9,
+  `${t1.kx},${t1.ky} → ${t2.kx},${t2.ky}`
+);
+fireWin("mouseup");
+
+// 平铺下不做「图中心留在视口」的收拢：图案本来就铺满整屏，拖多少都跟着走
+window.innerWidth = 1000;
+window.innerHeight = 800;
+tileDown(300, 160);
+fireWin("mousemove", { clientX: -4000, clientY: -4000 });
+const t3 = tileBox();
+check(
+  "平铺下不收拢平移量（拿单张盒中心去卡周期图案会拦住看隔壁的缝）",
+  Math.abs(t3.kx - (t2.kx - 4300)) < 1e-9 && Math.abs(t3.ky - (t2.ky - 4160)) < 1e-9,
+  `${t2.kx},${t2.ky} → ${t3.kx},${t3.ky}`
+);
+fireWin("mouseup");
+window.innerWidth = 0;
+window.innerHeight = 0;
+
+lbBgClick(tileStage);
+lbBgClick(tileStage);
+check("平铺下点画布不关层（整屏都是图，退出只走 ×、Esc 或再按田）", LB().hidden === false, String(LB().hidden));
+lbKey("Escape");
+check("Esc 在平铺下照样关层", LB().hidden === true, String(LB().hidden));
+click(thumbBox);
+await settle();
+check(
+  "重开回到单张：is-tiled 摘掉、背图抹掉（不然一份 base64 常驻内存）",
+  !LB().classSet.has("is-tiled") && tileStage.style.backgroundImage === "none" && lbTf().raw === "",
+  String(tileStage.style.backgroundImage).slice(0, 20)
+);
+
+lbKey("t");
+check("键盘 T 也能切进平铺", LB().classSet.has("is-tiled") && /^url\(/.test(tileBox().img), lbPct());
+lbKey("t");
+check("再按 T 回单张", !LB().classSet.has("is-tiled"), lbPct());
+
+// 两种画法是同一套状态：切来切去不跳视野
+lbKey("=");
+const pctBefore = lbPct();
+const sBefore = lbTf().s;
+lbKey("t");
+const t4 = tileBox();
+check(
+  "单张→平铺：倍率不变，格子尺寸 = 单张当前的渲染尺寸",
+  lbPct() === pctBefore && Math.abs(t4.w - sBefore * 400) < 1e-9,
+  `${pctBefore} 格宽=${t4.w} 单张倍数=${sBefore}`
+);
+lbKey("t");
+check("平铺→单张：视野也不跳回来", lbPct() === pctBefore && Math.abs(lbTf().s - sBefore) < 1e-9, lbTf().raw);
+
+/* 20) 「传输」按钮上的未读总数：与会话栏同源、读完就藏、超 99 封顶 */
+const NB = () => byId("nav-badge-xfer");
+const navNum = () => (NB().hidden ? 0 : Number(NB().text) || 0);
+/* 求和从会话栏那些徽标自己身上取：两处显示都由真代码渲染，
+   比在用例里再抄一遍加法有意义（谁改了求和口径，两边就会不一致地红） */
+const railSum = () =>
+  rows().reduce((n, r) => n + Number(r.children.find((c) => c.classSet.has("s-badge"))?.text || 0), 0);
+
+const total0 = railSum();
+/* 一条一条来、每条之后 settle：真机里第一条会把那个框建出来（后端推一次
+   sessions-changed），第二条起走本地累加（后端不为已存在的框重推）。两条
+   同拍塞进来只会撞到「列表还没回来、这一条没人认」那个桩特有的竞态。
+   ts 一律取 NOW 之前：桩里 Date.now() 是冻住的，focus() 把读指针推到那一站，
+   比它还晚的消息切进去了也清不掉未读（真机不会有这种消息）。 */
+const arrive = async (id, text, ts) => {
+  emit("msg-in", { message: { id, dir: "in", kind: "text", text, state: "sent", ts, peer: "NB" } });
+  await settle();
+};
+await arrive("nb1", "角标自检第一条", NOW - 2000);
+check(
+  "陌生那台来第一条（框刚建出来，靠重拉列表）：按钮上的数与会话栏那些徽标相加一致",
+  NB().hidden === false && navNum() === railSum() && railSum() === total0 + 1,
+  `会话栏合计=${railSum()} 按钮=${NB().text || "(空)"}`
+);
+await arrive("nb2", "角标自检第二条", NOW - 1000);
+check(
+  "第二条不重拉列表、只本地加一个未读：按钮上的数也得跟着加（两边共用同一次渲染）",
+  navNum() === railSum() && railSum() === total0 + 2,
+  `会话栏合计=${railSum()} 按钮=${NB().text || "(空)"}`
+);
+
+const nbBefore = navNum();
+click(rowOf("NB"));
+await settle();
+check(
+  "点进未读那一行，总数按后端回来的新 payload 掉下两条（不自己另算一份）",
+  navNum() === railSum() && railSum() === nbBefore - 2,
+  `${nbBefore} -> ${NB().text || "(空)"}，会话栏合计=${railSum()}`
+);
+
+// 一框一框点过去：每点一次都会拿回一份新 payload，两边得一直同步。
+// 点不动就停：第 8 节那条「明天」的消息比冻住的 now 还晚，focus() 推的读
+// 指针追不上它，那一行的未读本来就不是点进去能清掉的
+let stuck = false;
+for (let guard = 0; guard < 20 && !stuck && railSum() > 0; guard++) {
+  const r = rows().find((x) => x.children.some((c) => c.classSet.has("s-badge")));
+  if (!r) break;
+  const before = railSum();
+  click(rowOf(r.dataset.id));
+  await settle();
+  if (navNum() !== railSum()) break; // 两边对不上，下面的总断言会报出来，这里不再空转
+  if (railSum() >= before) stuck = true;
+}
+check(
+  "一路点过去，按钮上的数始终与会话栏那些徽标相等",
+  navNum() === railSum(),
+  `按钮=${NB().text || "(空)"} 合计=${railSum()}`
+);
+
+// 剩下那些清不掉的行，拿一份「后端说全读完了」的真载荷走同一条路：
+// 只把读指针按到最后一条消息之后，unread 仍由桩自己算，不在用例里抄一份
+const readsBefore = world.sessions.map((s) => s.read);
+const lastTs = world.hist.reduce((a, m) => Math.max(a, m.ts), 0);
+for (const s of world.sessions) s.read = lastTs + 1;
+emit("sessions-changed", sessionsPayload());
+await settle();
+check(
+  "未读真的全部归零时角标彻底藏起来：hidden=true 且文案清空，不留个 0 在那",
+  NB().hidden === true && NB().text === "" && railSum() === 0,
+  `hidden=${NB().hidden} text="${NB().text}" 合计=${railSum()}`
+);
+// 读指针还原回去：不然后面那句「还原后两边一致」会退化成 0 == 0 的空断言
+world.sessions.forEach((s, i) => (s.read = readsBefore[i]));
+
+/* 封顶与容错：直接喂一份会话列表进来，不依赖桩后端 */
+const capRow = (unread, i) => ({
+  id: "cap" + i,
+  peer: "cap" + i,
+  name: "封顶" + i,
+  host: "",
+  port: 0,
+  online: false,
+  bound: false,
+  created: 0,
+  last: Date.now(),
+  summary: "",
+  unread,
+});
+const feedRows = async (sessions) => {
+  emit("sessions-changed", { sessions, active: "" });
+  await settle();
+};
+
+await feedRows([capRow(99, 1)]);
+check("99 条就写 99，不加号", NB().text === "99", NB().text);
+await feedRows([capRow(100, 1)]);
+check("100 条封顶成 99+（与侧栏那套写法同一个口径）", NB().text === "99+", NB().text);
+await feedRows([capRow(60, 1), capRow(60, 2)]);
+check("两行各 60 也要封顶，不是只防单行超了", NB().text === "99+", NB().text);
+
+// 缺 unread / null / 负数都不能把 NaN 或 -3 报上去
+await feedRows([
+  { id: "n1", peer: "n1", name: "n1", unread: undefined },
+  { id: "n2", peer: "n2", name: "n2", unread: null },
+  { id: "n3", peer: "n3", name: "n3", unread: -5 },
+]);
+check(
+  "缺字段/null/负数一律当 0：不报 NaN、不报 -5，直接藏起来",
+  NB().hidden === true && NB().text === "",
+  `hidden=${NB().hidden} text="${NB().text}"`
+);
+
+// 收尾还原成桩后端的真列表：这段改过 state.cur，不还原会留给后续一个假象
+emit("sessions-changed", sessionsPayload());
+await settle();
+check(
+  "还原回真实会话列表后，按钮上的数还是会话栏那些徽标之和",
+  navNum() === railSum(),
+  `按钮=${NB().text || "(空)"} 合计=${railSum()}`
+);
+
+/* 21) 本机接收：提示音开关与收件目录（都存 prefs.json，与对比视图那份共用） */
+const notifyChk = () => byId("chk-notify-sound");
+const notifyTxt = () => byId("sw-notify-text");
+const inboxVal = () => byId("inbox-dir-value");
+const inboxReset = () => byId("btn-inbox-reset");
+const statusText = () => byId("st-msg").textContent;
+const setCount = () => calls.filter(([c]) => c === "set_prefs").length;
+const change = (node, on) => {
+  node.checked = on;
+  node.dispatchEvent({ type: "change" });
+};
+
+check(
+  "本机接收不参与启动路径：没开抽屉之前一次都没读过 prefs",
+  calls.every(([c]) => c !== "get_prefs" && c !== "inbox_dir"),
+  calls.filter(([c]) => c === "get_prefs" || c === "inbox_dir").map(([c]) => c).join(",")
+);
+
+// 抽屉是 toggle，此时它已经在前面的用例里被开过关；直按 classSet 判定当前开合
+if (byId("xfer-settings").classSet.has("is-open")) {
+  click(byId("btn-xfer-settings"));
+  await settle();
+}
+click(byId("btn-xfer-settings"));
+await settle();
+check(
+  "打开抽屉把磁盘上那两项填进界面：开关勾着、文案响一声、路径是默认那个",
+  notifyChk().checked === true && notifyTxt().text === "响一声" && inboxVal().textContent === DEFAULT_INBOX,
+  `checked=${notifyChk().checked} 文案="${notifyTxt().text}" 路径="${inboxVal().textContent}"`
+);
+check("没改过目录时「恢复默认」是灰的（点了没意义，比点了不报错更难懂）", inboxReset().disabled === true);
+
+change(notifyChk(), false);
+await settle();
+const patch = lastCall("set_prefs");
+check(
+  "关提示音只传一个 {notify:false}，不拿整份 prefs 回写（那会把对比视图选的布局一起盖掉）",
+  !!patch && Object.keys(patch).join() === "notify" && patch.notify === false,
+  JSON.stringify(patch)
+);
+check("开关关掉后文案立刻跟着变「不响」：那颗 input 藏在 label 里，光看开关看不出状态", notifyTxt().text === "不响");
+
+const plays0 = plays.length;
+click(byId("btn-notify-audition"));
+await settle();
+check(
+  "开关正关着时点试听仍然响一声：这一声就是用来分清「没消息」与「这台机器放不出声」的",
+  plays.length === plays0 + 1,
+  `点了 ${plays.length - plays0} 次`
+);
+
+change(notifyChk(), true);
+await settle();
+check(
+  "重新勾上写回 true，文案回到响一声",
+  prefs.notify === true && notifyTxt().text === "响一声",
+  `prefs.notify=${prefs.notify} 文案="${notifyTxt().text}"`
+);
+
+/* 选目录：取消 / 选成 / 被 Rust 拒 */
+const set0 = setCount();
+pickAnswer = null;
+click(byId("btn-inbox-choose"));
+await settle();
+check(
+  "在原生对话框里点取消就什么都不写，路径显示也不变",
+  setCount() === set0 && inboxVal().textContent === DEFAULT_INBOX,
+  `set_prefs 多了 ${setCount() - set0} 次，显示="${inboxVal().textContent}"`
+);
+check(
+  "选目录传的标题是收件目录那一句（复用发送那个选择器，标题不能还是「要发送的」）",
+  /收件目录/.test(String((lastCall("pick_folder") || {}).title || "")),
+  JSON.stringify(lastCall("pick_folder"))
+);
+
+pickAnswer = "/Volumes/外接盘/收件";
+click(byId("btn-inbox-choose"));
+await settle();
+check(
+  "选完写进 {inbox: 那条路径}，显示跟着换、恢复默认不再灰",
+  (lastCall("set_prefs") || {}).inbox === "/Volumes/外接盘/收件" &&
+    inboxVal().textContent === "/Volumes/外接盘/收件" &&
+    inboxReset().disabled === false,
+  `显示="${inboxVal().textContent}" 灰=${inboxReset().disabled}`
+);
+
+const shown = inboxVal().textContent;
+pickAnswer = "recv/今日";  // 桩里的 set_prefs 会抛，模拟 Rust 拒相对路径
+click(byId("btn-inbox-choose"));
+await settle();
+check(
+  "目录被 Rust 拒了（相对路径）时磁盘值与界面都不动，仍显示原来那个",
+  inboxVal().textContent === shown && prefs.inbox === "/Volumes/外接盘/收件",
+  `显示="${inboxVal().textContent}" 磁盘="${prefs.inbox}"`
+);
+check(
+  "被拒的原因上了屏，不是静默失败（点了没反应又不出错最难归因）",
+  String(statusText()).includes("绝对路径"),
+  statusText()
+);
+
+change(notifyChk(), false);
+await settle();
+click(inboxReset());
+await settle();
+check(
+  "恢复默认写的是空串（Rust 侧就是「回默认目录」，不是一个叫空的目录），显示与置灰跟着回来",
+  (lastCall("set_prefs") || {}).inbox === "" &&
+    inboxVal().textContent === DEFAULT_INBOX &&
+    inboxReset().disabled === true,
+  `磁盘="${prefs.inbox}" 显示="${inboxVal().textContent}" 灰=${inboxReset().disabled}`
+);
+change(notifyChk(), true);
+await settle();
+
+const r0 = revealed.length;
+click(byId("btn-inbox-reveal"));
+await settle();
+check(
+  "「打开目录」交给 reveal_in_folder 的就是当前显示那一条，不是空也不是旧目录",
+  revealed.length === r0 + 1 && revealed[revealed.length - 1] === DEFAULT_INBOX,
+  revealed.join(" | ")
+);
+
+// 抽屉收起再打开：得重读一遍，否则另一个抽屉（或磁盘手改）变了这边永远显旧的
+prefs.notify = false; // 假装另一个抽屉刚把它关了
+notifyChk().checked = true; // 只改 DOM 不发事件：界面上停着一个旧状态，这才是重读要修的东西
+await settle();
+click(byId("btn-xfer-settings"));
+await settle();
+click(byId("btn-xfer-settings"));
+await settle();
+check(
+  "抽屉收起再打开会重读：磁盘上被改掉的开关能回到界面（不是只在启动读一次）",
+  notifyChk().checked === false && notifyTxt().text === "不响",
+  `checked=${notifyChk().checked} 文案="${notifyTxt().text}"`
 );
 
 console.log(failed ? `\n${failed} 项未通过` : "\n全部通过");
