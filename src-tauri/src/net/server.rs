@@ -107,14 +107,29 @@ fn handle(hub: Arc<Hub>, mut req: tiny_http::Request) -> Result<(), String> {
         );
     }
 
-    let dev_id = hs.get("x-device").cloned().unwrap_or_default();
+    // 对端上报的显示名（base64，头值只能 ASCII）。不参与签名，只用来给
+    // 陌生会话起个名字；老版本不发这个头，名字退回设备 ID 自定显示
+    let dev_name = hs
+        .get("x-device-name")
+        .and_then(|v| store::hdr_decode(v))
+        .unwrap_or_default();
     let ts: i64 = hs.get("x-ts").and_then(|s| s.parse().ok()).unwrap_or(0);
     let sig = hs.get("x-sig").cloned().unwrap_or_default();
+    // 对方当前那个对话框（同一台可以有多个）。老版本这两个头都不发，都是空串
+    let from = Sender {
+        dev_id: hs.get("x-device").cloned().unwrap_or_default(),
+        dev_name,
+        sid: hs.get("x-session").cloned().unwrap_or_default(),
+        sid_name: hs
+            .get("x-session-name")
+            .and_then(|v| store::hdr_decode(v))
+            .unwrap_or_default(),
+    };
 
     match (method.as_str(), path.as_str()) {
         ("GET", "/ping") => {
             let digest = store::sha256_hex(b"");
-            if !store::verify_sig(&device.passphrase, &dev_id, ts, &digest, &sig) {
+            if !store::verify_sig(&device.passphrase, &from.dev_id, ts, &digest, &sig) {
                 return answer(
                     req,
                     403,
@@ -158,7 +173,7 @@ fn handle(hub: Arc<Hub>, mut req: tiny_http::Request) -> Result<(), String> {
             }
             // 签名基于请求体，必须在读完后才算
             let digest = store::sha256_hex(&body);
-            if !store::verify_sig(&device.passphrase, &dev_id, ts, &digest, &sig) {
+            if !store::verify_sig(&device.passphrase, &from.dev_id, ts, &digest, &sig) {
                 return answer(
                     req,
                     403,
@@ -172,7 +187,7 @@ fn handle(hub: Arc<Hub>, mut req: tiny_http::Request) -> Result<(), String> {
                     &serde_json::json!({ "ok": false, "error": "消息超过 1MB 上限" }),
                 );
             }
-            match handle_text(&hub, &body) {
+            match handle_text(&hub, &body, &from) {
                 Ok(msg) => {
                     let id = msg.id.clone();
                     hub.emit("msg-in", serde_json::json!({ "message": msg }));
@@ -181,7 +196,7 @@ fn handle(hub: Arc<Hub>, mut req: tiny_http::Request) -> Result<(), String> {
                 Err(e) => answer(req, 400, &serde_json::json!({ "ok": false, "error": e })),
             }
         }
-        ("PUT", "/file") => handle_file(hub, req, &device, &hs, &dev_id, ts, &sig),
+        ("PUT", "/file") => handle_file(hub, req, &device, &hs, &from, ts, &sig),
         _ => answer(
             req,
             404,
@@ -190,7 +205,32 @@ fn handle(hub: Arc<Hub>, mut req: tiny_http::Request) -> Result<(), String> {
     }
 }
 
-fn handle_text(hub: &Arc<Hub>, body: &[u8]) -> Result<Message, String> {
+/// 一条请求带来的身份与会话信息。`dev_id` 在签名里（伪造过不了校验），
+/// 其余几个都只是显示用的，故意不进签名：改设备名/会话名不该让旧请求失效
+struct Sender {
+    /// 发送方的设备 ID
+    dev_id: String,
+    /// 发送方的设备名
+    dev_name: String,
+    /// 对方当前那个对话框的会话 ID。空 = 上一版，落在这台的基础对话
+    sid: String,
+    /// 对方那个框的显示名，只在本机第一次见到这个会话 ID 时用来起名
+    sid_name: String,
+}
+
+impl Sender {
+    /// 这条消息该落进本机哪个对话框（不认识的框会顺手建出来）。
+    /// 名字用会话名，没有就退回设备名（上一版只发 X-Device-Name）
+    fn session(&self, hub: &Hub) -> String {
+        let name = if self.sid_name.is_empty() { &self.dev_name } else { &self.sid_name };
+        hub.session_for_incoming(&self.dev_id, &self.sid, name)
+    }
+}
+
+/// 入向消息的 `peer` 取的是**签名里的发送方设备 ID**，不是本机绑定的那台：
+/// 会话归属靠的就是这个字段（加上 `sid`），写错了历史无法回溯修正。
+/// 伪造 X-Device 会过不了 verify_sig，所以这里可以直信。
+fn handle_text(hub: &Arc<Hub>, body: &[u8], from: &Sender) -> Result<Message, String> {
     #[derive(serde::Deserialize)]
     struct InMsg {
         msg_id: String,
@@ -199,10 +239,8 @@ fn handle_text(hub: &Arc<Hub>, body: &[u8]) -> Result<Message, String> {
     }
     let parsed: InMsg =
         serde_json::from_slice(body).map_err(|e| format!("消息体不是合法 JSON: {e}"))?;
-    let peer = hub
-        .peer_snapshot()
-        .map(|p| p.id)
-        .unwrap_or_default();
+    // 陌生设备的第一条消息、或对方新开的第一个话题，都是在这里把会话建好的
+    let sid = from.session(hub);
     let msg = Message {
         id: parsed.msg_id,
         dir: "in".into(),
@@ -213,7 +251,8 @@ fn handle_text(hub: &Arc<Hub>, body: &[u8]) -> Result<Message, String> {
         path: None,
         state: "sent".into(),
         ts: parsed.ts,
-        peer,
+        peer: from.dev_id.clone(),
+        sid,
     };
     hub.store
         .append_message(&msg)
@@ -226,7 +265,7 @@ fn handle_file(
     mut req: tiny_http::Request,
     device: &store::Device,
     hs: &HashMap<String, String>,
-    dev_id: &str,
+    from: &Sender,
     ts: i64,
     sig: &str,
 ) -> Result<(), String> {
@@ -254,7 +293,7 @@ fn handle_file(
         Some((400, "缺少或非法的 X-Rel-Path".to_string()))
     } else if size == 0 || size > MAX_FILE_BYTES {
         Some((400, format!("非法文件大小: {size}")))
-    } else if !store::verify_sig(&device.passphrase, dev_id, ts, &want_sha, sig) {
+    } else if !store::verify_sig(&device.passphrase, &from.dev_id, ts, &want_sha, sig) {
         Some((403, "签名校验失败".to_string()))
     } else {
         let root = hub.store.inbox_dir().join(sanitize_component(&batch));
@@ -275,6 +314,9 @@ fn handle_file(
     };
     let root = hub.store.inbox_dir().join(sanitize_component(&batch));
     let dest = safe_rel_join(&root, &rel)?;
+    // 进度事件要在文件收完之前就知道归属，可那时还不该为一个没收完的传输
+    // 建会话 —— 所以先算落点（不建），收完那个真正落库的消息时再建
+    let route_sid = hub.route_session(&from.dev_id, &from.sid);
 
     // 这批此前已收到的字节数 = 进度基准；整批总大小未知时退回单文件口径
     let acc = hub.batch_touch(&batch, declared_total);
@@ -287,6 +329,8 @@ fn handle_file(
         &hub,
         &batch,
         &rel,
+        &from.dev_id,
+        &route_sid,
         acc.written,
         batch_total,
     );
@@ -303,7 +347,16 @@ fn handle_file(
                     .file_name()
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_else(|| name.clone());
-                let msg = build_inbox_message(&landing, &landing_name, &rel, &fin, &batch, &hub);
+                let sid = from.session(&hub);
+                let msg = build_inbox_message(
+                    &landing,
+                    &landing_name,
+                    &rel,
+                    &fin,
+                    &batch,
+                    &from.dev_id,
+                    &sid,
+                );
                 let _ = hub.store.append_message(&msg);
                 hub.emit("xfer-done", serde_json::json!({ "message": msg }));
             }
@@ -344,6 +397,10 @@ fn write_stream(
     hub: &Hub,
     batch: &str,
     rel: &str,
+    // 发送方设备 ID：进度气泡可能比 xfer-done 先到，没这个字段就不知道该铺进哪个会话
+    dev_id: &str,
+    // 这条传输落进的对话框（同一台的几个框各有归属）。只算出来的，可能还没建
+    sid: &str,
     base: u64,
     batch_total: u64,
 ) -> Result<(), StreamErr> {
@@ -383,6 +440,8 @@ fn write_stream(
                     // 所以报「基准 + 当前文件已写」而不是单文件百分比
                     "msg_id": batch,
                     "dir": "in",
+                    "peer": dev_id,
+                    "sid": sid,
                     "sent": base + sent,
                     "total": batch_total,
                     "name": rel
@@ -419,7 +478,8 @@ fn build_inbox_message(
     rel: &str,
     acc: &super::BatchAcc,
     batch: &str,
-    hub: &Hub,
+    dev_id: &str,
+    sid: &str,
 ) -> Message {
     let is_folder = landing.is_dir() || acc.files > 1;
     let size = if acc.total > 0 {
@@ -427,10 +487,6 @@ fn build_inbox_message(
     } else {
         acc.written
     };
-    let peer = hub
-        .peer_snapshot()
-        .map(|p| p.id)
-        .unwrap_or_default();
     Message {
         id: batch.to_string(),
         dir: "in".into(),
@@ -445,7 +501,8 @@ fn build_inbox_message(
         path: Some(landing.to_string_lossy().to_string()),
         state: "sent".into(),
         ts: store::now_ms(),
-        peer,
+        peer: dev_id.to_string(),
+        sid: sid.to_string(),
     }
 }
 

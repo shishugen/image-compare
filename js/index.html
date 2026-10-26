@@ -7,7 +7,9 @@
     <link rel="stylesheet" href="style.css" />
   </head>
   <!-- data-view 决定哪个视图可见，也决定拖进来的文件归谁处理（见 js/api.js） -->
-  <body data-view="compare">
+  <!-- layout-2 是出厂布局（与 view-compare.js 里的 let layout = "2" 一份口径）：
+       没有它，首帧到 loadPrefs 返回之间 B 窗会被 .only-multi 规则藏掉一下 -->
+  <body data-view="compare" class="layout-2">
     <div id="app">
       <!-- 左侧竖排导航：三个视图共用一条状态栏 -->
       <nav class="nav">
@@ -28,18 +30,18 @@
           <section class="view view-compare" id="view-compare">
             <header class="toolbar">
               <div class="tb-group">
-                <button id="btn-open-a" class="btn" title="载入图片到 A 窗">打开 A</button>
-                <button id="btn-open-b" class="btn" title="载入图片到 B 窗">打开 B</button>
-                <button id="btn-open-c" class="btn only-grid" title="载入图片到 C 窗">打开 C</button>
-                <button id="btn-open-d" class="btn only-grid" title="载入图片到 D 窗">打开 D</button>
+                <!-- 「打开 A/B/C/D」四个入口已拆：要往指定窗里放图就单击那个空窗（直接粘剪贴板，没图才弹选文件）、
+                     拖文件进窗，或者 ⌘V；一次多张就走下面这个「打开对比」（自动铺满可见窗） -->
                 <button id="btn-open-pair" class="btn btn-primary" title="一次选择多张图（⌘O）">打开对比</button>
+                <button id="btn-strip" class="btn btn-toggle" disabled title="浏览这张图所在文件夹的全部图片（⌘⇧B）">浏览列表</button>
               </div>
 
               <div class="tb-sep"></div>
 
-              <div class="tb-group layout-group">
+              <!-- 工具栏只常居 1/2 图这两档；四图 2×2 不常切，只在右侧「设置」抽屉里选（快捷键 4 仍然可用） -->
+              <div class="tb-group layout-group" title="显示几张图（四图 2×2 在「设置」里选）">
+                <button id="btn-layout-1" class="btn btn-toggle" title="单图浏览，只看 A 窗（快捷键 3）">1 图</button>
                 <button id="btn-layout-2" class="btn btn-toggle is-active" title="两图并排（快捷键 2）">2 图</button>
-                <button id="btn-layout-4" class="btn btn-toggle" title="四图 2×2 网格（快捷键 4）">4 图</button>
               </div>
 
               <div class="tb-sep"></div>
@@ -66,89 +68,147 @@
                   <span class="switch-track"><span class="switch-thumb"></span></span>
                   <span class="switch-text">同步</span>
                 </label>
-
-                <select id="sel-wheel" class="select" title="滚轮 / 触控板双指滚动的行为">
-                  <option value="zoom">滚轮缩放</option>
-                  <option value="pan">滚轮平移</option>
-                </select>
+                <!-- 工具栏这枚「滚轮缩放/平移」下拉已拆（用户要求）：只在右侧「设置」抽屉里选，
+                     真值也存在那里（view-compare.js 的 wheelMode()） -->
               </div>
 
               <div class="tb-spacer"></div>
 
               <div class="tb-group">
                 <button id="btn-clear" class="btn btn-ghost" title="清空所有图窗">清空</button>
+                <button id="btn-cmp-settings" class="btn btn-ghost" title="布局 / 同步 / 滚轮行为（存起来，下次启动还是这套）">设置</button>
               </div>
             </header>
 
             <!-- 对比主区 -->
-            <main class="stage" id="stage">
-              <section class="pane" id="pane-a" data-pane="a">
-                <div class="viewport">
-                  <div class="layer"><img class="canvas" alt="" draggable="false" /></div>
-                  <div class="empty">
-                    <div class="empty-icon">A</div>
-                    <p>单击直接粘剪贴板里的图，或拖拽到此处；⌘O 选文件</p>
-                  </div>
+            <div class="cmp-body">
+              <!-- 浏览侧栏：列出「当前这张图所在目录」的全部图片，点一行就是浏览到那张。
+                   它是 stage 的兄弟而不是子元素：分隔条按 stage 宽度算百分比，
+                   侧栏挤进 stage 会让两窗总宽溢出、拖拽比例全错 -->
+              <aside class="filmstrip" id="filmstrip" tabindex="0" role="listbox" hidden aria-label="当前图片所在文件夹">
+                <div class="fs-head">
+                  <span class="fs-dir" id="fs-dir" title=""></span>
+                  <span class="fs-count" id="fs-count"></span>
+                  <button class="fs-close" id="btn-strip-close" title="收起浏览列表（⌘⇧B）">×</button>
                 </div>
-                <div class="pane-tag">
-                  <span class="tag-dot"></span>
-                  <span class="tag-name">A</span>
-                  <button class="tag-close" data-close="a" title="关闭图片">×</button>
-                </div>
-              </section>
+                <p class="fs-tip" id="fs-tip" hidden></p>
+                <div class="fs-list" id="fs-list"></div>
+              </aside>
 
-              <div class="splitter" id="splitter" title="拖动调整两窗宽度"><span></span></div>
-
-              <section class="pane" id="pane-b" data-pane="b">
-                <div class="viewport">
-                  <div class="layer"><img class="canvas" alt="" draggable="false" /></div>
-                  <div class="empty">
-                    <div class="empty-icon">B</div>
-                    <p>单击直接粘剪贴板里的图，或拖拽到此处；⌘O 选文件</p>
+              <main class="stage" id="stage">
+                <section class="pane" id="pane-a" data-pane="a">
+                  <div class="viewport">
+                    <div class="layer"><img class="canvas" alt="" draggable="false" /></div>
+                    <div class="empty">
+                      <div class="empty-icon">A</div>
+                      <p>单击直接粘剪贴板里的图，或拖拽到此处；⌘O 选文件</p>
+                    </div>
                   </div>
-                </div>
-                <div class="pane-tag">
-                  <span class="tag-dot"></span>
-                  <span class="tag-name">B</span>
-                  <button class="tag-close" data-close="b" title="关闭图片">×</button>
-                </div>
-              </section>
-
-              <section class="pane only-grid" id="pane-c" data-pane="c">
-                <div class="viewport">
-                  <div class="layer"><img class="canvas" alt="" draggable="false" /></div>
-                  <div class="empty">
-                    <div class="empty-icon">C</div>
-                    <p>单击直接粘剪贴板里的图，或拖拽到此处；⌘O 选文件</p>
+                  <div class="pane-tag">
+                    <span class="tag-dot"></span>
+                    <span class="tag-name">A</span>
+                    <button class="tag-close" data-close="a" title="关闭图片">×</button>
                   </div>
-                </div>
-                <div class="pane-tag">
-                  <span class="tag-dot"></span>
-                  <span class="tag-name">C</span>
-                  <button class="tag-close" data-close="c" title="关闭图片">×</button>
-                </div>
-              </section>
+                  <!-- 这个窗自己的信息行：住在窗里，宽度跟着窗走，于是一直画在这张图的正下方 -->
+                  <div class="pane-foot" id="st-info-a">A: 未载入</div>
+                </section>
 
-              <section class="pane only-grid" id="pane-d" data-pane="d">
-                <div class="viewport">
-                  <div class="layer"><img class="canvas" alt="" draggable="false" /></div>
-                  <div class="empty">
-                    <div class="empty-icon">D</div>
-                    <p>单击直接粘剪贴板里的图，或拖拽到此处；⌘O 选文件</p>
+                <div class="splitter" id="splitter" title="拖动调整两窗宽度"><span></span></div>
+
+                <section class="pane only-multi" id="pane-b" data-pane="b">
+                  <div class="viewport">
+                    <div class="layer"><img class="canvas" alt="" draggable="false" /></div>
+                    <div class="empty">
+                      <div class="empty-icon">B</div>
+                      <p>单击直接粘剪贴板里的图，或拖拽到此处；⌘O 选文件</p>
+                    </div>
                   </div>
+                  <div class="pane-tag">
+                    <span class="tag-dot"></span>
+                    <span class="tag-name">B</span>
+                    <button class="tag-close" data-close="b" title="关闭图片">×</button>
+                  </div>
+                  <div class="pane-foot" id="st-info-b">B: 未载入</div>
+                </section>
+
+                <section class="pane only-grid" id="pane-c" data-pane="c">
+                  <div class="viewport">
+                    <div class="layer"><img class="canvas" alt="" draggable="false" /></div>
+                    <div class="empty">
+                      <div class="empty-icon">C</div>
+                      <p>单击直接粘剪贴板里的图，或拖拽到此处；⌘O 选文件</p>
+                    </div>
+                  </div>
+                  <div class="pane-tag">
+                    <span class="tag-dot"></span>
+                    <span class="tag-name">C</span>
+                    <button class="tag-close" data-close="c" title="关闭图片">×</button>
+                  </div>
+                  <div class="pane-foot" id="st-info-c">C: 未载入</div>
+                </section>
+
+                <section class="pane only-grid" id="pane-d" data-pane="d">
+                  <div class="viewport">
+                    <div class="layer"><img class="canvas" alt="" draggable="false" /></div>
+                    <div class="empty">
+                      <div class="empty-icon">D</div>
+                      <p>单击直接粘剪贴板里的图，或拖拽到此处；⌘O 选文件</p>
+                    </div>
+                  </div>
+                  <div class="pane-tag">
+                    <span class="tag-dot"></span>
+                    <span class="tag-name">D</span>
+                    <button class="tag-close" data-close="d" title="关闭图片">×</button>
+                  </div>
+                  <div class="pane-foot" id="st-info-d">D: 未载入</div>
+                </section>
+              </main>
+
+              <!-- 系统设置抽屉：与工具栏那几个控件读同一份状态，任一处改动实时同步另一处并落盘。
+                   放在 .cmp-body 里是因为 .drawer 靠绝对定位，需要一个 relative 的宿主（同传输视图的 .panel-body） -->
+              <aside class="drawer" id="cmp-settings">
+                <div class="drawer-head">
+                  <b>系统设置</b>
+                  <button id="btn-set-close" class="link-btn" data-close-drawer="cmp-settings">收起</button>
                 </div>
-                <div class="pane-tag">
-                  <span class="tag-dot"></span>
-                  <span class="tag-name">D</span>
-                  <button class="tag-close" data-close="d" title="关闭图片">×</button>
+                <div class="drawer-body">
+                  <label class="field">
+                    <span>显示图片数量</span>
+                    <select id="sel-set-layout" class="select">
+                      <option value="1">1 图：单图浏览，点列表就换那一张</option>
+                      <option value="2" selected>2 图：两图并排</option>
+                      <option value="4">4 图：2×2 网格</option>
+                    </select>
+                  </label>
+                  <p class="hint">与工具栏那两枚按钮、快捷键 3 / 2 / 4 是同一个开关，改完就存住；四图 2×2 工具栏上没放按钮，只能从这里选。</p>
+
+                  <label class="field">
+                    <span>图片同步</span>
+                    <label class="switch">
+                      <input id="chk-set-sync" type="checkbox" checked />
+                      <span class="switch-track"><span class="switch-thumb"></span></span>
+                      <span class="switch-text">开启</span>
+                    </label>
+                  </label>
+                  <p class="hint">开启后任一窗的缩放平移会复制到其它可见窗，载入新图也直接沿用同一区域。单图布局下只剩一个窗，这一项没有作用。</p>
+
+                  <label class="field">
+                    <span>滚轮 / 触控板双指</span>
+                    <select id="sel-set-wheel" class="select">
+                      <option value="zoom" selected>缩放</option>
+                      <option value="pan">平移</option>
+                    </select>
+                  </label>
+                  <p class="hint">双指滚动按这里选的行为走；触控板捏合（pinch）始终缩放，不受这一项影响。</p>
                 </div>
-              </section>
-            </main>
+              </aside>
+            </div>
           </section>
 
           <!-- ================= 视图二：局域网传输 ================= -->
           <section class="view view-transfer" id="view-transfer">
             <header class="toolbar">
+              <!-- 当前会话头：以前这里写的是「绑定的那台」，多台之后它只能是「正在聊的那台」 -->
               <div class="peer-box" id="xfer-peer">
                 <span class="dot dot-off"></span><b>读取连接状态中…</b>
               </div>
@@ -168,84 +228,109 @@
             </header>
 
             <div class="panel-body">
-              <!-- 搜索条：按类型筛历史气泡 + 关键词搜名字/文字内容（⌘F 直接跳进来） -->
-              <div class="filter-bar" id="xfer-filter">
-                <input
-                  id="xfer-search"
-                  class="input xfer-search"
-                  type="search"
-                  placeholder="搜名字或文字内容，Esc 清空"
-                  title="在已加载的历史里筛选，不发请求"
-                />
-                <div class="chip-row" id="xfer-chips">
-                  <button class="chip is-on" data-kind="all">全部</button>
-                  <button class="chip" data-kind="text">文字</button>
-                  <button class="chip" data-kind="image">图片</button>
-                  <button class="chip" data-kind="folder">文件夹</button>
-                  <button class="chip" data-kind="archive">压缩包</button>
-                  <button class="chip" data-kind="other">其他文件</button>
+              <!-- 会话栏：一个对话框一行。会话有自己的 ID（基础对话 = 那台的设备 ID，
+                   新话题 = UUID），所以同一台可以连着开好几个各自独立的对话框 -->
+              <aside class="session-list" id="xfer-sessions">
+                <div class="session-head">
+                  <b>聊天</b>
+                  <button class="link-btn" id="btn-session-new" title="选一台设备开一个对话框，同一台可以开好几个">＋ 新聊天</button>
                 </div>
-                <span class="filter-count dim" id="xfer-filter-count" hidden></span>
-              </div>
-
-              <!-- 首屏只铺最近 10 条，更早的靠这条补（内容没超出视口时滚不动，所以光靠滚动触发不够） -->
-              <button class="stream-older" id="xfer-older" hidden>加载更早的消息</button>
-
-              <!-- 消息流：文字气泡 + 文件/文件夹气泡（名称、大小、进度、打开位置） -->
-              <div class="stream" id="xfer-stream"></div>
-
-              <div class="compose">
-                <textarea
-                  id="xfer-input"
-                  class="input compose-input"
-                  rows="2"
-                  placeholder="写点什么，Enter 发送、Shift+Enter 换行；把文件拖进窗口或 ⌘V 粘贴即发送"
-                ></textarea>
-                <button id="btn-xfer-send" class="btn btn-primary" disabled title="对端离线时不可发送">发送</button>
-              </div>
-
-              <!-- 拖拽悬停遮罩：像微信那样，看到提示就可以松手 -->
-              <div class="drop-hint" id="xfer-drop-hint" hidden>
-                <div class="drop-hint-inner">
-                  <b id="xfer-drop-text">松开即发送</b>
-                  <span>支持一次拖多个，文件、图片、文件夹都行</span>
+                <div class="chat-pick" id="xfer-chat-pick" hidden>
+                  <div class="pick-title">选一台设备开对话框</div>
+                  <div class="pick-list" id="xfer-pick-list"></div>
+                  <p class="hint">已登记的设备与局域网里发现的设备合在一起，点一下开一个框；同一台可以重复点、开好几个。已经有的那几个去左边列表里点。</p>
                 </div>
-              </div>
-
-              <!-- 配对设置抽屉 -->
-              <aside class="drawer" id="xfer-settings">
-                <div class="drawer-head">
-                  <b>配对设置</b>
-                  <button class="link-btn" data-close-drawer="xfer-settings">收起</button>
-                </div>
-                <div class="drawer-body">
-                  <label class="field">
-                    <span>本机设备名</span>
-                    <input id="inp-device-name" class="input" placeholder="对端看到的名字" />
-                  </label>
-                  <label class="field">
-                    <span>配对口令</span>
-                    <input id="inp-passphrase" class="input" type="password" autocomplete="off" placeholder="≥4 个字符，两台填一样" />
-                  </label>
-                  <button id="btn-pair-save" class="btn btn-primary">保存口令与设备名</button>
-                  <p class="hint">口令只存本机，用于互认与请求签名。局域网内是明文传输，别用来传敏感文件。</p>
-
-                  <div class="cand-box" id="xfer-candidates"></div>
-
-                  <label class="field">
-                    <span>对端 IP:端口</span>
-                    <input id="inp-manual-addr" class="input" placeholder="192.168.1.23 或 192.168.1.23:45790" />
-                  </label>
-                  <button id="btn-bind-addr" class="btn">手动绑定对端</button>
-                  <p class="hint">mDNS 被网络策略屏蔽时的兜底；端口留空会从 45789 起逐个试探。</p>
-
-                  <div class="drawer-acts">
-                    <button id="btn-reprobe" class="btn btn-ghost">重新探测在线</button>
-                    <button id="btn-unbind" class="btn btn-ghost danger">解绑对端</button>
-                  </div>
-                  <p class="hint">Windows 首次监听会弹防火墙提示，必须勾「允许访问（私有网络）」。</p>
-                </div>
+                <div class="session-rows" id="xfer-session-rows"></div>
               </aside>
+
+              <div class="xfer-main">
+                <!-- 搜索条：只搜当前会话（跟微信一样不在全局里找），按类型筛 + 关键词搜名字/文字 -->
+                <div class="filter-bar" id="xfer-filter">
+                  <input
+                    id="xfer-search"
+                    class="input xfer-search"
+                    type="search"
+                    placeholder="在当前会话里搜名字或文字，Esc 清空"
+                    title="只搜当前会话已加载的历史，不发请求"
+                  />
+                  <div class="chip-row" id="xfer-chips">
+                    <button class="chip is-on" data-kind="all">全部</button>
+                    <button class="chip" data-kind="text">文字</button>
+                    <button class="chip" data-kind="image">图片</button>
+                    <button class="chip" data-kind="folder">文件夹</button>
+                    <button class="chip" data-kind="archive">压缩包</button>
+                    <button class="chip" data-kind="other">其他文件</button>
+                  </div>
+                  <span class="filter-count dim" id="xfer-filter-count" hidden></span>
+                </div>
+
+                <!-- 首屏只铺最近 10 条，更早的靠这条补（内容没超出视口时滚不动，所以光靠滚动触发不够） -->
+                <button class="stream-older" id="xfer-older" hidden>加载更早的消息</button>
+
+                <!-- 消息流：文字气泡 + 文件/文件夹气泡（名称、大小、进度、打开位置），
+                     中间按自然日插日期分隔线 -->
+                <div class="stream" id="xfer-stream"></div>
+
+                <div class="compose">
+                  <textarea
+                    id="xfer-input"
+                    class="input compose-input"
+                    rows="2"
+                    placeholder="写点什么，Enter 发送、Shift+Enter 换行；把文件拖进窗口或 ⌘V 粘贴即发送"
+                  ></textarea>
+                  <button id="btn-xfer-send" class="btn btn-primary" disabled title="当前会话离线时不可发送">发送</button>
+                </div>
+
+                <!-- 拖拽悬停遮罩：像微信那样，看到提示就可以松手 -->
+                <div class="drop-hint" id="xfer-drop-hint" hidden>
+                  <div class="drop-hint-inner">
+                    <b id="xfer-drop-text">松开即发送</b>
+                    <span>支持一次拖多个，文件、图片、文件夹都行</span>
+                  </div>
+                </div>
+
+                <!-- 配对设置抽屉 -->
+                <aside class="drawer" id="xfer-settings">
+                  <div class="drawer-head">
+                    <b>配对设置</b>
+                    <button class="link-btn" data-close-drawer="xfer-settings">收起</button>
+                  </div>
+                  <div class="drawer-body">
+                    <label class="field">
+                      <span>本机设备名</span>
+                      <input id="inp-device-name" class="input" placeholder="对端看到的名字" />
+                    </label>
+                    <label class="field">
+                      <span>配对口令</span>
+                      <input id="inp-passphrase" class="input" type="password" autocomplete="off" placeholder="≥4 个字符，每台都填一样" />
+                    </label>
+                    <button id="btn-pair-save" class="btn btn-primary">保存口令与设备名</button>
+                    <p class="hint">口令只存本机，用于互认与请求签名。局域网内是明文传输，别用来传敏感文件。</p>
+
+                    <div class="cand-box" id="xfer-candidates"></div>
+
+                    <label class="field">
+                      <span>对端 IP:端口</span>
+                      <input id="inp-manual-addr" class="input" placeholder="192.168.1.23 或 192.168.1.23:45790" />
+                    </label>
+                    <button id="btn-bind-addr" class="btn">手动添加对端</button>
+                    <p class="hint">mDNS 被网络策略屏蔽时的兜底；端口留空会从 45789 起逐个试探。可以同时添加多台，每台一个对话框。</p>
+
+                    <label class="field">
+                      <span>对端备注名</span>
+                      <input id="inp-peer-alias" class="input" maxlength="40" placeholder="像微信那样给它起个备注，留空则用对方报的设备名" />
+                    </label>
+                    <button id="btn-peer-alias" class="btn">保存备注名</button>
+                    <p class="hint">备注只存本机、只改本机显示（会话栏 / 顶栏 / 新建聊天的默认名），对端那边看不到任何变化。</p>
+
+                    <div class="drawer-acts">
+                      <button id="btn-reprobe" class="btn btn-ghost">重新探测在线</button>
+                      <button id="btn-unbind" class="btn btn-ghost danger">解绑当前对端</button>
+                    </div>
+                    <p class="hint">解绑只是不再主动发给它，而且不会再自动连回来 —— 要恢复得在上面的候选里点一下或再填一次 IP。聊天历史与收到的文件都留着。Windows 首次监听会弹防火墙提示，必须勾「允许访问（私有网络）」。</p>
+                  </div>
+                </aside>
+              </div>
             </div>
           </section>
 
@@ -296,7 +381,7 @@
                   <div class="drawer-acts">
                     <button id="btn-fav-save" class="btn btn-primary">保存</button>
                     <button id="btn-fav-copy" class="btn btn-ghost">复制全文</button>
-                    <button id="btn-fav-send" class="btn btn-ghost">发送到对端</button>
+                    <button id="btn-fav-send" class="btn btn-ghost">发到当前会话</button>
                     <button id="btn-fav-open" class="btn btn-ghost">在对比中打开</button>
                     <button id="btn-fav-delete" class="btn btn-ghost danger">删除</button>
                   </div>
@@ -314,12 +399,8 @@
           </span>
           <span id="st-msg" class="st-item st-msg"></span>
           <span class="st-spacer"></span>
-          <span class="st-only" data-for="compare">
-            <span id="st-info-a" class="st-item st-file">A: 未载入</span>
-            <span id="st-info-b" class="st-item st-file">B: 未载入</span>
-            <span id="st-info-c" class="st-item st-file only-grid">C: 未载入</span>
-            <span id="st-info-d" class="st-item st-file only-grid">D: 未载入</span>
-          </span>
+          <!-- 四个窗的文件名/分辨率不再挤在这条共用状态栏里：它们各自搬到了自己那个窗的
+               底部（.pane-foot，id 仍是 st-info-a/b/c/d），JS 的 refreshStatus() 一行没改 -->
         </footer>
       </div>
     </div>

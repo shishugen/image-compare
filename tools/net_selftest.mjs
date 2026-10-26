@@ -1,13 +1,14 @@
 #!/usr/bin/env node
-/* 局域网接收端的端到端自检：对着真正运行中的 app 发四种请求，把每条路由的状态码、
- * 落盘位置、路径守卫一次跑清楚。只在开发期手工执行：
+/* 局域网接收端的端到端自检：对着真正运行中的 app 发几种请求，把每条路由的状态码、
+ * 落盘位置、路径守卫、「多身份各自一个会话」、以及「同一台靠 X-Session 分落好几个对话框」一次跑清楚。只在开发期手工执行：
  *   node tools/net_selftest.mjs                          # 打本机，口令从 device.json 读
  *   node tools/net_selftest.mjs <配对口令>                # 打本机，显式给口令
  *   node tools/net_selftest.mjs <口令> --host 192.168.1.20  # 打另一台机器
  * 本机模式会读 device.json 并对收件箱做真实核对；远程模式只看状态码
  * （对端的 device.json 与落盘目录都在那台机器上，需过去逐项确认）。
  * 前置：被测那台的配对口令必须与本次用的口令一致，且 app 正在运行。
- * 用完会自动清掉自己写进收件箱的东西；聊天记录 messages.jsonl 不动（条目都带「自检」字样）。 */
+ * 用完会自动清掉自己写进收件箱的东西；聊天记录 messages.jsonl 不动（条目都带「自检」字样），
+ * 最后几段会在 sessions.json 里留下几行自检会话（两个身份 + 同一台的几个话题框），在界面上删掉即可（也只删会话与读指针）。 */
 import crypto from "node:crypto";
 import http from "node:http";
 import fs from "node:fs";
@@ -40,6 +41,8 @@ if (!PASS) {
   process.exit(2);
 }
 const DEV_ID = device.id;
+// 与 client.rs 一样报自己的显示名：远程模式读不到 device.json，用个固定名字
+const DEV_NAME = device.name || "selftest-remote-peer";
 const sha = (b) => crypto.createHash("sha256").update(b).digest("hex");
 const b64 = (s) => Buffer.from(s, "utf8").toString("base64");
 const EMPTY_SHA = sha(Buffer.alloc(0));
@@ -65,34 +68,64 @@ function ask(method, urlPath, headers, body) {
   });
 }
 
-function signed(extra, digest) {
+/** 以指定身份签名。与 client.rs::signed_headers 同构：显示名走 base64 头、
+ *  不参与签名，签名里的设备 ID 必须与 X-Device 一致 */
+function signedAs(id, name, extra, digest) {
   const ts = Date.now();
   return {
-    "X-Device": DEV_ID,
+    "X-Device": id,
+    "X-Device-Name": b64(name),
     "X-Ts": String(ts),
-    "X-Sig": sha(`${PASS}|${DEV_ID}|${ts}|${digest}`),
+    "X-Sig": sha(`${PASS}|${id}|${ts}|${digest}`),
     ...extra,
   };
 }
 
+/** 会话头：与 client.rs::session_headers 同构。X-Session 是会话 ID（UUID 或设备 ID，
+ *  本来就只有 ASCII）直接明文；X-Session-Name 可能含中文，走 base64。
+ *  两个头都故意不进签名（与 X-Device-Name 同理）：改个框名不该让旧请求失效 */
+function sessionHeaders(sess) {
+  if (!sess || !sess.id) return {};
+  const h = { "X-Session": sess.id };
+  if (sess.name) h["X-Session-Name"] = b64(sess.name);
+  return h;
+}
+
+function signed(extra, digest) {
+  return signedAs(DEV_ID, DEV_NAME, extra, digest);
+}
+
 /** 发一个文件。rel 决定收件箱里的相对路径，X-Name 是气泡上显示的名字。
  *  shaOverride 只改 X-Sha256（签名仍按覆盖后的值算），用来专门制造
- *  「签名能过、但头部声明的哈希与真实内容不符」这一岔路 */
-async function putFile({ batch, rel, name, content, isLast, batchSize, shaOverride }) {
+ *  「签名能过、但头部声明的哈希与真实内容不符」这一岔路。
+ * as 是换一个设备身份发（双身份那段要验的就是这个）；
+ *  session 是这次落在哪个对话框（同一台可以有好几个框） */
+async function putFile({ batch, rel, name, content, isLast, batchSize, shaOverride, as, session }) {
   const digest = shaOverride ?? sha(content);
-  const headers = signed(
-    {
-      "X-Sha256": digest,
-      "X-Size": String(content.length),
-      "X-Name": b64(name),
-      "X-Rel-Path": b64(rel),
-      "X-Batch": batch,
-      "X-Batch-Size": String(batchSize ?? content.length),
-      "X-Last": isLast ? "1" : "0",
-    },
-    digest
-  );
+  const extra = {
+    ...sessionHeaders(session),
+    "X-Sha256": digest,
+    "X-Size": String(content.length),
+    "X-Name": b64(name),
+    "X-Rel-Path": b64(rel),
+    "X-Batch": batch,
+    "X-Batch-Size": String(batchSize ?? content.length),
+    "X-Last": isLast ? "1" : "0",
+  };
+  const headers = as ? signedAs(as.id, as.name, extra, digest) : signed(extra, digest);
   return ask("PUT", "/file", headers, content);
+}
+
+/** 发一条文字消息。as 同样只用来换一个设备身份；session 决定落进对端哪个框 */
+async function postText(text, as, session) {
+  const body = Buffer.from(
+    JSON.stringify({ msg_id: crypto.randomUUID().replace(/-/g, ""), ts: Date.now(), text }),
+    "utf8"
+  );
+  const extra = { ...sessionHeaders(session), "Content-Type": "application/json" };
+  const digest = sha(body);
+  const headers = as ? signedAs(as.id, as.name, extra, digest) : signed(extra, digest);
+  return ask("POST", "/msg", headers, body);
 }
 
 let pass = 0;
@@ -123,14 +156,38 @@ function mark(p) {
 }
 /** messages.jsonl 最后一条（新到的消息一定在最末尾） */
 function lastMessage() {
-  const f = path.join(DATA, "messages.jsonl");
-  if (!fs.existsSync(f)) return null;
-  const lines = fs.readFileSync(f, "utf8").trim().split("\n");
+  const lines = jsonlLines();
+  if (!lines.length) return null;
   try {
     return JSON.parse(lines[lines.length - 1]);
   } catch {
     return null;
   }
+}
+/** 整个历史（自检靠它在里面找自己发的那几条，peer 字段就得从这核） */
+function jsonlLines() {
+  const f = path.join(DATA, "messages.jsonl");
+  if (!fs.existsSync(f)) return [];
+  return fs.readFileSync(f, "utf8").trim().split("\n");
+}
+/** sessions.json 的会话行：只读不写，app 那边是原子落盘，读不会拿到半截 */
+function sessionRows() {
+  try {
+    const f = path.join(DATA, "sessions.json");
+    return JSON.parse(fs.readFileSync(f, "utf8")).sessions || [];
+  } catch {
+    return [];
+  }
+}
+function findMessage(sub) {
+  for (const l of jsonlLines()) {
+    if (!l.includes(sub)) continue;
+    try {
+      const m = JSON.parse(l);
+      if (m.text === sub || m.name === sub || (m.text || "").includes(sub)) return m;
+    } catch {}
+  }
+  return null;
 }
 
 console.log(`目标 http://${HOST}:${PORT}  模式 ${LOCAL ? "本机（可核对落盘）" : "远程（只看状态码）"}\n`);
@@ -178,19 +235,12 @@ console.log(`目标 http://${HOST}:${PORT}  模式 ${LOCAL ? "本机（可核对
 /* 4. 文字消息落库 */
 {
   const text = "自检消息 " + Date.now();
-  const body = Buffer.from(
-    JSON.stringify({ msg_id: crypto.randomUUID().replace(/-/g, ""), ts: Date.now(), text }),
-    "utf8"
-  );
-  const r = await ask("POST", "/msg", signed({ "Content-Type": "application/json" }, sha(body)), body);
+  const r = await postText(text);
   if (r.status !== 200) {
     check("签名 /msg 回 200", false, r.status + " " + r.text);
   } else {
     check("签名 /msg 回 200", true);
-    checkLocal("消息确实写进 messages.jsonl", () => {
-      const lines = fs.readFileSync(path.join(DATA, "messages.jsonl"), "utf8").trim().split("\n");
-      return lines.some((l) => l.includes(text));
-    });
+    checkLocal("消息确实写进 messages.jsonl", () => jsonlLines().some((l) => l.includes(text)));
   }
 }
 
@@ -292,6 +342,144 @@ for (const rel of ["../逃逸.txt", "/etc/逃逸.txt", "a/../../逃逸.txt", "..
 checkLocal("路径守卫没有真的写出文件", () =>
   ["/tmp/逃逸.txt", path.join(DATA, "逃逸.txt")].every((p) => !fs.existsSync(p))
 );
+
+/* 11. 两个身份打同一台接收端：落库的 peer 必须是签名里那个 X-Device，
+      而且一人一行会话。
+      这里用的是「两个身份打一台」而不是「起两个 app 实例互发」：本机第二个实例
+      跟第一个共用同一个 app_data_dir（同一份 messages.jsonl 与 sessions.json），
+      「分别落进两个会话」根本核不出来；真两台要拿两台机器跑，本机跑不出那个拓扑 */
+// 第 12 段要拿这个身份的会话 ID 演一次「冒用别人的框」，所以把它提到块外
+const B_ID = "selftest-peer-" + Date.now().toString(16);
+const B_NAME = "自检乙机";
+{
+  const stamp = Date.now();
+  const mine = "自检甲消息 " + stamp;
+  const theirs = "自检乙消息 " + stamp;
+  const fileRel = "自检乙机的文件.txt";
+  mark(path.join(DATA, "inbox", fileRel));
+  const content = Buffer.from("两份身份共用一台接收端", "utf8");
+  const r1 = await postText(mine);
+  const r2 = await postText(theirs, { id: B_ID, name: B_NAME });
+  const r3 = await putFile({
+    batch: "selftesttwo" + stamp,
+    rel: fileRel,
+    name: fileRel,
+    content,
+    isLast: true,
+    as: { id: B_ID, name: B_NAME },
+  });
+  check(
+    "两个身份的 /msg 与 /file 都回 200",
+    r1.status === 200 && r2.status === 200 && r3.status === 200,
+    `${r1.status}/${r2.status}/${r3.status}`
+  );
+  checkLocal("文字消息的 peer 取自 X-Device，不是接收端绑的那台", () => {
+    const a = findMessage(mine);
+    const b = findMessage(theirs);
+    return !!a && !!b && a.peer === DEV_ID && b.peer === B_ID;
+  });
+  checkLocal("文件消息的 peer 也是 X-Device（/file 与 /msg 两条落库路径同口径）", () => {
+    const f = findMessage(fileRel);
+    return !!f && f.kind === "file" && f.peer === B_ID;
+  });
+  checkLocal("两个身份各自一行会话，没被合并成一行", () => {
+    // 基础对话的会话 ID 就等于设备 ID（老历史才能不改写就归位）。本段一概不带
+    // X-Session，所以这两个身份名下都只该有那一行；多框是第 12 段的事
+    const rows = sessionRows().filter(
+      (s) => (s.peer === DEV_ID || s.peer === B_ID) && s.id === s.peer
+    );
+    return new Set(rows.map((s) => s.peer)).size === 2;
+  });
+  checkLocal("陌生身份自动建会话，名字用的是 X-Device-Name", () => {
+    const row = sessionRows().find((s) => s.peer === B_ID);
+    return !!row && row.name === B_NAME;
+  });
+  // 同一个身份再来一条：必须回到刚才那一行，不能多开一个框
+  const again = await postText("自检乙机第二条 " + stamp, { id: B_ID, name: B_NAME });
+  check("同身份的第二条 /msg 回 200", again.status === 200, String(again.status));
+  checkLocal("同身份的第二条不会多出第二个框", () => sessionRows().filter((s) => s.peer === B_ID).length === 1);
+  console.log(`提示  本段会在会话列表里留下两行（本机身份与「${B_NAME}」）`);
+  console.log("      用会话栏那一行的「删除」清掉即可，聊天记录与收件箱都不受影响。");
+}
+
+/* 12. 同一台开多个对话框：落点由 X-Session 决定。会话 ID 是发起方生成的，
+      接收端只看「这个 ID 本机有没有、属不属于发来的那台」。
+      本机同样跑不出「两台各开一个框并互发」的拓扑，但入向分发是纯本地判断：
+      用同一个 X-Device 换几个 X-Session，就能把落点规则的四条分支全部踩一遍 */
+{
+  const stamp = Date.now();
+  // 两个本机没见过的会话 ID：模拟“同一台的第二个、第三个框”
+  const T1 = "selftest-topic-" + stamp.toString(16);
+  const T2 = "selftest-topic2-" + stamp.toString(16);
+  const T1_NAME = "自检话题框";
+  const noHead = "自检没有会话头 " + stamp; // 上一版根本不发 X-Session
+  const topic1 = "自检话题一 " + stamp;
+  const topic1Again = "自检话题一再发 " + stamp;
+  const topic2 = "自检话题二 " + stamp;
+  const hijack = "自检冒用他人会话 " + stamp; // 拿 B_ID 那个框的 ID 往本机框里塞消息
+  const fileRel = "自检话题里的文件.txt";
+  mark(path.join(DATA, "inbox", fileRel));
+  const replies = [];
+  replies.push(await postText(noHead));
+  replies.push(await postText(topic1, undefined, { id: T1, name: T1_NAME }));
+  // 同一个框的第二条，故意换一个会话名：名字只在头一回见到这个会话时用
+  replies.push(await postText(topic1Again, undefined, { id: T1, name: "对方后来改的名" }));
+  replies.push(await postText(topic2, undefined, { id: T2 }));
+  replies.push(await postText(hijack, undefined, { id: B_ID }));
+  replies.push(
+    await putFile({
+      batch: "selftesttopic" + stamp,
+      rel: fileRel,
+      name: fileRel,
+      content: Buffer.from("落进话题框的一个文件", "utf8"),
+      isLast: true,
+      session: { id: T1, name: T1_NAME },
+    })
+  );
+  check(
+    "带与不带 X-Session 的 /msg 与 /file 都回 200",
+    replies.every((r) => r.status === 200),
+    replies.map((r) => `${r.status} ${r.text}`).join(" | ")
+  );
+  checkLocal("不带 X-Session 落进那台的基础对话（上一版兼容）", () => {
+    const m = findMessage(noHead);
+    return !!m && m.peer === DEV_ID && m.sid === DEV_ID;
+  });
+  checkLocal("本机没见过的会话 ID 被认下来，消息落进那个框", () => {
+    const m = findMessage(topic1);
+    return !!m && m.peer === DEV_ID && m.sid === T1;
+  });
+  checkLocal("同一个 X-Session 的第二条仍落进同一个框", () => findMessage(topic1Again)?.sid === T1);
+  checkLocal("文件也按 X-Session 落进同一个话题框", () => {
+    const m = findMessage(fileRel);
+    return !!m && m.kind === "file" && m.sid === T1;
+  });
+  checkLocal("同一台的三个框各存各的：基础对话 / 话题一 / 话题二 互不混", () => {
+    const sids = [noHead, topic1, topic2].map((t) => findMessage(t)?.sid);
+    return sids[0] === DEV_ID && sids[1] === T1 && sids[2] === T2 && new Set(sids).size === 3;
+  });
+  checkLocal("新框自动进会话表，名字取 X-Session-Name", () => {
+    const row = sessionRows().find((s) => s.id === T1);
+    return !!row && row.peer === DEV_ID && row.name === T1_NAME;
+  });
+  checkLocal("对端后来改的会话名不会覆盖本机这一行（用户重命名不被打回）", () => {
+    const row = sessionRows().find((s) => s.id === T1);
+    return !!row && row.name === T1_NAME;
+  });
+  checkLocal("只带 X-Session 不带名字时，退回用设备名建框", () => {
+    const row = sessionRows().find((s) => s.id === T2);
+    return !!row && row.peer === DEV_ID && row.name === DEV_NAME;
+  });
+  checkLocal("冒用另一台的会话 ID：落回自己这台的基础对话", () => {
+    const m = findMessage(hijack);
+    return !!m && m.peer === DEV_ID && m.sid === DEV_ID;
+  });
+  checkLocal("被冒用的那个框归属没被搅乱，消息也没被插进去", () => {
+    const row = sessionRows().find((s) => s.id === B_ID);
+    return !!row && row.peer === B_ID && findMessage(hijack)?.sid !== B_ID;
+  });
+  console.log(`提示  本段在本机身份名下多开了两行话题框（${T1} / ${T2}）`);
+}
 
 /* 收尾：删掉自检写进收件箱的东西 */
 for (const p of madePaths) {

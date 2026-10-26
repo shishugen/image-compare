@@ -142,12 +142,95 @@ pub struct Device {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Peer {
     pub id: String,
+    /// 对方自己上报的设备名，每次 /ping 都会带回来
     pub name: String,
+    /// 本机给它起的备注名（跟微信那个「设置备注和标签」一个意思）。空串表示没有备注，
+    /// 于是界面退回用 `name`。只存本机、绝不上线：对端那份名字归它自己维护。
+    /// 加了 `#[serde(default)]`，老 peers.json 少这个字段照样读
+    #[serde(default)]
+    pub alias: String,
     pub host: String,
     pub port: u16,
     /// 最近一次 /ping 是否成功
     pub online: bool,
     pub last_seen: i64,
+}
+
+impl Peer {
+    /// 界面上到底叫哪个：有备注就一律用备注，没备注才用对方报的名。
+    /// 会话默认名、会话栏、候选列表、顶栏都得走这一条，否则同一台会出现两个名字
+    pub fn display_name(&self) -> String {
+        let a = self.alias.trim();
+        if !a.is_empty() {
+            return a.to_string();
+        }
+        let n = self.name.trim();
+        if !n.is_empty() {
+            return n.to_string();
+        }
+        format!("设备 {}", &self.id.chars().take(8).collect::<String>())
+    }
+}
+
+/// peers.json 的整体结构。以前磁盘上只有 `peers` 一个数组，读的时候靠一个私有
+/// 临时结构兜住；现在要多存一份「解绑名单」，就提成公开的了
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct PeersFile {
+    pub peers: Vec<Peer>,
+    /// 用户主动解绑过的设备 ID：mDNS 还会把它们发现、心跳还会 ping 通它们，
+    /// 没有这份名单的话「解绑」只撑一秒 —— 下一拍心跳就自动把同一台又登记回来
+    #[serde(default)]
+    pub ignored: Vec<String>,
+}
+
+/// 一个对话框。
+///
+/// `id` 是会话主键，前端与线上（`X-Session` 头）都只认它：
+/// - 一台对端的**基础对话**直接用对端设备 ID 当 id。老历史里那些没有 `sid` 的消息
+///   因此天然归到它名下，不需要改写 messages.jsonl（见 `Message::sid_of`）
+/// - 同一台后来再开的对话用另造的 UUID，由发起方生成、随消息带过去，两边落在同一个框
+///
+/// 所以「同一台可以有多个框，但同一个框在两边是同一个」由 id 的传递保证。
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Session {
+    /// 会话 ID：基础对话 = 对端设备 ID，新话题 = UUID。空串只出现在「未标记」那一行
+    #[serde(default)]
+    pub id: String,
+    /// 所属对端设备 ID；空串是「未标记」虚拟会话（老历史里 peer 缺失的那些）
+    pub peer: String,
+    /// 会话显示名：建的时候定下，之后各改各的（用户可以重命名，对端改名不再覆盖它）
+    pub name: String,
+    pub created: i64,
+    /// 本机读到哪了：未读数 = 该会话里比它新的入向消息条数
+    pub read: i64,
+}
+
+/// sessions.json 的整体结构
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct SessionsFile {
+    pub sessions: Vec<Session>,
+    /// 当前在聊的那个对话框的会话 ID。只是界面焦点，**不是**发送目标（目标由命令参数给）
+    pub active: String,
+    /// 被删过会话、但历史里还留着消息的会话 ID：列表不再把它们从历史里补回来，
+    /// 否则「删除」点了等于没点。对方在那个框里再发一条过来就自动出这个名单（历史本来就还在）
+    #[serde(default)]
+    pub hidden: Vec<String>,
+}
+
+impl SessionsFile {
+    /// 把上一版「会话 = 设备 ID」留下的文件补出现在的主键：那一版没有 id 字段，
+    /// 而它的会话正好就是一台的基础对话，所以 id 直接用 peer。
+    /// `active` 与 `hidden` 里存的是设备 ID，而基础对话的 id 恰好等于它 —— 不用跟着改。
+    /// 幂等，读文件时每次都过一遍（也顺手挡住手改进来的空 id 行：那种行会把所有会话混成一个）
+    pub fn normalize(&mut self) {
+        for s in &mut self.sessions {
+            if s.id.is_empty() {
+                s.id = s.peer.clone();
+            }
+        }
+        // 「未标记」从来不入会话表（它没有读指针也不能发），空 id 的行只能丢
+        self.sessions.retain(|s| !s.id.is_empty());
+    }
 }
 
 /// 请求签名：sha256(口令|设备ID|时间戳|摘要)。
@@ -198,9 +281,25 @@ pub struct Message {
     /// "sending" | "sent" | "failed"
     pub state: String,
     pub ts: i64,
-    /// 对端设备 ID，用于将来扩到多台
+    /// 对端设备 ID：这条消息是谁发的（取自签过名的 X-Device，伪造不了）
     #[serde(default)]
     pub peer: String,
+    /// 归属的会话 ID。空 = 这台的基础对话（等价于 sid == peer）；
+    /// 上一版根本没有这个字段，所以老历史只能按 `peer` 归到基础对话，不做猜测式改写
+    #[serde(default)]
+    pub sid: String,
+}
+
+impl Message {
+    /// 这条消息落在哪个对话框。老消息没有 sid，那类就归到发送方那台的基础对话
+    /// （基础对话的 id 恰好是设备 ID，所以不需要往 messages.jsonl 里补字段）
+    pub fn sid_of(&self) -> &str {
+        if self.sid.is_empty() {
+            &self.peer
+        } else {
+            &self.sid
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -236,6 +335,61 @@ pub fn fav_depth(nodes: &[FavNode], id: &str) -> usize {
         parent = nodes.iter().find(|n| n.id == p).and_then(|n| n.parent.clone());
     }
     depth
+}
+
+/* --------------------------------------------------------------------------
+ * 界面偏好（prefs.json）
+ * ------------------------------------------------------------------------ */
+
+/// 对比视图的三个偏好项。字段名保持单词 snake_case，与前端读法一致。
+///
+/// 存的是「用户选的默认值」：布局与 1:1 这些是工具栏上的即时开关，
+/// 每次改动顺手落盘，下次启动就是它 —— 所以这里只有三项，不做会话快照。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Preferences {
+    /// 布局："1" 单图浏览 / "2" 两图并排 / "4" 四图 2×2
+    #[serde(default)]
+    pub layout: String,
+    /// 缩放平移是否同步
+    #[serde(default = "default_sync")]
+    pub sync: bool,
+    /// 滚轮行为："zoom" | "pan"
+    #[serde(default = "default_wheel")]
+    pub wheel: String,
+}
+
+fn default_sync() -> bool {
+    true
+}
+
+fn default_wheel() -> String {
+    "zoom".into()
+}
+
+impl Default for Preferences {
+    /// 出厂态就是前端 HTML 里写死的那一份（两图 + 同步开 + 滚轮缩放），
+    /// 两边不一致会让「读到空」与「读到默认」表现出差别，没必要
+    fn default() -> Self {
+        Self {
+            layout: "2".into(),
+            sync: true,
+            wheel: default_wheel(),
+        }
+    }
+}
+
+impl Preferences {
+    /// 脏值一律退回默认，跟 `SessionsFile::normalize` 一个路子：
+    /// 手改坏的 prefs.json 不能让界面进入一个前端不认的布局（那种布局没有 CSS，
+    /// 表现是「四个窗都不显示」，比退回两图难查得多）
+    pub fn normalize(&mut self) {
+        if !matches!(self.layout.as_str(), "1" | "2" | "4") {
+            self.layout = Preferences::default().layout;
+        }
+        if self.wheel != "zoom" && self.wheel != "pan" {
+            self.wheel = default_wheel();
+        }
+    }
 }
 
 /* --------------------------------------------------------------------------
@@ -298,41 +452,46 @@ impl Store {
         )
     }
 
-    /* ---- peers：只绑定一台，数组留作扩展与迁移余地 ---- */
+    /* ---- peers：同时存多台，外加一份解绑名单 ---- */
 
-    pub fn load_peers(&self) -> Option<Peer> {
-        let txt = fs::read_to_string(self.file("peers.json")).ok()?;
-        #[derive(Deserialize)]
-        struct PeersFile {
-            peers: Vec<Peer>,
-        }
-        serde_json::from_str::<PeersFile>(&txt)
-            .ok()
-            .and_then(|f| f.peers.into_iter().next())
+    pub fn load_peers(&self) -> PeersFile {
+        let Ok(txt) = fs::read_to_string(self.file("peers.json")) else {
+            return PeersFile::default();
+        };
+        // 老版本只写一个元素，读进来就是一长度的 Vec，无需任何迁移；
+        // 老版本也没有 ignored 字段，靠 #[serde(default)] 兜住
+        serde_json::from_str::<PeersFile>(&txt).unwrap_or_default()
     }
 
-    pub fn save_peer(&self, peer: &Peer) -> Result<(), String> {
-        #[derive(Serialize)]
-        struct PeersFile<'a> {
-            peers: Vec<&'a Peer>,
-        }
-        let body = PeersFile {
-            peers: vec![peer],
-        };
+    /// 整体回写。所有增删改都走这一条，免得出现「写了新的抹了旧的」
+    pub fn save_peers(&self, f: &PeersFile) -> Result<(), String> {
         atomic_write(
             &self.file("peers.json"),
-            serde_json::to_vec_pretty(&body)
+            serde_json::to_vec_pretty(f)
                 .map_err(|e| format!("序列化对端失败: {e}"))?
                 .as_slice(),
         )
     }
 
-    pub fn clear_peer(&self) -> Result<(), String> {
-        let path = self.file("peers.json");
-        if path.exists() {
-            fs::remove_file(&path).map_err(|e| format!("删除 {} 失败: {e}", path.display()))?;
-        }
-        Ok(())
+    /* ---- sessions：一个对端一个聊天框 ---- */
+
+    /// 没这份文件就回空结构（首启动与旧版本都是这个状态，迁移在 Hub::new 里做）
+    pub fn load_sessions(&self) -> SessionsFile {
+        let mut f = fs::read_to_string(self.file("sessions.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str::<SessionsFile>(&t).ok())
+            .unwrap_or_default();
+        f.normalize();
+        f
+    }
+
+    pub fn save_sessions(&self, f: &SessionsFile) -> Result<(), String> {
+        atomic_write(
+            &self.file("sessions.json"),
+            serde_json::to_vec_pretty(f)
+                .map_err(|e| format!("序列化会话失败: {e}"))?
+                .as_slice(),
+        )
     }
 
     /* ---- messages：JSONL 追加，整读进内存 ---- */
@@ -461,11 +620,223 @@ impl Store {
                 .as_slice(),
         )
     }
+
+    /* ---- prefs：界面偏好，一项一次改动整体回写 ---- */
+
+    /// 没这份文件（首启动、老版本）就回出厂态；解析失败同样回出厂态，
+    /// 不是 Err —— 偏好读不出来不值得把界面初始化挂掉
+    pub fn load_prefs(&self) -> Preferences {
+        let mut p = fs::read_to_string(self.file("prefs.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str::<Preferences>(&t).ok())
+            .unwrap_or_default();
+        p.normalize();
+        p
+    }
+
+    pub fn save_prefs(&self, p: &Preferences) -> Result<(), String> {
+        atomic_write(
+            &self.file("prefs.json"),
+            serde_json::to_vec_pretty(p)
+                .map_err(|e| format!("序列化偏好失败: {e}"))?
+                .as_slice(),
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 每个用例一个独立目录：这几个测试会并行跑，共用一个目录会互相盖掉文件
+    fn 临时存储(名字: &str) -> Store {
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Store::new(std::env::temp_dir().join(format!("imgcmp-{名字}-{}-{n}", std::process::id())))
+    }
+
+    fn 台(id: &str) -> Peer {
+        Peer {
+            id: id.into(),
+            name: id.into(),
+            alias: String::new(),
+            host: "127.0.0.1".into(),
+            port: 45789,
+            online: false,
+            last_seen: 0,
+        }
+    }
+
+    #[test]
+    fn 多台对端写进去都能读回来() {
+        let s = 临时存储("peers");
+        assert!(s.load_peers().peers.is_empty(), "没有文件时回空列表");
+        s.save_peers(&PeersFile {
+            peers: vec![台("a"), 台("b"), 台("c")],
+            ignored: vec![],
+        })
+        .unwrap();
+        assert_eq!(s.load_peers().peers.len(), 3, "磁盘格式本来就是数组，三台都得存住");
+        // 解绑一台是整体回写，不能只写剩下的那一个还弄丢其它
+        let kept: Vec<Peer> = s.load_peers().peers.into_iter().filter(|p| p.id != "b").collect();
+        s.save_peers(&PeersFile { peers: kept, ignored: vec!["b".into()] }).unwrap();
+        let f = s.load_peers();
+        let ids: Vec<String> = f.peers.into_iter().map(|p| p.id).collect();
+        assert_eq!(ids, vec!["a", "c"]);
+        assert_eq!(f.ignored, vec!["b"], "解绑名单得跟着活下来，否则重启后又被自动登记回来");
+        let _ = std::fs::remove_dir_all(&s.dir);
+    }
+
+    #[test]
+    fn 备注名与解绑名单活得过重启() {
+        let s = 临时存储("peers_alias");
+        let mut 甲 = 台("aaa111");
+        甲.name = "Mac".into();
+        甲.alias = "办公室那台".into();
+        s.save_peers(&PeersFile { peers: vec![甲], ignored: vec!["zzz".into()] })
+            .unwrap();
+        let f = s.load_peers();
+        assert_eq!(f.peers[0].alias, "办公室那台", "备注名是用户打的字，不能一重启就没了");
+        assert_eq!(f.peers[0].display_name(), "办公室那台", "有备注时显示名就是备注");
+        assert_eq!(f.ignored, vec!["zzz"]);
+        // 没备注的那台（以及备注只填了空格的）退回对方报的名；再空就露一截设备 ID
+        let mut 乙 = 台("bbb222");
+        乙.name = "Windows-PC".into();
+        assert_eq!(乙.display_name(), "Windows-PC");
+        乙.alias = "   ".into();
+        assert_eq!(乙.display_name(), "Windows-PC", "只填了空白的备注等于没填");
+        乙.name = String::new();
+        assert_eq!(乙.display_name(), "设备 bbb222", "两个都没才露设备 ID，别出现空名字");
+        // 老文件没有 alias 字段：必须照样读得出来，不能整个列表变空
+        std::fs::write(
+            s.file("peers.json"),
+            r#"{"peers":[{"id":"old1","name":"旧机","host":"127.0.0.1","port":45789,"online":true,"last_seen":1}]}"#,
+        )
+        .unwrap();
+        let f = s.load_peers();
+        assert_eq!(f.peers.len(), 1, "老版本写的 peers.json 不能因为多个字段就全丢");
+        assert_eq!(f.peers[0].alias, "", "缺字段就是没备注");
+        assert!(f.ignored.is_empty(), "缺 ignored 就是没人被解绑过");
+        let _ = std::fs::remove_dir_all(&s.dir);
+    }
+
+    #[test]
+    fn 会话表没文件时回空结构且可以往返() {
+        let s = 临时存储("sessions");
+        let f = s.load_sessions();
+        assert!(f.sessions.is_empty() && f.active.is_empty() && f.hidden.is_empty(), "首启动就是这个状态");
+        s.save_sessions(&SessionsFile {
+            sessions: vec![Session {
+                id: "a".into(),
+                peer: "a".into(),
+                name: "甲机".into(),
+                created: 1,
+                read: 2,
+            }],
+            active: "a".into(),
+            hidden: vec!["gone".into()],
+        })
+        .unwrap();
+        let back = s.load_sessions();
+        assert_eq!(back.active, "a");
+        assert_eq!(back.sessions[0].id, "a", "会话主键得存住，不然重启后多个框会并成一个");
+        assert_eq!(back.sessions[0].name, "甲机");
+        assert_eq!(back.sessions[0].read, 2, "读指针丢了就等于未读记录丢了");
+        assert_eq!(back.hidden, vec!["gone".to_string()], "删过的会话得记住，不然重启就补回来");
+        let _ = std::fs::remove_dir_all(&s.dir);
+    }
+
+    #[test]
+    fn 旧版会话文件没id时按对端补上基础对话() {
+        let s = 临时存储("sessions-normalize");
+        std::fs::create_dir_all(&s.dir).unwrap();
+        // 上一版的 sessions.json：一行只有 peer，没有 id；active/hidden 存的是设备 ID
+        std::fs::write(
+            s.file("sessions.json"),
+            br#"{ "sessions": [ { "peer": "a", "name": "jia", "created": 1, "read": 9 } ],
+                 "active": "a", "hidden": ["b"] }"#,
+        )
+        .unwrap();
+        let f = s.load_sessions();
+        assert_eq!(f.sessions[0].id, "a", "基础对话的 id 就是设备 ID，老历史才能归到它");
+        assert_eq!(f.active, "a", "焦点不用改：它本来指向的就是这个 id");
+        assert_eq!(f.hidden, vec!["b".to_string()]);
+        // 手改成空 id 的行会把所有会话混成一个，读进来就该丢掉
+        std::fs::write(
+            s.file("sessions.json"),
+            br#"{ "sessions": [ { "id": "", "peer": "", "name": "", "created": 0, "read": 0 } ],
+                 "active": "", "hidden": [] }"#,
+        )
+        .unwrap();
+        assert!(s.load_sessions().sessions.is_empty(), "未标记不入会话表");
+        let _ = std::fs::remove_dir_all(&s.dir);
+    }
+
+    #[test]
+    fn 没sid的老消息归到那台的基础对话() {
+        let 条 = |sid: &str, peer: &str| Message {
+            id: "m".into(),
+            dir: "in".into(),
+            kind: "text".into(),
+            text: Some("x".into()),
+            name: None,
+            size: None,
+            path: None,
+            state: "sent".into(),
+            ts: 1,
+            peer: peer.into(),
+            sid: sid.into(),
+        };
+        assert_eq!(条("", "a").sid_of(), "a", "上一版没有这个字段，只能归基础对话");
+        assert_eq!(条("u1", "a").sid_of(), "u1", "新话题按带的会话 ID 算");
+        assert_eq!(条("", "").sid_of(), "", "未标记还是未标记");
+        // sid 是后加的字段：不含它的旧 JSONL 行必须能解开来
+        let 老行 = r#"{"id":"m","dir":"in","kind":"text","text":"x","state":"sent","ts":1,"peer":"a"}"#;
+        let m: Message = serde_json::from_str(老行).unwrap();
+        assert_eq!(m.sid_of(), "a", "缺字段不能报错，否则整份历史读不出来");
+    }
+
+    #[test]
+    fn 界面偏好往返与脏值退回默认() {
+        let s = 临时存储("prefs");
+        assert_eq!(
+            s.load_prefs(),
+            Preferences::default(),
+            "没有 prefs.json（首启动与老版本）就是出厂态"
+        );
+
+        s.save_prefs(&Preferences {
+            layout: "1".into(),
+            sync: false,
+            wheel: "pan".into(),
+        })
+        .unwrap();
+        let back = s.load_prefs();
+        assert_eq!(back.layout, "1", "单图布局得活过重启，否则用户每次进来都要重选");
+        assert!(!back.sync);
+        assert_eq!(back.wheel, "pan");
+
+        // 手写的缺字段 JSON：只补缺的那几项，不能把已填的抹掉
+        std::fs::create_dir_all(&s.dir).unwrap();
+        std::fs::write(s.file("prefs.json"), r#"{ "layout": "4" }"#).unwrap();
+        let p = s.load_prefs();
+        assert_eq!(p.layout, "4");
+        assert!(p.sync, "缺 sync 字段应该按出厂态给开");
+        assert_eq!(p.wheel, "zoom");
+
+        // 前端不认的布局与滚轮值：存进去就该被清掉（没有 CSS 的布局会让四个窗都不显示）
+        for bad_layout in ["3", "", "8", "两图"] {
+            std::fs::write(s.file("prefs.json"), format!(r#"{{ "layout": "{bad_layout}" }}"#)).unwrap();
+            assert_eq!(s.load_prefs().layout, "2", "非法布局 {bad_layout:?} 必须退回两图");
+        }
+        std::fs::write(s.file("prefs.json"), r#"{ "wheel": "scroll" }"#).unwrap();
+        assert_eq!(s.load_prefs().wheel, "zoom");
+
+        // 整份被改坏也不能报错，回出厂态（偏好读不出来不值得挂掉界面初始化）
+        std::fs::write(s.file("prefs.json"), "不是 JSON").unwrap();
+        assert_eq!(s.load_prefs(), Preferences::default());
+        let _ = std::fs::remove_dir_all(&s.dir);
+    }
 
     #[test]
     fn 非法相对路径必须被拒() {
@@ -580,6 +951,7 @@ mod tests {
             state: "sent".into(),
             ts: 1,
             peer: String::new(),
+            sid: String::new(),
         };
         s.append_message(&base).unwrap();
         s.append_message(&Message {
@@ -626,6 +998,7 @@ mod tests {
             state: "sending".into(),
             ts: 1,
             peer: String::new(),
+            sid: String::new(),
         };
         s.append_message(&base).unwrap();
         s.append_message(&Message {

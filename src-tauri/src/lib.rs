@@ -10,7 +10,32 @@ mod favorites;
 mod http;
 mod net;
 mod pair;
+mod prefs;
 mod store;
+
+/// 图片扩展名表：对话框过滤、目录浏览、mime 判定三处共用这一份。
+/// 加新格式必须一次改齐（漏一处的表现是「侧栏列得出来、read_image 却回
+/// application/octet-stream」，前端只报「解码失败」，排查成本极高）
+const IMAGE_EXTS: &[&str] = &[
+    "png", "jpg", "jpeg", "webp", "gif", "bmp", "avif", "svg", "tif", "tiff",
+];
+
+/// 浏览列表里一个目录最多列多少张（一个目录上千张图时不指望把列表铺完）
+const FOLDER_MAX_ITEMS: usize = 2000;
+
+fn is_image_ext(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| {
+            // 先看是不是原样就在表里，只在大小写不一致时才去 lower（多数路径不用分配）
+            if IMAGE_EXTS.contains(&e) {
+                return true;
+            }
+            let lower = e.to_ascii_lowercase();
+            IMAGE_EXTS.contains(&lower.as_str())
+        })
+        .unwrap_or(false)
+}
 
 /// 图片文件选择，最多返回 4 个路径，按选择顺序依次填入图窗。
 /// 必须走 Rust：WKWebView 的 input[type=file] 递出的 File 是 0 字节（只能拿到名字/类型），
@@ -21,7 +46,7 @@ async fn pick_images(app: tauri::AppHandle) -> Result<Vec<String>, String> {
     app.dialog()
         .file()
         .set_title("选择要对比的图片（可多选，最多四张）")
-        .add_filter("图片", &["png", "jpg", "jpeg", "webp", "gif", "bmp", "avif"])
+        .add_filter("图片", IMAGE_EXTS)
         .pick_files(move |files| {
             let _ = tx.send(files);
         });
@@ -67,6 +92,68 @@ async fn read_image(path: String) -> Result<ImagePayload, String> {
     })
 }
 
+/// 浏览侧栏里的一项。字段保持 snake_case（与 ImagePayload 同一个口径，
+/// 加过 rename_all 之后前端读不到字段那件事踩过一次）
+#[derive(Debug, serde::Serialize)]
+struct FolderImageItem {
+    path: String,
+    name: String,
+    size: u64,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct FolderImages {
+    dir: String,
+    items: Vec<FolderImageItem>,
+    /// 本层图片比 FOLDER_MAX_ITEMS 还多：前端在列表底部提示「只列出前 N 张」
+    truncated: bool,
+}
+
+/// 列出「这张图所在目录」里的全部图片，给对比视图的浏览侧栏用。
+/// 只看一层、不递归子目录。
+#[tauri::command]
+async fn list_folder_images(path: String) -> Result<FolderImages, String> {
+    folder_images(&PathBuf::from(&path))
+}
+
+/// 真正的活儿拆成同步函数：命令要是 async 的（Tauri 里不阻塞主线程），
+/// 但单测没有 tokio runtime，直接调这个函数就能验
+fn folder_images(file: &std::path::Path) -> Result<FolderImages, String> {
+    let dir = file
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| format!("{} 看不出所在目录", file.display()))?;
+    let entries =
+        std::fs::read_dir(dir).map_err(|e| format!("读目录失败（{}）: {}", dir.display(), e))?;
+    // 排序不在这里做：JS 的 localeCompare(…, { numeric: true }) 天然拿到
+    // IMG_2 < IMG_10 的自然序，Rust 手写数字感知排序只会多一堆代码
+    let mut items: Vec<FolderImageItem> = Vec::new();
+    let mut truncated = false;
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if !p.is_file() || !is_image_ext(&p) {
+            continue; // 子目录与非图片都不进列表
+        }
+        if items.len() >= FOLDER_MAX_ITEMS {
+            truncated = true;
+            break;
+        }
+        items.push(FolderImageItem {
+            name: p
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default(),
+            path: p.to_string_lossy().to_string(),
+            size: p.metadata().map(|m| m.len()).unwrap_or(0),
+        });
+    }
+    Ok(FolderImages {
+        dir: dir.to_string_lossy().to_string(),
+        items,
+        truncated,
+    })
+}
+
 fn mime_of(ext: Option<&str>) -> Option<&'static str> {
     match ext.map(|e| e.to_ascii_lowercase()) {
         Some(x) if x == "png" => Some("image/png"),
@@ -76,6 +163,7 @@ fn mime_of(ext: Option<&str>) -> Option<&'static str> {
         Some(x) if x == "bmp" => Some("image/bmp"),
         Some(x) if x == "avif" => Some("image/avif"),
         Some(x) if x == "svg" => Some("image/svg+xml"),
+        Some(x) if x == "tif" || x == "tiff" => Some("image/tiff"),
         _ => None,
     }
 }
@@ -214,6 +302,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             pick_images,
             read_image,
+            list_folder_images,
             take_pending_paths,
             copy_text,
             clip::paste_paths,
@@ -222,6 +311,12 @@ pub fn run() {
             net::send_text,
             net::send_paths,
             net::msg_history,
+            net::sessions,
+            net::session_create,
+            net::session_new,
+            net::session_rename,
+            net::session_focus,
+            net::session_delete,
             net::reveal_in_folder,
             net::save_path_as,
             net::pick_folder,
@@ -230,11 +325,14 @@ pub fn run() {
             pair::set_pair_config,
             pair::bind_peer_addr,
             pair::unbind_peer,
+            pair::set_peer_alias,
             pair::reprobe_peer,
             favorites::fav_list,
             favorites::fav_upsert,
             favorites::fav_delete,
-            favorites::fav_move
+            favorites::fav_move,
+            prefs::get_prefs,
+            prefs::set_prefs
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
@@ -262,4 +360,56 @@ pub fn run() {
         #[cfg(not(target_os = "macos"))]
         let _ = (&app_handle, &event); // 非 macOS 无 Opened 变体，避免未使用告警
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    // cargo 的用例是并行跑的，光靠 process::id 会撞同一个临时目录
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let p = std::env::temp_dir().join(format!(
+            "imgcmp-{tag}-{nanos}-{}",
+            SEQ.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&p).expect("建临时目录");
+        p
+    }
+
+    #[test]
+    fn 目录浏览只回本层的图片() {
+        let root = temp_dir("folder");
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).expect("建子目录");
+        for name in ["a.png", "b.TXT", "c.TIFF", "d"] {
+            std::fs::write(root.join(name), b"x").expect("建测试文件");
+        }
+        std::fs::write(sub.join("e.jpg"), b"x").expect("建子目录里的图");
+
+        let got = folder_images(&root.join("a.png")).expect("列目录");
+        let mut names: Vec<String> = got.items.iter().map(|i| i.name.clone()).collect();
+        names.sort();
+        assert_eq!(names, ["a.png", "c.TIFF"], "只留图片、且只留本层：{names:?}");
+        assert_eq!(got.dir, root.to_string_lossy().to_string());
+        assert!(!got.truncated);
+        assert!(got.items.iter().all(|i| i.size == 1), "size 要给前端当大小闸门用");
+        // 扩展名判定不看大小写（c.TIFF 进了列表就是这条的反证）
+        assert!(is_image_ext(std::path::Path::new("x.TIFF")));
+        assert!(!is_image_ext(std::path::Path::new("x.txt")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 看不出所在目录时报错而不是铺空列表() {
+        // 没有父目录的相对路径（"a.png"）parent 是 Some("")，不滤掉就会拿空串去 read_dir
+        let err = folder_images(std::path::Path::new("a.png")).unwrap_err();
+        assert!(err.contains("看不出所在目录"), "实际错误：{err}");
+    }
 }

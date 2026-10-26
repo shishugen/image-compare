@@ -1,7 +1,9 @@
 //! 配对与设备管理命令：口令、本机名、手动 IP 兜底、解绑。
 //!
-//! 「只绑定两台」在这里落地：一旦绑定了某个 device_id，再发现第三台就拒绝，
-//! 必须手动解绑才能换。心跳只在没有对端时才自动绑定。
+//! 配对就是把一台设备「登记」进来：同时可以登记多台，每台都是一个独立会话，
+//! 都能主动发。新登记不会顶掉旧的，也不会自动把当前会话抢过去。
+//! 只有口令不一致 / 不是本应用这类确定错才会把候选从列表里去掉。
+//! 用户主动解绑过的那台会进一份名单，后台从此不再替他把它绑回来（见 `unbind_peer`）。
 
 use crate::net::{client, Hub};
 use crate::store::Peer;
@@ -12,12 +14,13 @@ use tauri::State;
 /// 口令太短在这个场景里没有意义（局域网里可被穷举），给个下限
 const MIN_PASSPHRASE: usize = 4;
 
-/// 当前绑定 + 候选列表，前端连接面板用
+/// 已登记的对端 + 当前会话 + 候选列表，前端连接面板用
 #[tauri::command]
 pub fn list_peers(hub: State<'_, Arc<Hub>>) -> Value {
     json!({
-        "peer": hub.peer_snapshot(),
-        "discovered": hub.discovered_snapshot(),
+        "peers": hub.peers_snapshot(),
+        "active": hub.active_snapshot(),
+        "discovered": hub.discovered_json(),
     })
 }
 
@@ -62,6 +65,8 @@ pub fn set_pair_config(
 
 /// 手动配对兜底：填对端 IP（可带端口），端口留空则从默认端口连续试探。
 /// 公司网络/VLAN 常屏蔽 multicast，mDNS 整段失效时这是唯一入口。
+/// 多台共存时这里不拒第三台：按地址 ping，成功就是把这一台登记进来
+/// （bind_peer 按设备 ID 插入，顺手会把会话建好）。
 #[tauri::command]
 pub async fn bind_peer_addr(
     hub: State<'_, Arc<Hub>>,
@@ -70,12 +75,6 @@ pub async fn bind_peer_addr(
     let hub = hub.inner().clone();
     let addr = addr.trim().to_string();
     let (host, port) = split_addr(&addr)?;
-    if let Some(existing) = hub.peer_snapshot() {
-        return Err(format!(
-            "已绑定对端「{}」，请先解绑再连新设备（本应用只支持两台）",
-            existing.name
-        ));
-    }
     tauri::async_runtime::spawn_blocking(move || {
         let ports: Vec<u16> = match port {
             Some(p) => vec![p],
@@ -103,34 +102,49 @@ pub async fn bind_peer_addr(
     .map_err(|e| format!("配对任务被中断: {e}"))?
 }
 
+/// 解绑一台。会话与历史都留着，只失去「主动发给它」的地址；
+/// 同时把它记进解绑名单，否则 mDNS 还在广播、心跳下一拍 ping 得通就又自动登记回来了
 #[tauri::command]
-pub fn unbind_peer(hub: State<'_, Arc<Hub>>) -> Result<Value, String> {
+pub fn unbind_peer(hub: State<'_, Arc<Hub>>, peer: String) -> Result<Value, String> {
     let hub = hub.inner().clone();
-    hub.unbind_peer()?;
+    hub.unbind_peer_id(&peer)?;
     Ok(hub.status_json())
 }
 
-/// 直接把一台已绑定设备的地址标为离线/在线之外，这里只给前端一个「重新探测」的入口
+/// 给一台已登记的对端改备注名（像微信里给好友设的备注）：只影响本机显示，
+/// 不会传给对端。传空串就是清掉备注，退回对方上报的设备名。
+/// 名字只在本机这一侧，所以改完不需要对端在线
 #[tauri::command]
-pub async fn reprobe_peer(hub: State<'_, Arc<Hub>>) -> Result<Value, String> {
+pub fn set_peer_alias(
+    hub: State<'_, Arc<Hub>>,
+    peer: String,
+    alias: String,
+) -> Result<Value, String> {
     let hub = hub.inner().clone();
-    let peer = hub
-        .peer_snapshot()
-        .ok_or_else(|| "还没有绑定对端".to_string())?;
-    tauri::async_runtime::spawn_blocking(move || {
-        match client::ping(&hub, &peer.host, peer.port) {
-            Ok(fresh) => {
-                let p = Peer {
-                    online: true,
-                    ..fresh.clone()
-                };
-                hub.bind_peer(p.clone());
-                Ok(json!({ "peer": p, "online": true }))
-            }
-            Err(e) => {
-                hub.set_peer_online(false);
-                Err(e)
-            }
+    hub.set_peer_alias(&peer, &alias)?;
+    Ok(hub.status_json())
+}
+
+/// 重新探测一台已登记设备的地址。失败只把它标离线，不删：
+/// 离线不等于解绑，否则对端重启一次就要重新配一次
+#[tauri::command]
+pub async fn reprobe_peer(hub: State<'_, Arc<Hub>>, peer: String) -> Result<Value, String> {
+    let hub = hub.inner().clone();
+    let target = hub
+        .peer_by_id(&peer)
+        .ok_or_else(|| "还没有登记这台对端".to_string())?;
+    tauri::async_runtime::spawn_blocking(move || match client::ping(&hub, &target.host, target.port) {
+        Ok(fresh) => {
+            let p = Peer {
+                online: true,
+                ..fresh.clone()
+            };
+            hub.bind_peer(p.clone());
+            Ok(json!({ "peer": p, "online": true }))
+        }
+        Err(e) => {
+            hub.set_peer_online(&target.id, false);
+            Err(e)
         }
     })
     .await

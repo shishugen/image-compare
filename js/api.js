@@ -195,7 +195,7 @@ export async function copyText(text) {
   }
 }
 
-/** 把文字交给传输通道；不要求用户先切到传输视图 */
+/** 把文字交给传输通道：不带 to 参数，后端发给当前会话（不要求先切到传输视图） */
 export async function sendTextToPeer(text) {
   if (!text || !text.trim()) {
     toast("这条内容是空的", "error");
@@ -203,7 +203,7 @@ export async function sendTextToPeer(text) {
   }
   try {
     await invoke("send_text", { text });
-    toast("已发送到对端");
+    toast("已发到当前会话");
     return true;
   } catch (err) {
     toast(errText(err), "error");
@@ -211,12 +211,12 @@ export async function sendTextToPeer(text) {
   }
 }
 
-/** 把文件/文件夹交给传输通道（文件夹由 Rust 侧递归逐文件发送） */
+/** 把文件/文件夹交给传输通道（同上，发给当前会话；文件夹由 Rust 侧递归逐文件发送） */
 export async function sendPathsToPeer(paths) {
   if (!paths || !paths.length) return false;
   try {
     await invoke("send_paths", { paths });
-    toast(`已发送 ${paths.length} 项到对端`);
+    toast(`已发送 ${paths.length} 项到当前会话`);
     return true;
   } catch (err) {
     toast(errText(err), "error");
@@ -358,6 +358,37 @@ export function fmtTime(ms) {
   const sameDay = d.toDateString() === new Date().toDateString();
   const hm = `${p(d.getHours())}:${p(d.getMinutes())}`;
   return sameDay ? hm : `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${hm}`;
+}
+
+const WEEKDAYS = ["星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六"];
+
+/**
+ * 把时间归到「哪一个自然日」。用年月日三元组比对而不是把时间戳相减：
+ * 夏令时那两天一天不是 24 小时，拿 86400000 当一天会让「昨天」算错
+ */
+function dayKey(ms) {
+  const d = new Date(ms);
+  if (Number.isNaN(d.getTime())) return "";
+  return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+}
+
+/**
+ * 相邻两条消息之间要不要插一条日期分隔线。返回 null 表示同一天，不用插。
+ * `prevTs` 是流里它前面那一条的时间；传 null/undefined 表示前面还没有过消息
+ * （首屏第一条、或刚往前补了一页），那时候也得出线，不然整段都没日期可看。
+ * 措辞三档：今天只到月日、昨天只写「昨天」、更早带年份 —— 跟微信一致。
+ */
+export function fmtDayDivider(ts, prevTs) {
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return null;
+  if (prevTs !== null && prevTs !== undefined && dayKey(prevTs) === dayKey(ts)) return null;
+  const md = `${d.getMonth() + 1}月${d.getDate()}日`;
+  const now = new Date();
+  if (dayKey(ts) === dayKey(now.getTime())) return `${md} ${WEEKDAYS[d.getDay()]}`;
+  const y = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  y.setDate(y.getDate() - 1);
+  if (dayKey(ts) === dayKey(y.getTime())) return "昨天";
+  return `${d.getFullYear()}年${md} ${WEEKDAYS[d.getDay()]}`;
 }
 
 /** 输入框里粘贴/输入的路径可能带引号或前导空格 */
