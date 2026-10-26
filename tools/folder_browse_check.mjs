@@ -281,6 +281,8 @@ const SPACE = "/tmp/shot/有 空格&符号"; // 验 asset 地址里的路径转�
 const DELTA = "/tmp/shot/DELTA";
 const EPS = "/tmp/shot/EPS";
 const ZETA = "/tmp/shot/ZETA"; // 第 17 节专用：asset 能转地址但取不到文件
+// 只给「一屏十几行全挂上」那条用：12 张、每张都要真读，把并发上限之外的那些逼进队列
+const QUEUE = "/tmp/shot/QUEUE";
 const img = (name, size) => ({ name, size });
 const sub = (name, kids) => ({ name, dir: true, kids });
 
@@ -335,6 +337,9 @@ const world = {
         img("z4.png", 4000),
         img("z5.png", 5000),
       ],
+    },
+    [QUEUE]: {
+      entries: Array.from({ length: 12 }, (_, i) => img(`q${i + 1}.png`, 1000 + i)),
     },
     [GAMMA]: {
       entries: [
@@ -647,6 +652,26 @@ const thumbSrc = (i) => thumbOf(i)?.querySelector("img")?.src || "";
 const thumbImg = (i) => thumbOf(i)?.querySelector("img") || null;
 /** 这趟一共走了多少次 read_image（asset 那条路应该是 0） */
 const totalReads = () => [...world.reads.values()].reduce((a, b) => a + b, 0);
+/** 假布局：容器 240 高、每行 40，行 rect 按索引排（scrollTop 可动）。
+ *  「可见即挂」除了 IO 还有一条纯几何的兜底，不给真 rect 就没东西可算 */
+function fakeLayout(scrollTop = 0, rowH = 40, viewH = 240) {
+  const list = stripList();
+  list.clientHeight = viewH;
+  list.clientWidth = 190;
+  list.scrollTop = scrollTop;
+  list.getBoundingClientRect = () => ({ left: 0, top: 0, right: 190, bottom: viewH, width: 190, height: viewH });
+  rows().forEach((row, i) => {
+    const top = i * rowH - scrollTop;
+    row.getBoundingClientRect = () => ({ left: 0, top, right: 190, bottom: top + rowH, width: 190, height: rowH });
+  });
+}
+/** 滚一下并等节流（80ms）走完 —— 不发 IO，单看几何那一道路能不能把行补上 */
+async function scrollStrip(top) {
+  fakeLayout(top);
+  stripList().dispatchEvent({ type: "scroll" });
+  await new Promise((r) => setTimeout(r, 120));
+  await settle();
+}
 const ghostName = () => ghost().querySelector(".sg-name").text;
 
 /** 行上第二格（.fs-size）真正显示的那段字：目录源是体积，历史源是相对时间 */
@@ -926,14 +951,26 @@ check(
 check("两次都真读了盘（合并的是显示，不是丢请求）", readCount() === readsHold + 2, `${readsHold} -> ${readCount()}`);
 check("连按最终只动了该动的窗", changedPanes(beforeHold).length >= 1, changedPanes(beforeHold).join(","));
 
-/* ===================== 8) 小图的内存闸门：只解当前项 ±1 ===================== */
+/* ===================== 8) 小图：可见即挂（不再只解当前项 ±1） ===================== */
 since = mark();
 await openViaCmdO([`${GAMMA}/g3_big.png`]); // 换目录 → 行全部重建，小图从零开始
 check("目录源下换目录只重发一次列目录", calls.slice(since).filter(([c]) => c === "list_folder_images").length === 1);
 check("目录源下新目录的行重建了", rowNames().join(",") === "g1.png,g2.png,g3_big.png,g4.png,g5.png,gone.png", rowNames().join(","));
-check("当前项 ±1 自动出小图", hasThumb(1) && hasThumb(3), `${hasThumb(1)},${hasThumb(3)}`);
-check("窗口外的行不读盘（几百张的目录才敢列）", !hasThumb(0) && !hasThumb(4) && !hasThumb(5) && pendingOf(4) === "");
+// IO 说这六行都在视口里：该挂几行就挂几行 —— 老口径只挂当前项 ±1，其余行一直空着
+ioInstances[0].fire(rows().map((r) => ({ target: r, isIntersecting: true })));
+await settle();
+check(
+  "一屏里的行都挂上小图（不再只解当前项 ±1）",
+  [0, 1, 3, 4, 5].every((i) => hasThumb(i)),
+  [0, 1, 2, 3, 4, 5].map((i) => (hasThumb(i) ? 1 : 0)).join("")
+);
+check(
+  "并发上限之外的行排队补上，且每张只读一次盘（直接丢掉就会永远空着）",
+  [0, 1, 3, 4, 5].every((i) => (world.reads.get(rowPaths()[i]) || 0) === 1),
+  [0, 1, 3, 4, 5].map((i) => world.reads.get(rowPaths()[i]) || 0).join(",")
+);
 check("过 4MB 的不自动解，只给「大」字占位", pendingOf(2) === "大" && !hasThumb(2), pendingOf(2));
+check("退路里挂的是 data URL（整图 base64）", thumbSrc(0).startsWith("data:"), thumbSrc(0).slice(0, 22));
 
 const rd2 = world.reads.get(`${GAMMA}/g2.png`) || 0;
 click(rows()[1]); // 点行：这一张才真读一次 IPC
@@ -953,21 +990,53 @@ const rd4 = world.reads.get(`${GAMMA}/g4.png`) || 0;
 click(rows()[2]); // 回到中间那张：窗口里的 g4 该从 LRU 里画出来
 await settle();
 check("摘掉位图再滚回来不重读盘（LRU 命中）", (world.reads.get(`${GAMMA}/g4.png`) || 0) === rd4 && hasThumb(3), `${rd4} -> ${world.reads.get(`${GAMMA}/g4.png`)}`);
+// 当前项是 2，rows[4] 在 ±1 窗口之外：老口径在这儿空着，现在 IO 说可见就该挂
+io.fire([{ target: rows()[4], isIntersecting: false }]);
+check("滚出视口先摘掉第 5 行", !hasThumb(4));
+const rd5 = world.reads.get(`${GAMMA}/g5.png`) || 0;
 io.fire([{ target: rows()[4], isIntersecting: true }]);
 await settle();
-check("窗口外的行就算滚进视口也不自动解", !hasThumb(4) && pendingOf(4) === "");
+check(
+  "IO 说可见就挂回来，不再被 ±1 窗口挡回去",
+  hasThumb(4) && (world.reads.get(`${GAMMA}/g5.png`) || 0) === rd5,
+  `${rd5} -> ${world.reads.get(`${GAMMA}/g5.png`)}`
+);
+
+/* —— 一屏十几行：并发 3 之外的那些必须排队补上（用户那屏就是十几行） —— */
+await openViaCmdO([`${QUEUE}/q6.png`]);
+await settle();
+check("十二行的目录都列出来了", rows().length === 12, String(rows().length));
+ioInstances[0].fire(rows().map((r) => ({ target: r, isIntersecting: true })));
+await settle(60);
+check(
+  "十二行全部挂上：并发 3 之外的行排队补上，不是直接丢掉",
+  rows().every((_, i) => hasThumb(i)),
+  rows().map((_, i) => (hasThumb(i) ? 1 : 0)).join("")
+);
+// 回到第 9 段要的那个目录（上面换了一圈，状态重新取）
+await openViaCmdO([`${GAMMA}/g3_big.png`]);
+await settle();
 
 /* ===================== 9) 读失败：不动对照位、只把行标灰 ===================== */
 const before9 = shot();
 const idx9 = currentIndex();
 world.missing.add(`${GAMMA}/gone.png`);
+const rdGone = world.reads.get(`${GAMMA}/gone.png`) || 0;
 click(rows()[5]);
 await settle();
 check("读失败时状态栏给原因", statusText().startsWith("载入失败"), statusText());
 check("读失败不动任何窗（对照位不被悄悄换掉）", shot().a === before9.a && shot().b === before9.b);
 check("读失败不推进游标", currentIndex() === idx9, `${currentIndex()} vs ${idx9}`);
 check("失败那行标灰", badIndex() === 5, String(badIndex()));
-check("失败那行不解小图", !hasThumb(5) && pendingOf(5) === "");
+// 标灰之后再“滚进视口”也不重来：bad 那一层把请求拦住（可见即挂之后这一条更要紧）
+io.fire([{ target: rows()[5], isIntersecting: false }]);
+io.fire([{ target: rows()[5], isIntersecting: true }]);
+await settle();
+check(
+  "失败那行标灰后不再解小图：bad 把请求拦住，一次也不多读",
+  (world.reads.get(`${GAMMA}/gone.png`) || 0) === rdGone,
+  `${rdGone} -> ${world.reads.get(`${GAMMA}/gone.png`)}`
+);
 const before9b = shot();
 click(rows()[3]);
 await settle();
@@ -1316,22 +1385,23 @@ check(
 fireWin("mouseup", { clientX: 30, clientY: 60 });
 await settle();
 
-/* —— 转不出地址时，老闸门必须还在（那是纯浏览器调试与 convertFileSrc 缺失的退路） —— */
+/* —— 转不出地址时，退路也是「一屏几行挂几行」（纯浏览器调试与 convertFileSrc 缺失时走它） —— */
 world.assetOn = false;
 click(byId("btn-clear"));
 await settle();
-await openViaCmdO([`${EPS}/e2.png`]); // EPS 同样是干净目录：窗口外的行是真没读，不是读的缓存
+await openViaCmdO([`${EPS}/e2.png`]); // EPS 同样是干净目录：这几行是真没读过盘，不是缓存命中
 await settle();
-io.fire(rows().map((r) => ({ target: r, isIntersecting: true })));
-await settle();
+// IO 一次都不 fire：只发一次 scroll，单看几何那一道能不能把屏上的行补齐
+await scrollStrip(0);
 check(
-  "退路里仍是老口径：±1 窗口内的读盘、窗口外的不读、6MB 那只给「大」字",
-  hasThumb(1) && !hasThumb(3) && pendingOf(2) === "大",
-  `1:${hasThumb(1)} 3:${hasThumb(3)} 2占位:${pendingOf(2)}`
+  "IO 一次都没 fire，只靠滚动兜底：一屏里的行也全挂上",
+  [0, 1, 3, 4].every((i) => hasThumb(i)),
+  [0, 1, 2, 3, 4].map((i) => (hasThumb(i) ? 1 : 0)).join("")
 );
+check("退路里过 4MB 的仍只给「大」字", pendingOf(2) === "大", pendingOf(2));
 check("退路里挂的是 data URL（整图 base64）而不是 asset 地址", thumbSrc(1).startsWith("data:"), thumbSrc(1).slice(0, 24));
 
-/* ============ 17) asset 转得出地址但取不到文件（403）：整列退回 read_image，只认一次 ============ */
+/* ============ 17) asset 转得出地址但取不到文件（403）：按路径退回 read_image，只认一次 ============ */
 world.assetOn = true; // 转地址照样成功，只是文件拿不到 —— 这里手动打 error 事件模拟
 key("2");
 click(byId("btn-clear"));
@@ -1368,28 +1438,28 @@ thumbImg(4)?.dispatchEvent({ type: "error", target: thumbImg(4) });
 await settle();
 console.warn = realWarn;
 check(
-  "第二张坏图同样被治好（asset 地址抹掉），但按老闸门不越窗口读盘，这格就空着",
-  !thumbSrc(4).startsWith("asset:") && !hasThumb(4) && pendingOf(4) === "",
-  `src:${thumbSrc(4)} 占位:${pendingOf(4)}`
+  "第二张坏图同样被治好：这一行也拿到 data URL（不再因为窗口外就空着）",
+  thumbSrc(4).startsWith("data:") && hasThumb(4),
+  `src:${thumbSrc(4).slice(0, 22)} 占位:${pendingOf(4)}`
 );
-check("第二张不再重复刷日志", warns2.length === 0, `${warns2.length} 条`);
-check("自愈那一行没多读盘（窗口外不读就是对的）", totalReads() === rd17b, `${rd17b} -> ${totalReads()}`);
+check("坏路径按路径记：第二个路径照样打一条日志", warns2.length === 1, `${warns2.length} 条`);
+check("自愈那一行只多读一次盘", totalReads() === rd17b + 1, `${rd17b} -> ${totalReads()}`);
 
-// 认栽之后新滚进来的行：直接走退路，压根不再试 asset
+// 坏路径只黑名单自己，别的行照旧走 asset
 io.fire([{ target: rows()[2], isIntersecting: false }]);
 io.fire([{ target: rows()[2], isIntersecting: true }]);
 await settle();
 check(
-  "认栽后新挂的行不再试 asset：窗口内的 z3 直接读盘给 data URL",
-  thumbSrc(2).startsWith("data:"),
-  thumbSrc(2).slice(0, 22)
+  "坏的两个路径只黑名单自己：同目录里 z3 照旧挂 asset 地址",
+  thumbSrc(2).startsWith("asset://localhost/"),
+  thumbSrc(2).slice(0, 34)
 );
-// 牌也不该再去拿 asset 地址（z2 刚作为大图读过，LRU 里有）
+// 牌也不受牵连（z2 是好的路径，asset 地址照挂）
 rowDown(rows()[1], 30, 30);
 fireWin("mousemove", { clientX: 30, clientY: 60, buttons: 1 });
 check(
-  "牌上也不挂 asset 地址了：只用退路里那份缓存，没有就只写名字",
-  !String(ghostImg().attributes.src || "").startsWith("asset:"),
+  "牌上照旧挂 asset 地址：坏的是别的行，跟这一张无关",
+  String(ghostImg().attributes.src || "").startsWith("asset://localhost/"),
   JSON.stringify(ghostImg().attributes)
 );
 fireWin("mouseup", { clientX: 30, clientY: 60 });
@@ -1497,14 +1567,19 @@ check("切到目录源不动图窗", changedPanes(shot18).length === 0, changedP
 check("切到目录源拿当前那张去列一次目录", folderCalls().length === fc18b + 1 && rowNames().includes("big.png"), rowNames().join(","));
 check("目录源下头部又写目录名", byId("fs-dir").text === "ALPHA" && byId("fs-count").text === "5 张", `${byId("fs-dir").text}/${byId("fs-count").text}`);
 check("切到目录源不动侧栏的开合（还开着）", strip().hidden === false, `hidden:${strip().hidden}`);
-const rd18c = totalReads();
 await useSource("history");
 // 两个方向都得查：只在前一半查的话，「切源顺手把 open 写掉」会被 ensureFolderList 的自动弹开抹平（变异测试踩过）
 check("切回历史源同样不收起侧栏", strip().hidden === false, `hidden:${strip().hidden}`);
+const firstPath18 = rowPaths()[0];
+const rd18first = world.reads.get(firstPath18) || 0;
 io.fire(rows().map((r) => ({ target: r, isIntersecting: true })));
 await settle();
 check("切回历史源不重发列目录", folderCalls().length === fc18b + 1);
-check("切源不清 thumbCache：同一张不回盘重读", totalReads() === rd18c && hasThumb(0), `${rd18c} -> ${totalReads()}`);
+check(
+  "切源不清 thumbCache：同一张不回盘重读",
+  (world.reads.get(firstPath18) || 0) === rd18first && hasThumb(0),
+  `${rd18first} -> ${world.reads.get(firstPath18)}`
+);
 check("切回历史源不重发 get_history（本地那份够用）", calls.filter(([c]) => c === "get_history").length === 1);
 
 /* —— 失效行：标灰、不动落窗不推游标，但绝不从历史里被抹掉 —— */

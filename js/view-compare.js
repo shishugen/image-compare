@@ -589,12 +589,12 @@ ui.picker.addEventListener("change", () => {
  * 文件的地址（assetSrc()），一个字节也不往 JS 里搬，±1 窗口、体积闸门、LRU 三道全部不参与，
  * 只剩「滚进视口才挂」这一道（IntersectionObserver 负责，滚出去就把位图摘掉）。
  * 下面那几个 STRIP_* 只服务于退路：纯浏览器里调试（没有 convertFileSrc）或转地址失败时，
- * 只能走 read_image 拿整图 base64（上限 80MB），那时才需要闸门：只给「当前项
- * ±STRIP_DECODE_WINDOW」与滚进视口的行申请，超过 STRIP_AUTO_MAX 的不自动解，拿 LRU 卡总量。
- * Rust 侧始终出不了真缩略图（刻意不带 image 依赖，Cargo.toml 里连 arboard 都关了默认特性）。
+ * 只能走 read_image 拿整图 base64（上限 80MB）。退路同样「滚进视口就挂」——只解当前项
+ * ±1 的话一屏里除那三行以外全是空位（2026-10-26 用户看到的就是这个），所以窗口只剩
+ * 「连 IO 都没有时」这一层兜底，另有体积、LRU、并发三道上限。
  * ------------------------------------------------------------------------ */
-const STRIP_DECODE_WINDOW = 1; // 退路里的窗口：当前项前后各解几张（1 → 最多 3 张在解码）
-const STRIP_LRU_MAX = 8; // 退路里内存最多留几张整图 data URL
+const STRIP_DECODE_WINDOW = 1; // 兜底窗口：连 IntersectionObserver 都没有时才只解当前项 ±1
+const STRIP_LRU_MAX = 40; // 退路里内存最多留几张整图 data URL：一屏 13~17 行，留够一屏 + 缓冲
 const STRIP_AUTO_MAX = 4 * 1024 * 1024; // 体积闸门：与传输视图的 PREVIEW_AUTO_MAX 同口径
 const STRIP_INFLIGHT_MAX = 3; // 同时发出去的 read_image 封顶
 const STRIP_DIR_MAX = 2000; // 与 Rust 的 FOLDER_MAX_ITEMS 对齐，后端截断时说明一声
@@ -605,23 +605,23 @@ const HISTORY_MAX = 100;
 /** 侧栏两个列表源的 id（setStripSource 只认这两个值） */
 const STRIP_SOURCES = ["history", "dir"];
 
-/** asset 这条路是不是在这台机器上走不通：只要有一张 403/404 就当成系统性的（scope 没覆盖到它、
- *  或 Windows 那边 canonicalize 后的路径与 glob 对不上），整列直接退回 read_image。
- *  只认一次、不退回去反复撞墙：否则每滚一回视口就多一次失败请求 + 一行日志 */
-let assetDead = false;
+/** asset 这条路取不到文件的**那几个路径**（403/404、文件刚被取走、Windows 那边 canonicalize
+ *  后的路径与 glob 对不上）。只记这一张、不牵连整列：一张坏图不该让同目录另外几十行全掉进慢路。
+ *  记过的路径不再重试：否则每滚一回视口就多一次失败请求 + 一行日志 */
+const assetBad = new Set();
 
-/** 取 asset 地址，但先看 assetDead 脸色（assetSrc 自己不管这个） */
+/** 取 asset 地址，但先看 assetBad 的脸色（assetSrc 自己不管这个） */
 function assetFor(path) {
-  return assetDead ? null : assetSrc(path);
+  return assetBad.has(path) ? null : assetSrc(path);
 }
 
-/** 某个 asset 地址取不到文件：从此不再试这条路，并把这一行交给退路重画一次。
- *  这一行无论如何都要重画：每张图的 error 是各自报上来的，只治第一张会把其余那几张留在破图上 */
+/** 某个 asset 地址取不到文件：把这个路径记进黑名单，并让这一行走退路重画一次。
+ *  只治这一行 —— 每张图的 error 是各自报上来的，一张坏图不该牵连同目录的其它行 */
 function thumbAssetFailed(i, row) {
-  const first = !assetDead;
-  assetDead = true;
-  if (first) {
-    console.warn("[asset] 这个 asset 地址取不到文件，侧栏整列退回 read_image（多半是 tauri.conf.json 的 assetProtocol.scope 没覆盖到它）");
+  const path = (row && row.dataset && row.dataset.path) || (browse.items[i] && browse.items[i].path);
+  if (path && !assetBad.has(path)) {
+    assetBad.add(path);
+    console.warn("[asset] 这个地址取不到文件，这一行退回 read_image（其余行照旧走 asset）:", path);
   }
   dropThumb(row); // 不先把破图摘了，ensureThumb 开头那句「已经有 img 就返」会直接退回去
   ensureThumb(i, false);
@@ -647,6 +647,8 @@ const browse = {
 /** path -> 整图 data URL。拿 Map 的插入顺序当 LRU：命中就重新插到末尾 */
 const thumbCache = new Map();
 let thumbInflight = 0;
+// 并发满了先排在这儿：可见即挂之后一屏十几行同时申请，直接丢掉会让超出的那几行一直空着
+const thumbQueue = [];
 let stripRows = []; // 与 browse.items 一一对应，只在列表换了时重建
 let stripFocused = false;
 
@@ -942,6 +944,7 @@ function buildStrip() {
   // 旧行先从观察名单里摘干净：换目录时旧节点已被拆掉，但 IO 还强引用着它们，
   // 一个目录接一个目录地翻就会越积越多
   if (stripIO) stripIO.disconnect();
+  thumbQueue.length = 0; // 换目录后旧索引没有意义
   list.textContent = "";
   for (let i = 0; i < browse.items.length; i++) {
     const it = browse.items[i];
@@ -1135,7 +1138,8 @@ window.addEventListener("mouseup", () => {
   stripDrag.index = -1;
 });
 
-/** 该行在不在「当前项附近」这个自动窗口里（窗口外一律不主动读盘）。
+/** 该行在不在「当前项附近」这个兜底窗口里 —— 只给「连 IntersectionObserver 都没有」
+ *  的环境用；有 IO 时该挂哪些行由可见性说了算（见 requestNearThumbs）。
  *  体积闸门不在这里判：过大的要给「大」字占位，见 ensureThumb */
 function inDecodeWindow(i) {
   return browse.idx >= 0 && !!browse.items[i] && Math.abs(i - browse.idx) <= STRIP_DECODE_WINDOW;
@@ -1180,16 +1184,14 @@ function rememberThumb(path, dataUrl) {
   if (!path || !dataUrl) return;
   thumbCache.delete(path);
   thumbCache.set(path, dataUrl);
-  while (thumbCache.size > STRIP_LRU_MAX) {
-    const oldest = thumbCache.keys().next().value;
-    if (oldest === path) break;
-    thumbCache.delete(oldest);
-    const row = stripRows.find((r) => r.dataset.path === oldest);
-    if (row) dropThumb(row);
-  }
+  // 淘汰只清缓存、不碰 DOM：屏上已经画出来的行不该因为缓存满了被摘成空格
+  //（原来这里连带 dropThumb，一屏超过 LRU 上限时前面几行会被自己挤掉，看到的还是空位）。
+  // 真正的摘图交给 IO：滚出视口才 dropThumb。
+  while (thumbCache.size > STRIP_LRU_MAX) thumbCache.delete(thumbCache.keys().next().value);
 }
 
-/** force=true 是用户主动点行/载入大图后补的，不受窗口与体积闸门限制 */
+/** 谁调谁负责「该不该加载」：IO 只对滚进视口的行调、requestNearThumbs 只对当前项附近
+ *  与可见行调。force=true 是用户主动点行/载入大图后补的，连体积闸门也不看 */
 async function ensureThumb(i, force) {
   const row = stripRows[i];
   const it = browse.items[i];
@@ -1209,15 +1211,18 @@ async function ensureThumb(i, force) {
     paintThumb(row, cached);
     return;
   }
-  if (!force && !inDecodeWindow(i)) return;
-  if (!force) {
+  // 不在这里拿 ±1 窗口拦一道：滚进视口就该挂，拦在这一层等于只挂当前项那三行
+  if (!force && Number(it.size) > STRIP_AUTO_MAX) {
     // 大图不自动解：整图 base64 太吃内存，给个「大」字占位，点行才真读一次
-    if (Number(it.size) > STRIP_AUTO_MAX) {
-      setThumbPlaceholder(row, "大");
-      return;
-    }
+    setThumbPlaceholder(row, "大");
+    return;
   }
-  if (thumbInflight >= STRIP_INFLIGHT_MAX) return;
+  if (thumbInflight >= STRIP_INFLIGHT_MAX) {
+    // 排进队列等位置，不能直接 return：一屏十几行里超出的那些会永远空着
+    setThumbPlaceholder(row, "…");
+    if (!thumbQueue.includes(i)) thumbQueue.push(i);
+    return;
+  }
   thumbInflight++;
   setThumbPlaceholder(row, "…");
   try {
@@ -1234,24 +1239,54 @@ async function ensureThumb(i, force) {
     markStrip();
   } finally {
     thumbInflight--;
+    // 空出位置就把排队的那几行接上（ensureThumb 同步走到第一个 await 前会先占住计数）
+    while (thumbInflight < STRIP_INFLIGHT_MAX && thumbQueue.length) {
+      const next = thumbQueue.shift();
+      const nextRow = stripRows[next];
+      const nextBox = nextRow && nextRow.querySelector ? nextRow.querySelector(".fs-thumb") : null;
+      if (!nextBox || nextBox.querySelector("img")) continue; // 行没了或已经有图
+      ensureThumb(next, false);
+    }
   }
 }
 
-/** 没得 IntersectionObserver（或自检桩里没这个 API）时，靠这个窗口兼一下 */
-function requestNearThumbs() {
-  if (stripIO) {
-    // IO 只管滚进滚出，当前项附近的这几张无论如何先保证
-    for (let i = browse.idx - STRIP_DECODE_WINDOW; i <= browse.idx + STRIP_DECODE_WINDOW; i++) {
-      if (i >= 0) ensureThumb(i, false);
-    }
-    return;
+/** 行容器里此刻真正可见的那几行（纯几何算，不依赖 IO）。
+ *  IO 被节流、漏发或压根没触发时靠它把「屏上该有图的行」补齐 —— 用户反馈的
+ *  「只有当前项旁边两张有图」就是那个局面：IO 那条路没到、±1 窗口又把其余行挡回去 */
+function visibleRowRange() {
+  const list = ui.stripList;
+  if (!list || !stripRows.length) return [];
+  if (typeof list.getBoundingClientRect !== "function") return []; // 假 DOM 桩：没有布局
+  const box = list.getBoundingClientRect();
+  if (!box || !Number.isFinite(box.top) || !Number.isFinite(box.bottom)) return [];
+  // 容器收着（侧栏隐藏）时所有 rect 都是 0，全都算「可见」就一次性把整目录读一遍
+  if (!(box.bottom > box.top)) return [];
+  const out = [];
+  for (let i = 0; i < stripRows.length; i++) {
+    const row = stripRows[i];
+    if (!row || typeof row.getBoundingClientRect !== "function") return [];
+    const r = row.getBoundingClientRect();
+    if (!(r.bottom > r.top)) continue; // 还没布局的行不参与
+    // 上下各留一行余量：滚动时下一张先备好
+    if (r.bottom >= box.top - 56 && r.top <= box.bottom + 56) out.push(i);
   }
+  return out;
+}
+
+/** 把该挂小图的行都挂上：当前项 ±1 先发，随后是此刻可见的整段。
+ *  没得 IntersectionObserver（或自检桩里没这个 API）时才退回「当前项附近」那个窗口 */
+function requestNearThumbs() {
+  for (let i = browse.idx - STRIP_DECODE_WINDOW; i <= browse.idx + STRIP_DECODE_WINDOW; i++) {
+    if (i >= 0) ensureThumb(i, false);
+  }
+  const visible = visibleRowRange();
+  for (const i of visible) ensureThumb(i, false);
+  if (stripIO) return;
+  const keep = new Set(visible);
   for (let i = 0; i < browse.items.length; i++) {
-    if (inDecodeWindow(i)) ensureThumb(i, false);
-    else {
-      const row = stripRows[i];
-      if (row && !thumbCache.get(browse.items[i].path)) dropThumb(row);
-    }
+    if (keep.has(i) || inDecodeWindow(i)) continue;
+    const row = stripRows[i];
+    if (row && !thumbCache.get(browse.items[i].path)) dropThumb(row);
   }
 }
 
@@ -1266,9 +1301,20 @@ const stripIO =
             else dropThumb(en.target);
           }
         },
-        { root: ui.stripList, rootMargin: "80px" }
+        // 上下各多要 200px：滚动时下一屏先备好，别等行露头才开始读盘
+        { root: ui.stripList, rootMargin: "200px" }
       )
     : null;
+
+// IO 之外的第二道：滚动时按几何补一次（节流 80ms）。IO 正常时这些调用会被
+// 「已经有 img 就返」挡掉、不额外花代价；IO 失灵时就靠它把屏上的行补齐
+let stripScrollTimer = 0;
+if (ui.stripList && ui.stripList.addEventListener) {
+  ui.stripList.addEventListener("scroll", () => {
+    clearTimeout(stripScrollTimer);
+    stripScrollTimer = setTimeout(requestNearThumbs, 80);
+  });
+}
 
 /** 浏览到列表里第 index 张：2/4 图下落窗严格交替，单图下永远换 A；失败不推进游标 */
 async function browseTo(index) {

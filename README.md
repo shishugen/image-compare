@@ -101,7 +101,7 @@ mac-image-compare/
 │   │                       视图状态、拖拽与粘贴的路由（drop + 悬停 + ⌘V）、toast
 │   ├── view-compare.js     对比视图：图窗、同步缩放平移、键盘（含 ⌘C 复制图片）、原生拖拽落点判定、
 │   │                       浏览侧栏（两个源可切：默认「最近看过」/「当前文件夹」；小图首选 asset 地址，取不到文件或转不出地址就退回
-│   │                       整图 base64 + 当前项 ±1 闸门）
+│   │                       整图 base64，屏上看得见几行就挂几行）
 │   │                       与按可见窗序列轮转落窗、
 │   │                       把某一行拖到指定那个窗（指针自绘，不用 HTML5 draggable）、
 │   │                       三档布局（1/2/4 图，`LAYOUT_KEYS` 是「哪些窗可见」的唯一口径）、
@@ -161,7 +161,7 @@ mac-image-compare/
 │   ├── folder_browse_check.mjs 浏览侧栏的纯逻辑自检（拿真 api.js/view-compare.js + 假 DOM 跑：
 │   │                       默认源就是「最近看过」与切源那一大组（不重发 IPC、不清小图缓存、不动图窗与开合）、
 │   │                       目录源下列表只含本层图片、按可见窗序列轮转落窗（两图下就是严格交替）、
-│   │                       把某一行拖到指定那个窗、小图的两套口径（asset 整列挂图 / 退路只解 ±1）、
+│   │                       把某一行拖到指定那个窗、小图「可见即挂」（asset 直挂 / 退路排队补上）、
 │   │                       逐张浏览也记历史（两个源下都写盘、历史源不重排、正看着那张早退不重复写），
 │   │                       与 asset 取不到文件时的退回与只认一次，见第八节）
 │   ├── prefs_layout_check.mjs 三档布局与系统设置的纯逻辑自检（拿真 api.js/view-compare.js + 假 DOM 跑：
@@ -226,8 +226,8 @@ cd src-tauri && RUSTUP_TOOLCHAIN=stable-aarch64-apple-darwin cargo test --lib   
 node tools/zoom_math_check.js                                                   # 对比视图零回归（5 项）
 node tools/paste_route_check.mjs                                                # 粘贴分流：什么时候该抢、抢来交给谁（10 项）
 node tools/session_route_check.mjs                                              # 会话路由：同一台多框、未读、分页游标不串、离线排队、放大层缩放平移与田字平铺、「传输」按钮角标、本机接收抽屉、会话栏一行的排布与时间格式（187 项）
-node tools/folder_browse_check.mjs                                              # 浏览侧栏：默认源就是最近看过、切源那一大组、目录源下的列表口径与按可见窗轮转落窗（两图/四图）、拖行到指定窗、小图两套口径、逐张浏览记历史且不重排（205 项）
-node tools/prefs_layout_check.mjs                                               # 三档布局与系统设置：联动、存盘、单图浏览、CSS/HTML/tauri.conf.json/Rust 侧合约（含定宽列会不会被长内容撑破的通用扫描、窄栏里那一行谁都不许偷偷占宽、田字查看铺四份的几何与「每份画整张图」），含本机接收那一段与提示音、图标管线、查看历史（189 项）
+node tools/folder_browse_check.mjs                                              # 浏览侧栏：默认源就是最近看过、切源那一大组、目录源下的列表口径与按可见窗轮转落窗（两图/四图）、拖行到指定窗、小图可见即挂（IO + 滚动兜底 + 并发排队 + 坏路径只黑名单自己）、逐张浏览记历史且不重排（210 项）
+node tools/prefs_layout_check.mjs                                               # 三档布局与系统设置：联动、存盘、单图浏览、CSS/HTML/tauri.conf.json/Rust 侧合约（含定宽列会不会被长内容撑破的通用扫描、窄栏里那一行谁都不许偷偷占宽、田字查看铺四份的几何与「每份画整张图」、小图可见即挂的四条静态合约），含本机接收那一段与提示音、图标管线、查看历史（194 项）
 cd tools/win-check && CARGO_TARGET_DIR=../../src-tauri/target cargo check --target x86_64-pc-windows-msvc --lib   # Windows 那半在 mac 上过类型检查（见第七节第 8 条）
 node tools/net_selftest.mjs                                                     # 端到端协议自检
 ```
@@ -967,6 +967,26 @@ kill %1; rm -rf "$SB"
     的话底下的 `1`/`2`/`4` 会同时生效（按一个 `1` 两层一起动）；关掉时把 canvas 尺寸归零，那份
     `2w × 2h` 的位图是几十 MB。
 
+45. **侧栏小图：屏上看得见几行就挂几行**（2026-10-26 修）。用户当时看到的是「除了点中那一张和它
+    上下各一张，其余全是空位」。根因是退路里 `ensureThumb()` 被 `inDecodeWindow()` 拦成「当前项
+    ±1」—— IO 说可见也没用，因为那道闸在 IO 之后。现在**谁调谁负责该不该加载**：IO 只对滚进视口
+    的行调、`requestNearThumbs()` 只对当前项附近与可见行调，`ensureThumb()` 里只剩体积闸门。
+    四条跟着改的：
+    ① **并发满了排队，不许丢**：一屏十几行、`STRIP_INFLIGHT_MAX = 3`，超出的进 `thumbQueue`，在
+    `finally` 里接上（原来是直接 `return`，那几行会一直空着；12 行的用例专门钉这条）；
+    ② **LRU 淘汰只清缓存、不摘屏**：原来连带 `dropThumb`，一屏超过上限时前面几行会被自己挤成
+    空格；`STRIP_LRU_MAX` 8 → 40（够一屏 13~17 行 + 缓冲）；
+    ③ **滚动兜底**：`visibleRowRange()` 用 `getBoundingClientRect` 纯几何算可见行，`scroll` 上还挂了
+    一道 80ms 节流的补挂。容器收着（侧栏隐藏）时所有 rect 都是 0，必须靠 `box.bottom > box.top`
+    挡掉，否则「全都可见」会一次把整目录读一遍；
+    ④ **asset 失败按路径记**：`assetDead`（一张坏图整列退回 IPC）换成 `assetBad`（`Set`，只黑名单
+    那一个路径），同目录其它行照旧直挂 `asset://`。
+    证据：`folder_browse_check` 新增「一屏里的行都挂上」「12 行并发排队补上」「IO 说可见就挂回来」
+    「IO 一次不 fire、只靠滚动兜底也全挂」「坏路径只黑名单自己」；四个变异各只红对应那条（把窗口
+    闸门加回来 → 「一屏里的行都挂上」红成 `010100`；并发不排队 → 12 行那条红成 `111011100000`）。
+    注意「淘汰摘屏」这条只有静态合约守得住：一屏最多十几行，`STRIP_LRU_MAX = 40` 在行为上到不了，
+    是防御性修复。
+
 ---
 
 ## 八、对比视图：浏览侧栏（两个源 + 前后两张同时在屏上）
@@ -1057,11 +1077,10 @@ kill %1; rm -rf "$SB"
 **「对齐」靠的是已有的同步模式**，浏览这一层没有新发明：`Pane.setImage()` 里新载入的窗会沿用参照窗的
 `scale/x/y`，所以前后两张自动停在同一区域，翻着翻着不会越看越歪。
 
-### 侧栏小图怎么来的：先试 `asset://`，试不到才走整图 base64
+### 侧栏小图怎么来的：屏上看得见几行就挂几行
 
 **只要 `convertFileSrc()` 拿得到地址，行上的小图就是直接指本地文件**（`api.js` 的 `assetSrc()`）：缩放与解码全部
-交给 WebView，不过 JS 的手。所以**视口里有多少行就挂多少图**（只看 `IntersectionObserver` 这一道：滚进来才挂、
-滚出去就摘位图），一个字节也不往 IPC 上搬；`read_image` 解不了的 svg/avif 也能显示了。地址形如
+交给 WebView，不过 JS 的手，一个字节也不往 IPC 上搬；`read_image` 解不了的 svg/avif 也能显示了。地址形如
 `asset://localhost/<百分号转义后的路径>`（Windows/Android 上是 `http://asset.localhost/...`），所以路径里的中文与空格
 全靠转义，那一条在 `folder_browse_check` 里有专门用例。
 
@@ -1086,25 +1105,31 @@ kill %1; rm -rf "$SB"
 不过要说清：`**` 命中 Windows 那些路径只是按「匹配任意多段」推出来的，**本机无法跑真 Windows 验证**，
 所以下面那道 `onerror` 兜底是必需品而不是可选项。
 
-**拿得到地址不等于取得到文件**：scope 没覆盖、文件刚被取走、上面那个 Windows 路径问题，`convertFileSrc()` 都是
-正常返地址、只是那张图 `onerror`。所以 asset 图一律挂 `onerror`：抹掉破图、改走 `read_image`，并把
-`assetDead` 置上 —— 从此整列不再试 asset（只认一次；否则每滚一回视口就多一次失败请求 + 一行日志）。
-已经挂上去的其他行各自报自己的 error、各自自愈；自愈走的是退路那套闸门，**不会顺手把 ±1 与 4MB 两道拆了**。
+**屏上看得见几行就挂几行**（2026-10-26 定稿，第七节 #45 有这次的经过）：`IntersectionObserver` 负责
+「滚进来就挂、滚出去就摘位图」；另外 `visibleRowRange()` 用 `getBoundingClientRect` 纯几何算一遍可见行、
+`scroll` 上挂了 80ms 节流的 `requestNearThumbs()` 补挂 —— IO 漏发或被节流时也不至于让某一屏一直空着。
+容器收着（侧栏隐藏）时所有 rect 都是 0，所以那函数先看 `box.bottom > box.top`，不然「全都可见」会一次把
+整目录读一遍。
 
-**退路仍完整保留**：在纯浏览器里调试（没有 `convertFileSrc`）或转地址失败时，还是得用 `read_image` 拿整图
-base64（上限 80MB）—— 那时一个目录几百张绝不可能一次全读，三道闸门就重新上场（常数集中在
-`view-compare.js` 的 `STRIP_*`，要调就改那一块）：
+**拿得到地址不等于取得到文件**：scope 没覆盖、文件刚被取走、上面那个 Windows 路径问题，`convertFileSrc()` 都是
+正常返地址、只是那张图 `onerror`。所以 asset 图一律挂 `onerror`：抹掉破图、改走 `read_image`，并把这个**路径**
+记进 `assetBad`（`Set`）—— 此后只有这一行不再试 asset，同目录其它行照旧直挂；同一路径只认一次，不会每滚
+一回视口就多一次失败请求 + 一行日志（原来是 `assetDead`，一张坏图就让整列掉进慢路，几百张目录会变成
+几百次 IPC）。
+
+**退路也照样「可见即挂」**：纯浏览器里调试（没有 `convertFileSrc`）或转地址失败时，用 `read_image` 拿整图
+base64（上限 80MB）。常数集中在 `view-compare.js` 的 `STRIP_*`，要调就改那一块：
 
 | 闸门 | 值 | 意思（**仅退路**） |
 |---|---|---|
-| `STRIP_DECODE_WINDOW` | 1 | 只自动解**当前项 ±1**（≤ 3 张）；滚进来的行只要在窗口外也不去读盘 |
-| `STRIP_AUTO_MAX` | 4MB | 与传输视图 `PREVIEW_AUTO_MAX` 同口径：过大的不自动解，行上只给一个「大」字占位，要让这一行显示出来（点行 / ↑↓ 选中 / `[`/`]`）才走一次 IPC |
-| `STRIP_LRU_MAX` | 8 | 内存里最多留 8 张整图 data URL（拿 `Map` 的插入顺序当 LRU：命中就重插到末尾，最老那张连同它画出来的位图一起丢） |
-| `STRIP_INFLIGHT_MAX` | 3 | 同时发出去的 `read_image` 封顶 |
+| `STRIP_DECODE_WINDOW` | 1 | 只给「连 `IntersectionObserver` 都没有」的环境兜底：那时只解当前项 ±1 |
+| `STRIP_AUTO_MAX` | 4MB | 与传输视图 `PREVIEW_AUTO_MAX` 同口径：过大的不自动解，行上给一个「大」字占位，要让这一行显示出来（点行 / ↑↓ 选中 / `[`/`]`）才走一次 IPC |
+| `STRIP_LRU_MAX` | 40 | 内存里最多留 40 张整图 data URL：一屏 13~17 行要装得下（8 张那个旧值会让滚回来的行重新读盘）。**淘汰只清缓存、不摘屏上的图** |
+| `STRIP_INFLIGHT_MAX` | 3 | 同时发出去的 `read_image` 封顶；超出的进 `thumbQueue`、在 `finally` 里接上 —— 直接丢会让一屏里靠后的那几行永远空着 |
 
 两个顺手省盘的细节（都只在退路里有意义）：`browseTo()` 载入大图成功后会把那份 data URL **塞进 LRU**，
 所以点一行只读一次盘，不会大图小图各读一遍；换目录时 `buildStrip()` 先 `stripIO.disconnect()` 再重建行，
-否则换过几个目录后观察名单会把已被拆掉的旧节点一直强引用着。
+并把 `thumbQueue` 清空（旧索引没有意义），否则换过几个目录后观察名单会把已被拆掉的旧节点一直强引用着。
 
 Rust 侧始终出不了真缩略图（刻意不带 `image` 依赖，`Cargo.toml` 里连 arboard 都关了默认特性）；
 真要服务端生成的 128px 缩略图 + 磁盘缓存，得先把这条依赖口径改掉，那是另一个决定。

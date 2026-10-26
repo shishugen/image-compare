@@ -1028,39 +1028,75 @@ check(
   apiJs.includes("export function assetSrc") ? "函数体已核" : "函数都没了"
 );
 check(
-  "ensureThumb 里 asset 分支排在 LRU 与±1 窗口闸门之前（排在后面就又被窗口拦回三行）",
+  "ensureThumb 不再拿 ±1 窗口拦路：IO 说滚进视口就挂，只剩体积闸门（拦在那一层就是只有三行有图）",
   (() => {
     const from = cmpJs.indexOf("async function ensureThumb");
     const to = cmpJs.indexOf("function requestNearThumbs");
     if (from < 0 || to <= from) return false;
     const body = cmpJs.slice(from, to);
-    // 取地址走 assetFor()（它才会看 assetDead 脸色），直连 assetSrc() 等于把「认栽」那一层跨了
-    const a = body.indexOf("assetFor(");
-    const b = body.indexOf("thumbCache.get(");
-    const c = body.indexOf("inDecodeWindow(");
-    return a >= 0 && a < b && b < c && body.indexOf("assetSrc(") < 0;
+    return !body.includes("inDecodeWindow(") && body.includes("STRIP_AUTO_MAX");
   })(),
+  "ensureThumb 里不该再出现 inDecodeWindow"
+);
+check(
+  "ensureThumb 里 asset 分支仍排在 LRU 之前（取地址走 assetFor，它才看黑名单脸色）",
   (() => {
     const body = cmpJs.slice(cmpJs.indexOf("async function ensureThumb"), cmpJs.indexOf("function requestNearThumbs"));
-    return `assetFor:${body.indexOf("assetFor(")} LRU:${body.indexOf("thumbCache.get(")} 窗口:${body.indexOf("inDecodeWindow(")}`;
-  })()
+    const a = body.indexOf("assetFor(");
+    const b = body.indexOf("thumbCache.get(");
+    return a >= 0 && a < b && body.indexOf("assetSrc(") < 0;
+  })(),
+  "assetFor 必须排在 thumbCache.get 之前"
+);
+check(
+  "并发满了排队而不是丢掉，换目录清队列（直接丢会让超出的那几行永远空着）",
+  cmpJs.includes("const thumbQueue = [];") &&
+    /thumbInflight >= STRIP_INFLIGHT_MAX\)\s*\{[\s\S]{0,200}?thumbQueue\.push\(i\)/.test(cmpJs) &&
+    /thumbQueue\.shift\(\)/.test(cmpJs) &&
+    /thumbQueue\.length = 0;/.test(cmpJs)
+);
+check(
+  "滚动兜底：可见范围按几何算、scroll 上有节流补挂（IO 漏发也不至于一直空着）",
+  cmpJs.includes("function visibleRowRange()") &&
+    cmpJs.includes("getBoundingClientRect") &&
+    /function requestNearThumbs[\s\S]{0,600}?visibleRowRange\(\)/.test(cmpJs) &&
+    /addEventListener\("scroll"[\s\S]{0,200}?requestNearThumbs/.test(cmpJs)
+);
+check(
+  "侧栏收着（容器高 0）时不能把整目录都算成可见：那会一次性读几百张",
+  /box\.bottom > box\.top/.test(cmpJs)
 );
 check(
   "退路没被拆：read_image 与三道闸门常量都还在（纯浏览器调试与转地址失败时走它）",
   cmpJs.includes('invoke("read_image"') &&
     cmpJs.includes("STRIP_DECODE_WINDOW") &&
     cmpJs.includes("STRIP_AUTO_MAX") &&
-    cmpJs.includes("STRIP_LRU_MAX")
+    cmpJs.includes("STRIP_LRU_MAX") &&
+    // 一屏十几行都挂图，缓存至少要装得下一屏：8 张那个旧值会让滚回来的行重新读盘
+    Number((cmpJs.match(/const STRIP_LRU_MAX = (\d+);/) || [])[1]) >= 20
 );
 /* asset 地址拿得到、但文件取不到（scope 未覆盖 / Windows 上 canonicalize 后的路径与 glob 对不上）
    时 assetSrc() 不会回 null，单靠「回 null 才退路」会留一列破图 */
 check(
-  "asset 图必须挂 onerror 退回 read_image，且只认一次（assetDead）",
-  cmpJs.includes("addEventListener(\"error\", onErr)") &&
-    cmpJs.includes("let assetDead = false;") &&
-    /function assetFor\([\s\S]{0,120}?assetDead[\s\S]{0,60}?assetSrc\(/.test(cmpJs) &&
-    /function thumbAssetFailed[\s\S]{0,400}?dropThumb\(row\);[\s\S]{0,120}?ensureThumb\(i, false\);/.test(cmpJs)
+  "asset 图必须挂 onerror 退回 read_image，且坏路径只黑名单自己（一张坏图不牵连整列）",
+  cmpJs.includes('addEventListener("error", onErr)') &&
+    cmpJs.includes("const assetBad = new Set();") &&
+    /function assetFor\([\s\S]{0,120}?assetBad\.has\(path\)[\s\S]{0,60}?assetSrc\(/.test(cmpJs) &&
+    /function thumbAssetFailed[\s\S]{0,500}?assetBad\.add\(path\)[\s\S]{0,200}?dropThumb\(row\);[\s\S]{0,120}?ensureThumb\(i, false\);/.test(cmpJs) &&
+    !cmpJs.includes("assetDead")
 );
+check(
+  "LRU 淘汰只清缓存、不摘屏上的图（一屏超过上限时前面几行会被自己挤成空格）",
+  (() => {
+    const from = cmpJs.indexOf("function rememberThumb");
+    const to = cmpJs.indexOf("async function ensureThumb");
+    if (from < 0 || to <= from) return false;
+    const body = cmpJs.slice(from, to);
+    return !body.includes("dropThumb(") && /while \(thumbCache\.size > STRIP_LRU_MAX\)/.test(body);
+  })(),
+  "rememberThumb 里不该再出现 dropThumb"
+);
+
 
 /* ------------------------------ 未读角标（三处显示） ------------------------------
    角标这套拆在四个文件里：CSS 给形、HTML 给节点、Rust 给图标上那颗、JS 给按钮上那个。
