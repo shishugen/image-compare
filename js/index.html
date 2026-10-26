@@ -51,6 +51,7 @@
               <div class="tb-group">
                 <button id="btn-fit" class="btn" title="两图同时适应窗口（0 / F）">适应窗口</button>
                 <button id="btn-actual" class="btn" title="恢复原始像素（1）">1:1</button>
+                <button id="btn-tile" class="btn" disabled title="田字查看（T）：把这一张图原样铺成 2×2，十字那两条就是接缝 —— 看这张图能不能和自己无缝接上；1:1 看最准">田字</button>
               </div>
 
               <div class="tb-sep"></div>
@@ -455,6 +456,23 @@
     <div class="strip-ghost" id="strip-ghost" hidden>
       <img alt="" />
       <span class="sg-name"></span>
+    </div>
+
+    <!-- 田字查看（对比视图）：把当前这一张图原样铺成 2×2，十字那两条就是接缝。
+         四份画进**同一张 canvas** 再整体变换，而不是四个 <img> 摆 2×2 —— 后者在非整数倍
+         缩放下会被浏览器画出亚像素亮缝（README 第 29 条），那条缝是渲染凭空造的，
+         而这里要判的恰恰是「有没有缝」，用四个 img 就是拿一个会造假缝的工具去验缝 -->
+    <div class="tileview" id="cmp-tileview" hidden>
+      <button class="lb-close" id="tv-close" title="关闭（Esc）">×</button>
+      <div class="lb-tools" id="tv-tools">
+        <button class="btn btn-icon" id="tv-out" title="缩小（-）">−</button>
+        <span class="lb-zoom" id="tv-zoom">100%</span>
+        <button class="btn btn-icon" id="tv-in" title="放大（+）">+</button>
+        <button class="btn lb-txt" id="tv-fit" title="适应窗口（0）">适应</button>
+        <button class="btn lb-txt" id="tv-one" title="原始像素 1:1（1），看接缝最准">1:1</button>
+      </div>
+      <canvas class="tv-canvas" id="tv-canvas"></canvas>
+      <div class="lb-cap" id="tv-cap"></div>
     </div>
 
     <!-- 聊天缩略图点开的放大层：复用同一份 data URL，不再走一次磁盘读取。

@@ -1004,6 +1004,13 @@ textarea.input {
 .session-list {
   position: relative;
   flex: 0 0 214px;
+  /* 定宽列必须配 min-width:0：flex 项目默认 min-width:auto，下限是内容的 min-content，
+     而会话预览里那种长文件名（`BJL261026010_E1082CAD…B6.jpg`）是一个不可断的整体，
+     会把这一列从 214px 撑到 367px（headless Chrome 实测），里面那行 ellipsis 反而永不生效。
+     两个实测事实：只需在容器这一层加（加在 .session-rows 上是冗余）；
+     同样写法的 .tree（收藏那棵 232px）却不撑，因为它自身带 overflow:auto ——
+     auto 最小尺寸只对该元素 overflow 为 visible 时生效 */
+  min-width: 0;
   display: flex;
   flex-direction: column;
   min-height: 0;
@@ -1028,9 +1035,10 @@ textarea.input {
 }
 
 .session-row {
+  position: relative; /* 「改名/删除」浮层的定位基准，见下面 .s-acts */
   display: flex;
   align-items: flex-start;
-  gap: 8px;
+  gap: 6px; /* 214px 的窄栏里每省 1px 就是一个字的三分之一 */
   padding: 8px 10px;
   border-bottom: 1px solid var(--border);
   cursor: pointer;
@@ -1059,6 +1067,7 @@ textarea.input {
   align-items: baseline;
   justify-content: space-between;
   gap: 6px;
+  /* 这一行现在只装名字：时间与操作都去了第二行与 hover 浮层，名字拿到整行宽 */
 }
 
 .s-top b {
@@ -1076,6 +1085,15 @@ textarea.input {
 }
 
 .s-sub {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  /* 裁切交给里面的 .s-prev：这层现在是容器，自己再带 ellipsis 会把时间一起裁掉 */
+}
+
+.s-prev {
+  flex: 1 1 auto;
+  min-width: 0;
   font-size: 11px;
   color: var(--text-dim);
   overflow: hidden;
@@ -1096,12 +1114,22 @@ textarea.input {
 }
 
 .s-acts {
-  flex: 0 0 auto;
-  /* 一行只放「改名」与「删除」两个：会话栏只有 214px，按钮再多名字就没了 */
+  /* 绝对定位，不占行里的空间：以前它只靠 opacity:0 藏着，可照样吃 50px，
+     而名字一共才剩 60px —— 看不见的东西把名字挤掉了一半。现在平时根本不参与布局，
+     hover 才浮在右下角顶掉时间与预览尾部（那两处都是次要信息，名字才是） */
+  position: absolute;
+  right: 10px;
+  bottom: 6px;
   display: grid;
   grid-template-columns: auto auto;
   gap: 0 6px;
+  padding: 0 3px;
+  border-radius: 4px;
+  /* 与 hover 时的行底色一致，不垫一层会跟底下的预览文字叠成一团糊 */
+  background: var(--bg);
   opacity: 0;
+  /* 不写 visibility 的话 opacity:0 仍能被点中（一个看不见的按钮接走一次点击） */
+  visibility: hidden;
 }
 
 .s-acts .link-btn {
@@ -1110,6 +1138,7 @@ textarea.input {
 
 .session-row:hover .s-acts {
   opacity: 1;
+  visibility: visible;
 }
 
 /* 行内改名：直接顶掉那一行的名字，不弹系统对话框（webview 里 prompt 不一定能用） */
@@ -1830,6 +1859,38 @@ textarea,
   font-size: 18px;
   line-height: 1;
   cursor: pointer;
+}
+
+/* ==========================================================================
+ * 田字查看（对比视图）：一张图原样铺成 2×2，十字处就是接缝。
+ * 控件条 / 关闭键 / 说明行直接复用 .lb-tools / .lb-close / .lb-cap，
+ * 那几个类本来就不依赖 .lightbox 祖先，再写一套只会两处漂移。
+ * ========================================================================== */
+.tileview {
+  position: fixed;
+  inset: 0;
+  /* 与放大层同档但分属两个视图，不会同时出现；比抽屉(5)高就够 */
+  z-index: 880;
+  background: #08090c;
+  /* 放大后超出屏幕的部分裁掉，别把窗口撑出滚动条 */
+  overflow: hidden;
+  cursor: grab;
+}
+
+.tileview.is-dragging {
+  cursor: grabbing;
+  /* 拖着看接缝时顺手选中画布，光标会变成文本选择那套 */
+  user-select: none;
+}
+
+/* 画布就是拼好的那张位图：左上原点 + transform，与 .layer 同一套口径 —— 变换只改
+   视觉不改布局盒，所以「适应那一档」只需在打开与改窗口时量一次 */
+.tv-canvas {
+  position: absolute;
+  top: 0;
+  left: 0;
+  transform-origin: 0 0;
+  will-change: transform;
 }
 
 /* pointer-events: none 是必须的——遮罩一旦吃掉鼠标事件，Tauri 的原生拖拽就收不到 drop 了 */

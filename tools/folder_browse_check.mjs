@@ -508,7 +508,7 @@ window.__TAURI__ = {
 const tmp = join(os.tmpdir(), `folder-browse-check-${crypto.randomBytes(6).toString("hex")}`);
 mkdirSync(tmp, { recursive: true });
 writeFileSync(join(tmp, "package.json"), JSON.stringify({ type: "module" }));
-for (const f of ["api.js", "view-compare.js"]) copyFileSync(join(here, "..", "js", f), join(tmp, f));
+for (const f of ["api.js", "view-compare.js", "tile.js"]) copyFileSync(join(here, "..", "js", f), join(tmp, f));
 await import(join(tmp, "view-compare.js"));
 
 /* ------------------------------- 小工具 ------------------------------- */

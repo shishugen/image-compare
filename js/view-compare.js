@@ -29,6 +29,8 @@ import {
   setStatus,
   toast,
 } from "./api.js";
+// 田字查看的落点单独一个文件：它只有数学（不碰 DOM），自检能直接 import 真实现
+import { tilePlacements } from "./tile.js";
 
 const MIN_SCALE = 0.25;
 const MAX_SCALE = 8;
@@ -36,6 +38,12 @@ const PAN_STEP = 40;
 
 const ui = {
   stage: el("stage"),
+  // 田字查看（把这一张图原样铺成 2×2，看十字处的接缝）
+  btnTile: el("btn-tile"),
+  tvRoot: el("cmp-tileview"),
+  tvCanvas: el("tv-canvas"),
+  tvZoom: el("tv-zoom"),
+  tvCap: el("tv-cap"),
   splitter: el("splitter"),
   zoomSlider: el("zoom-slider"),
   zoomLabel: el("zoom-label"),
@@ -129,6 +137,7 @@ class Pane {
       this.fit(false);
     }
     refreshStatus();
+    tvRefreshBtn();
   }
 
   clear() {
@@ -140,6 +149,7 @@ class Pane {
     this.root.classList.remove("has-image");
     this.apply();
     refreshStatus();
+    tvRefreshBtn();
   }
 
   /** 适应本窗（broadcast=false 时不通知另一个窗） */
@@ -1843,6 +1853,212 @@ function copyTargets() {
   return [...new Set(pool.map((p) => p.meta?.path).filter(Boolean))];
 }
 
+/* ------------------------------------------------------------------------
+ * 田字查看：把当前这一张图**原样铺成 2×2**（四份一模一样的），看十字那两条接缝
+ *
+ * 注意不是「切成四块再拼回」——那得到的只是原图本身，屏上什么变化都没有。要看的是这张图
+ * 能不能像壁纸那样和自己接上：右边紧挨另一份的左边、下边紧挨另一份的上边。
+ *
+ * 为什么不用 4 个 <img> 摆成 2×2：非整数倍缩放下浏览器会在格子之间画出亚像素亮缝
+ * （README 第 29 条已经为这件事踩过坑），那是渲染凭空造的，而这里要判的恰恰是「有没有缝」——
+ * 拿一个会造假缝的画法去验缝，结论必然是错的。所以四份画进**同一张 canvas**
+ * （落点由 tile.js 的 tilePlacements 算，都是整像素），视觉缩放全部交给这张画布的 transform：
+ * 画布内相邻两次绘制之间没有半像素透明缝，看得见的缝才是真缝。
+ * ---------------------------------------------------------------------- */
+const tv = { open: false, st: { scale: 1, x: 0, y: 0 }, w: 0, h: 0, drag: null };
+
+/** 切的是「当前活动窗」那张图（与 ⌘C 取同一窗）；那一窗没图就没得切 */
+const tvPane = () => (activePane && activePane.loaded ? activePane : null);
+
+/** 按钮能不能按随「这一窗有没有图」变：载入/清空时都会走到这里 */
+function tvRefreshBtn() {
+  if (ui.btnTile) ui.btnTile.disabled = !tvPane();
+}
+
+/** 四份画进同一张画布，画布尺寸 = 2×2 张图。CSS 尺寸也按像素写死——像素级对照不靠
+ *  「缩放正好是整数倍」这种运气 */
+function tvPaint(pane) {
+  const c = ui.tvCanvas;
+  const { w, h } = pane.natural || {};
+  if (!c || !w || !h) return false;
+  // 空数组 = 边长不足 1 像素（见 tile.js），老老实实拒绝
+  const spots = tilePlacements(w, h);
+  if (!spots.length) return false;
+  c.width = w * 2;
+  c.height = h * 2;
+  // canvas 是替换元素：不写 CSS 尺寸就会被当成按 width/height 属性值拉伸
+  c.style.width = `${w * 2}px`;
+  c.style.height = `${h * 2}px`;
+  const g = c.getContext && c.getContext("2d");
+  if (!g) return false;
+  g.clearRect(0, 0, w * 2, h * 2);
+  // 源矩形就是整张图（不切）：四份一模一样，每份都按原尺寸落在自己的象限
+  for (const p of spots) {
+    g.drawImage(pane.img, 0, 0, w, h, p.dx, p.dy, w, h);
+  }
+  tv.w = w * 2;
+  tv.h = h * 2;
+  return true;
+}
+
+function tvApply() {
+  const { scale, x, y } = tv.st;
+  if (ui.tvCanvas && ui.tvCanvas.style) {
+    ui.tvCanvas.style.transform = `translate(${x}px, ${y}px) scale(${scale})`;
+  }
+  if (ui.tvZoom) ui.tvZoom.textContent = `${Math.round(tv.st.scale * 100)}%`;
+}
+
+/** 适应窗口：与图窗那套同一口径（min(窗/图) 再收进 25%~800%） */
+function tvFit() {
+  const vw = window.innerWidth || 0;
+  const vh = window.innerHeight || 0;
+  if (!vw || !vh || !tv.w || !tv.h) return;
+  const scale = clamp(Math.min(vw / tv.w, vh / tv.h), MIN_SCALE, MAX_SCALE);
+  tv.st = {
+    scale,
+    x: Math.round((vw - tv.w * scale) / 2),
+    y: Math.round((vh - tv.h * scale) / 2),
+  };
+  tvApply();
+}
+
+function tvActual() {
+  const vw = window.innerWidth || 0;
+  const vh = window.innerHeight || 0;
+  if (!tv.w || !tv.h) return;
+  tv.st = { scale: 1, x: Math.round((vw - tv.w) / 2), y: Math.round((vh - tv.h) / 2) };
+  tvApply();
+}
+
+/** 拼好那张的中心，换算成视口坐标下的锚点（与放大层的 lbCenter 同一套口径） */
+const tvCenter = () => ({
+  x: tv.st.x + (tv.w * tv.st.scale) / 2,
+  y: tv.st.y + (tv.h * tv.st.scale) / 2,
+});
+
+function tvZoom(factor, anchor) {
+  // 锚点公式与图窗共用一个 applyZoom：缩放时指针下的那一点图像内容不动
+  applyZoom(tv.st, factor, anchor || tvCenter());
+  tvApply();
+}
+
+function tvShow(pane) {
+  tv.open = true;
+  if (ui.tvRoot) {
+    ui.tvRoot.hidden = false;
+    ui.tvRoot.classList.remove("is-dragging");
+  }
+  if (ui.tvCap) {
+    const n = (pane.meta && pane.meta.name) || "";
+    ui.tvCap.textContent = `${n} · 同一张图铺 4 份（${tv.w}×${tv.h}）· 十字处两条就是接缝 · 1:1 看最准`;
+  }
+  tvFit();
+}
+
+function tvOpen() {
+  const pane = tvPane();
+  if (!pane) {
+    toast("这一窗还没有图，没有可切的", "error");
+    return;
+  }
+  const start = () => {
+    if (!tvPaint(pane)) {
+      toast("这张图的尺寸异常，铺不了田字", "error");
+      return;
+    }
+    tvShow(pane);
+  };
+  const img = pane.img;
+  // 图还没解码完时 drawImage 会画出一片空白且不报错：等 decode() 回来再画
+  if (img && img.complete === false && typeof img.decode === "function") {
+    img.decode().then(start).catch(start);
+  } else {
+    start();
+  }
+}
+
+function tvClose() {
+  if (!tv.open) return;
+  tv.open = false;
+  tv.drag = null;
+  tv.st = { scale: 1, x: 0, y: 0 };
+  if (ui.tvRoot) {
+    ui.tvRoot.hidden = true;
+    ui.tvRoot.classList.remove("is-dragging");
+  }
+  if (ui.tvCanvas) {
+    // 尺寸归零：拼好的那份位图可能几十 MB，关掉就别留着
+    ui.tvCanvas.width = 0;
+    ui.tvCanvas.height = 0;
+    if (ui.tvCanvas.style) ui.tvCanvas.style.transform = "";
+  }
+  tv.w = 0;
+  tv.h = 0;
+}
+
+if (ui.btnTile) ui.btnTile.addEventListener("click", () => (tv.open ? tvClose() : tvOpen()));
+for (const [id, fn] of [
+  ["tv-close", tvClose],
+  ["tv-fit", tvFit],
+  ["tv-one", tvActual],
+  ["tv-in", () => tvZoom(1.25)],
+  ["tv-out", () => tvZoom(0.8)],
+]) {
+  const b = el(id);
+  if (b) b.addEventListener("click", fn);
+}
+
+if (ui.tvRoot) {
+  // 滚轮以指针为锚：放大看接缝时，想盯的那一格不会被挪出视野
+  ui.tvRoot.addEventListener(
+    "wheel",
+    (ev) => {
+      if (!tv.open) return;
+      ev.preventDefault();
+      tvZoom(ev.deltaY < 0 ? 1.1 : 1 / 1.1, { x: ev.clientX || 0, y: ev.clientY || 0 });
+    },
+    { passive: false }
+  );
+
+  ui.tvRoot.addEventListener("pointerdown", (ev) => {
+    if (!tv.open || ev.button !== 0) return;
+    // 按在控件条与关闭键上不算拖图
+    const t = ev.target;
+    if (t && t.closest && t.closest(".lb-tools, .lb-close")) return;
+    tv.drag = { x: ev.clientX, y: ev.clientY };
+    if (ui.tvRoot.setPointerCapture && ev.pointerId !== undefined) {
+      ui.tvRoot.setPointerCapture(ev.pointerId);
+    }
+    ui.tvRoot.classList.add("is-dragging");
+  });
+
+  ui.tvRoot.addEventListener("pointermove", (ev) => {
+    if (!tv.drag) return;
+    tv.st.x += ev.clientX - tv.drag.x;
+    tv.st.y += ev.clientY - tv.drag.y;
+    tv.drag = { x: ev.clientX, y: ev.clientY };
+    tvApply();
+  });
+
+  const tvEndDrag = () => {
+    if (!tv.drag) return;
+    tv.drag = null;
+    ui.tvRoot.classList.remove("is-dragging");
+  };
+  ui.tvRoot.addEventListener("pointerup", tvEndDrag);
+  ui.tvRoot.addEventListener("pointercancel", tvEndDrag);
+
+  // 双击 = 适应 ↔ 100%（与图窗、放大层同一个手势口径）
+  ui.tvRoot.addEventListener("dblclick", () => {
+    if (!tv.open) return;
+    if (tv.st.scale >= 1) tvFit();
+    else tvActual();
+  });
+}
+
+tvRefreshBtn();
+
 window.addEventListener("keydown", (ev) => {
   if (currentView() !== "compare") return;
   // 拖到一半按 Esc：这趟作废就到此为止，不能再让同一个 Esc 去收侧栏 / 关抽屉（拦在
@@ -1858,6 +2074,37 @@ window.addEventListener("keydown", (ev) => {
 
   const meta = ev.metaKey || ev.ctrlKey;
   const key = ev.key.toLowerCase();
+
+  // 田字查看是覆盖层，比侧栏/抽屉都高：开着时它的键先接，其余一律不落到下面的
+  // 对比视图快捷键（否则一个 1 会同时把底下的图窗改成 1:1）
+  if (tv.open) {
+    if (key === "escape" || key === "t") {
+      ev.preventDefault();
+      tvClose();
+      return;
+    }
+    if (key === "0" || key === "f") {
+      ev.preventDefault();
+      tvFit();
+      return;
+    }
+    if (key === "1") {
+      ev.preventDefault();
+      tvActual();
+      return;
+    }
+    if (key === "+" || key === "=") {
+      ev.preventDefault();
+      tvZoom(1.25);
+      return;
+    }
+    if (key === "-") {
+      ev.preventDefault();
+      tvZoom(0.8);
+      return;
+    }
+    return;
+  }
 
   if (meta && key === "o") {
     ev.preventDefault();
@@ -1913,6 +2160,11 @@ window.addEventListener("keydown", (ev) => {
     case "1":
       ev.preventDefault();
       el("btn-actual").click();
+      break;
+    case "t":
+      // 田字查看：把这一张图铺成 2×2，看十字处两条接缝是否接得上
+      ev.preventDefault();
+      if (tvPane()) tvOpen();
       break;
     case "2":
       ev.preventDefault();

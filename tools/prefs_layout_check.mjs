@@ -398,8 +398,10 @@ window.__TAURI__ = {
 const tmp = join(os.tmpdir(), `prefs-layout-check-${crypto.randomBytes(6).toString("hex")}`);
 mkdirSync(tmp, { recursive: true });
 writeFileSync(join(tmp, "package.json"), JSON.stringify({ type: "module" }));
-for (const f of ["api.js", "view-compare.js"]) copyFileSync(join(here, "..", "js", f), join(tmp, f));
+for (const f of ["api.js", "view-compare.js", "tile.js"]) copyFileSync(join(here, "..", "js", f), join(tmp, f));
 await import(join(tmp, "view-compare.js"));
+// 田字查看的落点算法：直接 import 真实现来数几何（它不碰 DOM，不需要桩）
+const { tilePlacements } = await import(join(tmp, "tile.js"));
 
 /* ------------------------------- 小工具 ------------------------------- */
 const flush = () => new Promise((r) => setTimeout(r, 0));
@@ -910,6 +912,50 @@ check(
   /body\.is-strip-drag \{[^}]*user-select: none;/.test(css) &&
     cmpJs.includes('classList.add("is-strip-drag")')
 );
+// 扫之前先剥注释：否则注释里写的 min-width / overflow 字样会被当成“已防护”而假通过
+const cssBare = css.replace(/\/\*[\s\S]*?\*\//g, "");
+check(
+  "每个 flex:0 0 <N>px 的定宽列都防住了「内容把列撑破」：块里要么写 min-width:0，要么自身带 overflow，要么写了显式 width（拿 headless Chrome 实测过：会话栏那 214px 被一条长文件名撑到 367px，里面那行 ellipsis 全程没生效）",
+  (() => {
+    // 白名单：窄条与图位，量过不会撑（.splitter 6px 把手与 .nav 48px 图标条里没有长文本）
+    const ALLOW = [".splitter", ".nav"];
+    const bad = [];
+    for (const m of cssBare.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+      const sel = m[1].trim().replace(/\s+/g, " ");
+      const body = m[2];
+      if (!/flex:\s*0\s+0\s+\d+px/.test(body)) continue;
+      if (
+        /min-width:\s*0/.test(body) ||
+        /overflow(-x)?:\s*(auto|hidden|scroll)/.test(body) ||
+        /(^|[^-])width:\s*\d+px/.test(body) ||
+        ALLOW.some((a) => sel.includes(a))
+      )
+        continue;
+      bad.push(sel);
+    }
+    if (bad.length) console.log("    未防护的定宽列:", bad.join(" | "));
+    return bad.length === 0;
+  })()
+);
+check(
+  "会话栏那 214px 确实带了 min-width:0（上面那个 bug 的直接回归位；只需加在容器这一层，加在 .session-rows 上是冗余）",
+  /\.session-list \{[^}]*flex: 0 0 214px;[^}]*min-width: 0;/.test(cssBare)
+);
+check(
+  "「改名/删除」不再吃行里的宽度：绝对定位浮在右下角，行自己带 position:relative 当基准（漏了基准它会相对整个列表定位，所有行的按钮堆到列表右下角）",
+  /\.session-row \{[^}]*position: relative;/.test(cssBare) &&
+    /\.s-acts \{[^}]*position: absolute;/.test(cssBare) &&
+    !/\.s-acts \{[^}]*flex: 0 0 auto;/.test(cssBare)
+);
+check(
+  "操作按钮平时 visibility:hidden：只写 opacity:0 的话一个看不见的按钮照样能接走一次点击，hover 才放回 visible",
+  /\.s-acts \{[^}]*visibility: hidden;/.test(cssBare) &&
+    /\.session-row:hover \.s-acts \{[^}]*visibility: visible;/.test(cssBare)
+);
+check(
+  "第二行预览自己带 min-width:0 + ellipsis：.s-sub 改成 flex 容器后，裁切只能靠它（时间还得留在行内）",
+  /\.s-prev \{[^}]*min-width: 0;[^}]*text-overflow: ellipsis;/.test(cssBare)
+);
 check(
   "行→窗这段走指针事件，不碰 HTML5 的 draggable/dataTransfer（dragDropEnabled 开着，那条通道只认从 Finder 递进来的路径）",
   (() => {
@@ -1346,5 +1392,114 @@ check(
 );
 
 /* -------------------------------------------------------------------------- */
+/* ==========================================================================
+ * 田字查看：把一张图原样铺成 2×2（四份一样的），验十字那两条接缝
+ *
+ * 几何用真函数数（覆盖计数那组：四份落点必须把 2w×2h 盖满、每像素恰好一次），画法用静态
+ * 合约钉住「四份进同一张 canvas、每份画的是整张图」—— 桩里没有 2D 上下文，画不出来。
+ * 真渲染下的等价性另用 headless Chrome 探针证过：617×411（奇数）走「canvas → PNG →
+ * <img> → 4 份 drawImage」，四个象限各自与原图逐像素零差异；对照组（把图切成 1/4 再铺）
+ * 是几千个像素的差异 —— 对照组能红，说明那个探针不是恒真的。
+ * ========================================================================== */
+/** 画布上每个像素恰好被覆盖一次才算对：少了就是一条真缝，多了是把同一处画了两遍 */
+function onceCovered(boxes, w, h) {
+  const cnt = new Uint8Array(w * h);
+  for (const b of boxes) {
+    if (b.w <= 0 || b.h <= 0) return "有零宽/零高的块";
+    for (let y = b.y; y < b.y + b.h; y++) {
+      if (y < 0 || y >= h) return `越出画面 y=${y}`;
+      for (let x = b.x; x < b.x + b.w; x++) {
+        if (x < 0 || x >= w) return `越出画面 x=${x}`;
+        const i = y * w + x;
+        if (cnt[i]++) return `重叠在 (${x},${y})`;
+      }
+    }
+  }
+  for (let i = 0; i < cnt.length; i++) if (cnt[i] !== 1) return `漏了 (${i % w},${(i / w) | 0})`;
+  return "";
+}
+
+const TV_SIZES = [[600, 400], [617, 411], [1, 1], [2, 2], [3, 3], [17, 400], [1, 400], [999, 777]];
+const tvBad = [];
+for (const [w, h] of TV_SIZES) {
+  const spots = tilePlacements(w, h);
+  if (spots.length !== 4) {
+    tvBad.push(`${w}×${h} 不是 4 份`);
+    continue;
+  }
+  // 每份都按原尺寸落在自己的象限：四份合起来正好把 2w×2h 盖满，十字处边贴边、不重不漏
+  const err = onceCovered(spots.map((p) => ({ x: p.dx, y: p.dy, w, h })), w * 2, h * 2);
+  if (err) tvBad.push(`${w}×${h} ${err}`);
+  const want = [[0, 0], [w, 0], [0, h], [w, h]];
+  spots.forEach((p, i) => {
+    if (p.dx !== want[i][0] || p.dy !== want[i][1]) {
+      tvBad.push(`${w}×${h} 第 ${i + 1} 份落在 (${p.dx},${p.dy})，应是 (${want[i][0]},${want[i][1]})`);
+    }
+  });
+}
+check(
+  "铺 4 份正好填满 2w×2h：每份落在自己的象限（左上/右上/左下/右下）、按原尺寸、互不重叠，十字处边贴边",
+  tvBad.length === 0,
+  tvBad.join(" | ")
+);
+check(
+  "边长不足 1 像素时返回空数组而不是瞎画：drawImage 的源宽高传 0 是浏览器差异区（有的当空操作、有的抛错）",
+  tilePlacements(0, 0).length === 0 &&
+    tilePlacements(undefined, 400).length === 0 &&
+    tilePlacements(-5, 10).length === 0 &&
+    tilePlacements(1, 1).length === 4
+);
+check(
+  "四份画的是**整张图**（源矩形 0,0,w,h）、画布是 2w×2h：切成四块再拼回等于原图本身，屏上什么变化都没有，也就无从看接缝 —— 这正是第一版做反的地方",
+  /g\.drawImage\(pane\.img, 0, 0, w, h, p\.dx, p\.dy, w, h\)/.test(cmpJs) &&
+    /c\.width = w \* 2;/.test(cmpJs) &&
+    /c\.height = h \* 2;/.test(cmpJs)
+);
+
+const tvHtml = (() => {
+  const a = html.indexOf('id="cmp-tileview"');
+  const b = html.indexOf("<!-- 聊天缩略图点开的放大层", a);
+  return a < 0 || b < 0 ? "" : html.slice(a, b);
+})();
+check(
+  "覆盖层里只有一张 canvas，没有 4 个 <img> 摆 2×2：非整数倍缩放下浏览器会在格子间画亚像素亮缝（第 29 条），拿会造假缝的画法去验缝必然出错",
+  tvHtml !== "" && tvHtml.includes('id="tv-canvas"') && !/<img\b/.test(tvHtml),
+  tvHtml ? tvHtml.slice(0, 100) : "没找到 #cmp-tileview"
+);
+
+const setImgBody = cmpJs.slice(cmpJs.indexOf("async setImage("), cmpJs.indexOf("  clear() {"));
+const clearBody = cmpJs.slice(cmpJs.indexOf("  clear() {"), cmpJs.indexOf("/** 适应本窗"));
+check(
+  "「田字」按钮出厂是灰的（没图就没得切），载入与清空各刷新一次 —— 漏掉载入那次它就永远灰着，这功能等于没接上",
+  /id="btn-tile"[^>]*disabled/.test(html) &&
+    setImgBody.includes("tvRefreshBtn()") &&
+    clearBody.includes("tvRefreshBtn()"),
+  `setImage=${setImgBody.includes("tvRefreshBtn()")} clear=${clearBody.includes("tvRefreshBtn()")}`
+);
+
+check(
+  "缩放与图窗共用 applyZoom + 同一档 25%~800%：两处口径分家的话，同一个滚轮手势在两边放大的幅度不一样",
+  /function tvZoom\(factor, anchor\) \{[\s\S]{0,220}?applyZoom\(tv\.st, factor/.test(cmpJs) &&
+    /function tvFit\(\) \{[\s\S]{0,300}?clamp\(Math\.min\(vw \/ tv\.w, vh \/ tv\.h\), MIN_SCALE, MAX_SCALE\)/.test(cmpJs)
+);
+
+const tvKeyAt = cmpJs.indexOf("  if (tv.open) {");
+const metaOAt = cmpJs.indexOf('if (meta && key === "o")');
+check(
+  "田字查看开着时它先接键再 return：不拦的话底下那套 1/2/4 会同时生效，按一个 1 两层一起动",
+  tvKeyAt > 0 && metaOAt > tvKeyAt && cmpJs.slice(tvKeyAt, metaOAt).includes("return;")
+);
+
+check(
+  "覆盖层是固定满屏 + 裁掉溢出（放大后不能把窗口撑出滚动条），画布用左上原点 transform（与 .layer 同口径）",
+  /\.tileview \{[^}]*position: fixed;[^}]*inset: 0;[^}]*overflow: hidden;/.test(cssBare) &&
+    /\.tv-canvas \{[^}]*transform-origin: 0 0;/.test(cssBare)
+);
+
+check(
+  "关掉就把画布尺寸归零：拼好的那份位图是几十 MB，关掉还留着是白占内存",
+  /function tvClose\(\)[\s\S]{0,600}?tvCanvas\.width = 0;/.test(cmpJs)
+);
+
 console.log(`\n合计 PASS=${passed} FAIL=${failed}`);
 process.exit(failed ? 1 : 0);

@@ -1644,6 +1644,48 @@ check(
   `按钮=${NB().text || "(空)"} 合计=${railSum()}`
 );
 
+/* 20b) 会话栏一行怎么排：名字独占第一行 + 时间格式（桩不解析 HTML，拿 innerHTML 字符串看）
+     会话栏只有 214px，时间跟名字挤一行、加上平时看不见的操作按钮占 50px，
+     拿 headless Chrome 量过：名字只剩 3~4 个汉字） */
+const p2 = (x) => String(x).padStart(2, "0");
+const tsInYear = at(10, 9, 5); // 今年内、既不是今天也不是昨天也不是前天
+const dIn = new Date(tsInYear);
+const dCross = new Date(tsInYear);
+dCross.setFullYear(dCross.getFullYear() - 1); // 跨年那一档（期望值从 ts 现算，不硬编码日期）
+await feedRows([
+  { id: "t1", peer: "t1", name: "名字独占一行", unread: 0, last: tsInYear, summary: "十天前的框" },
+  { id: "t2", peer: "t2", name: "跨年框", unread: 0, last: dCross.getTime(), summary: "去年的框" },
+]);
+const t1Html = rowOf("t1")?.innerHTML || "";
+const t2Html = rowOf("t2")?.innerHTML || "";
+check(
+  "名字后面直接收尾：时间不再跟名字挤在同一行（挤的时候整行只剩 3~4 个汉字）",
+  /<b>名字独占一行<\/b><\/div>/.test(t1Html),
+  t1Html
+);
+check(
+  "预览包了一层 .s-prev：裁切交给它，时间才能站在第二行右端",
+  /class="s-sub"><span class="s-prev">[^<]*<\/span><span class="s-time">/.test(t1Html),
+  t1Html
+);
+check(
+  "今年内的框只写到月-日（年份白吃 20px）",
+  t1Html.includes(`<span class="s-time">${p2(dIn.getMonth() + 1)}-${p2(dIn.getDate())}</span>`) &&
+    !/s-time">\d{4}-/.test(t1Html),
+  t1Html.match(/s-time">[^<]*/)?.[0] || "没时间"
+);
+check(
+  "跨年必须留年份：只写 10-16 会把去年的框说成今年的",
+  t2Html.includes(
+    `<span class="s-time">${dCross.getFullYear()}-${p2(dCross.getMonth() + 1)}-${p2(dCross.getDate())}</span>`
+  ),
+  t2Html.match(/s-time">[^<]*/)?.[0] || "没时间"
+);
+// 这段喂的是临时列表，还原以免给后面的用例留一个只剩两行的会话栏
+emit("sessions-changed", sessionsPayload());
+await settle();
+check("那一段跑完会话栏还原回桩后端的真列表", rows().length === sessionsPayload().sessions.length, `${rows().length}`);
+
 /* 21) 本机接收：提示音开关与收件目录（都存 prefs.json，与对比视图那份共用） */
 const notifyChk = () => byId("chk-notify-sound");
 const notifyTxt = () => byId("sw-notify-text");

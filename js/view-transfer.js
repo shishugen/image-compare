@@ -177,6 +177,8 @@ function railTime(ts) {
   const p = (x) => String(x).padStart(2, "0");
   if (d.toDateString() === new Date().toDateString()) return `${p(d.getHours())}:${p(d.getMinutes())}`;
   if (Math.floor((Date.now() - ts) / 86400000) === 1) return "昨天";
+  // 今年内只到月-日：带上年的那种写法要 60px，而这一行总共才 194px；跨年才留年份
+  if (d.getFullYear() === new Date().getFullYear()) return `${p(d.getMonth() + 1)}-${p(d.getDate())}`;
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
 }
 
@@ -448,10 +450,12 @@ function sessionNode(s) {
       ? `${s.host}:${s.port}`
       : "这台还没添加，只能查看历史";
   const dot = unmarked ? "dot-warn" : s.online ? "dot-on" : "dot-off";
+  // 名字独占第一行，时间与预览共用第二行：会话栏只 214px，时间跟名字挤在同一行时
+  // 实测名字只剩 3~4 个汉字（拿 headless Chrome 量的），而「什么时候最后说的」远没名字重要
   row.innerHTML = `<span class="dot ${dot}"></span>
     <div class="s-main">
-      <div class="s-top"><b>${escapeHtml(s.name)}</b><span class="s-time">${railTime(s.last)}</span></div>
-      <div class="s-sub">${escapeHtml(s.summary || "还没有消息")}</div>
+      <div class="s-top"><b>${escapeHtml(s.name)}</b></div>
+      <div class="s-sub"><span class="s-prev">${escapeHtml(s.summary || "还没有消息")}</span><span class="s-time">${railTime(s.last)}</span></div>
     </div>`;
   if (!unmarked && s.unread > 0) {
     const b = document.createElement("span");
