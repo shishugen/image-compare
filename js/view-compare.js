@@ -14,6 +14,7 @@
 import {
   assetSrc,
   copyPathAsFile,
+  copyText,
   currentView,
   el,
   errText,
@@ -26,7 +27,9 @@ import {
   registerOpenHandler,
   routeDrop,
   routeDropHover,
+  setPendingSend,
   setStatus,
+  setView,
   toast,
 } from "./api.js";
 // 田字查看的落点单独一个文件：它只有数学（不碰 DOM），自检能直接 import 真实现
@@ -84,7 +87,103 @@ const ui = {
   setLayout: el("sel-set-layout"),
   setSync: el("chk-set-sync"),
   setWheel: el("sel-set-wheel"),
+  // 图片右键菜单：自己画的那套中文菜单（不用 WebView 原生那套英文的）
+  imgMenu: el("img-menu"),
 };
+
+/* --------------------------------------------------------------------------
+ * 图片右键菜单
+ *
+ * 为什么要自己画：右键点在图片上时，WKWebView 会弹它自己那套原生菜单（Open Image in
+ * New Window / Copy Subject / Look Up / Share…），语言跟着 app 的本地化走英语，
+ * 而且除了「复制图片」以外对这里几乎没用。这里只留四项真用得上的，全部走已有命令，
+ * 没有一行后端改动。
+ *
+ * 只拦「图片」这一类目标：图窗的 viewport（img 与日后叠在上面的画布都盖住）和侧栏的
+ * 每一行。输入框里的右键原样留给系统 —— 粘文字还得靠它。
+ * ------------------------------------------------------------------------ */
+const imgMenu = { path: "", name: "" };
+
+function closeImgMenu() {
+  if (!ui.imgMenu || ui.imgMenu.hidden) return;
+  ui.imgMenu.hidden = true;
+}
+
+/** 在鼠标处摊开菜单：先显示再量尺寸，贴到窗口右/下边时翻到另一边 */
+function openImgMenu(ev, path, name) {
+  // 没本机路径的图这四项一项也用不上（浏览器里调试才会遇上），让原生菜单照旧出
+  if (!path || !ui.imgMenu) return false;
+  if (ev.preventDefault) ev.preventDefault();
+  if (ev.stopPropagation) ev.stopPropagation();
+  imgMenu.path = path;
+  imgMenu.name = name || baseOf(path);
+  const m = ui.imgMenu;
+  m.hidden = false;
+  // 先把坐标清零再量：不清的话贴边窗口收缩时旧坐标会被当成新尺寸参与翻边
+  m.style.left = "0px";
+  m.style.top = "0px";
+  const rect = m.getBoundingClientRect ? m.getBoundingClientRect() : { width: 0, height: 0 };
+  const gap = 8;
+  const vw = window.innerWidth || 0;
+  const vh = window.innerHeight || 0;
+  let x = ev.clientX || 0;
+  let y = ev.clientY || 0;
+  if (vw && x + rect.width + gap > vw) x = Math.max(gap, x - rect.width);
+  if (vh && y + rect.height + gap > vh) y = Math.max(gap, y - rect.height);
+  m.style.left = x + "px";
+  m.style.top = y + "px";
+  return true;
+}
+
+async function runImgMenu(act) {
+  const path = imgMenu.path;
+  const name = imgMenu.name;
+  closeImgMenu();
+  if (!path) return;
+  try {
+    if (act === "save") {
+      const saved = await invoke("save_path_as", { src: path });
+      // null = 选文件框里按了取消：这不是失败，不用弹提示
+      if (saved) toast(`已另存为 ${saved}`);
+    } else if (act === "copy-img") {
+      await copyPathAsFile([path]);
+    } else if (act === "copy-path") {
+      await copyText(path);
+    } else if (act === "send") {
+      // 先摆进待发送区，发不发、发给谁都由用户在聊天视图里定（微信那个顺序）。
+      // 先登记再切视图，反了就是切过去没东西可拿
+      setPendingSend(path, name);
+      setView("transfer");
+    } else if (act === "reveal") {
+      await invoke("reveal_in_folder", { path });
+    }
+  } catch (err) {
+    toast(errText(err) || `${name || path} 操作失败`, "error");
+  }
+}
+
+for (const [id, act] of [
+  ["ctx-save", "save"],
+  ["ctx-copy-img", "copy-img"],
+  ["ctx-copy-path", "copy-path"],
+  ["ctx-send", "send"],
+  ["ctx-reveal", "reveal"],
+]) {
+  const btn = el(id);
+  if (btn) btn.addEventListener("click", () => runImgMenu(act));
+}
+// 点菜单以外的地方就收起（系统菜单就是这个手感）；菜单里自己的点击不算「外面」。
+// 用 pointerdown 而不是 click：按住拖出菜单外再松手，菜单也不会留到下一轮。
+// 右键也一样会先过这里 —— 关掉旧菜单后紧接着的 contextmenu 会在新目标上再开一个，
+// 所以「换一张图右键」只要一下，不用先点空白
+window.addEventListener("pointerdown", (ev) => {
+  if (!ui.imgMenu || ui.imgMenu.hidden) return;
+  const t = ev.target;
+  if (t && ui.imgMenu.contains && ui.imgMenu.contains(t)) return;
+  closeImgMenu();
+});
+// 滚轮一动菜单也会错位（它是 fixed 定位），直接收掉
+window.addEventListener("wheel", () => closeImgMenu(), { passive: true });
 
 /* --------------------------------------------------------------------------
  * Pane：一个图窗（视口 + 图片层 + 视图状态）
@@ -103,6 +202,13 @@ class Pane {
     this.natural = { w: 0, h: 0 };
     this.meta = null; // { name, size, path }
     this.loaded = false;
+
+    // 右键：绑在视口上而不是 img 上——田字之类盖在图上层的元素也会冒泡到这里，
+    // 而 meta.path 始终是「当前这一窗里那张图」的本机路径
+    this.viewport.addEventListener("contextmenu", (ev) => {
+      const m = this.meta;
+      openImgMenu(ev, m && m.path, m && m.name);
+    });
   }
 
   get size() {
@@ -983,6 +1089,8 @@ function buildStrip() {
       browseTo(i);
     });
     row.addEventListener("mousedown", (ev) => onRowDown(ev, i));
+    // 侧栏里右键任何一行（名称或缩略图）：菜单里的四项都指向这一行那张图
+    row.addEventListener("contextmenu", (ev) => openImgMenu(ev, it.path, it.name));
     list.appendChild(row);
     stripRows.push(row);
     if (stripIO) stripIO.observe(row);
@@ -2107,6 +2215,12 @@ tvRefreshBtn();
 
 window.addEventListener("keydown", (ev) => {
   if (currentView() !== "compare") return;
+  // 右键菜单是当时叠在最上面的那一层：Esc 先收它，不再往下传给侧栏/抽屉
+  if (ev.key === "Escape" && ui.imgMenu && !ui.imgMenu.hidden) {
+    ev.preventDefault();
+    closeImgMenu();
+    return;
+  }
   // 拖到一半按 Esc：这趟作废就到此为止，不能再让同一个 Esc 去收侧栏 / 关抽屉（拦在
   // 本处理函数最开头靠的是下面那句 return；同一个 window 上的其它监听 stopPropagation 管不着）
   // 松手后紧跟的那一下 click 也一并吐掉（startStripDrag 已记下 swallow，这里不再补）
@@ -2286,6 +2400,8 @@ window.addEventListener("keydown", (ev) => {
 
 /* ------------------------------- 初始化 -------------------------------- */
 window.addEventListener("resize", () => refreshZoom());
+// 窗口尺寸一变，fixed 菜单的量位贴在原处就不对了，直接收掉
+window.addEventListener("resize", closeImgMenu);
 for (const p of Object.values(panes)) p.apply();
 refreshZoom();
 refreshStatus();

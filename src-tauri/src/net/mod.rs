@@ -409,6 +409,8 @@ impl Hub {
                         created: now,
                         // 新建时读指针从 0 起：对方头一回敲门的条消息本身就是个未读
                         read: if is_active { now } else { 0 },
+                        // 新开的框不该因为“刚建”就自己跑到最上面去
+                        pinned: false,
                     });
                     true
                 }
@@ -455,6 +457,7 @@ impl Hub {
                 created: now,
                 // 自己刚开的框当然算已经读过，不该回头就挂个未读
                 read: now,
+                pinned: false,
             });
             g.active = id.clone();
             g.clone()
@@ -476,6 +479,22 @@ impl Hub {
             let mut g = self.sessions.lock().expect("sessions 锁中毒");
             match g.sessions.iter_mut().find(|s| s.id == id) {
                 Some(s) => s.name = name.to_string(),
+                None => return Err("没有这个会话".into()),
+            }
+            g.clone()
+        };
+        self.store.save_sessions(&f)?;
+        self.emit_sessions();
+        Ok(())
+    }
+
+    /// 置顶 / 取消置顶。只动这一个框的标记，列表顺序由 `sessions_json` 重算：
+    /// 存储里的先后不动，取消置顶后自然回原位（微信也是这个手感）
+    pub fn set_session_pinned(&self, id: &str, pinned: bool) -> Result<(), String> {
+        let f = {
+            let mut g = self.sessions.lock().expect("sessions 锁中毒");
+            match g.sessions.iter_mut().find(|s| s.id == id) {
+                Some(s) => s.pinned = pinned,
                 None => return Err("没有这个会话".into()),
             }
             g.clone()
@@ -579,7 +598,7 @@ impl Hub {
         let mut rows: Vec<Value> = f
             .sessions
             .iter()
-            .map(|s| session_row(&s.id, &s.peer, &s.name, s.created, true, &stats, &peers))
+            .map(|s| session_row(&s.id, &s.peer, &s.name, s.created, true, s.pinned, &stats, &peers))
             .collect();
         // 历史里露出来、但会话表里没有的框也要建行（手改过 sessions.json、或旧版升级
         // 上来的历史才会这样）。“未标记”本来就不入会话表，靠这里露出来。
@@ -587,14 +606,11 @@ impl Hub {
         for id in orphan_sessions(&stats, &f) {
             // 所属那台从历史里反推：同一个框的消息都带着同一个发送方设备 ID
             let peer = stats.get(id).map(|s| s.peer).unwrap_or_default();
-            rows.push(session_row(id, peer, "", 0, false, &stats, &peers));
+            rows.push(session_row(id, peer, "", 0, false, false, &stats, &peers));
         }
-        rows.sort_by(|a, b| {
-            b["last"]
-                .as_i64()
-                .unwrap_or_default()
-                .cmp(&a["last"].as_i64().unwrap_or_default())
-        });
+        // 置顶的永远在前（跟最近说的先后无关），组内再按最后一条时间倒序。
+        // 只排发给前端的这一份：会话表的存储顺序不动，取消置顶后自然回原位
+        sort_session_rows(&mut rows);
         json!({ "sessions": rows, "active": f.active })
     }
 
@@ -873,6 +889,7 @@ fn session_row(
     stored: &str,
     created: i64,
     tracked: bool,
+    pinned: bool,
     stats: &HashMap<&str, SessionStat>,
     peers: &HashMap<String, Peer>,
 ) -> Value {
@@ -888,11 +905,28 @@ fn session_row(
         "online": p.map(|x| x.online).unwrap_or(false),
         "bound": p.is_some(),
         "created": created,
+        // 置顶的排在列表最前，前端靠它给行加底色（微信那种），也靠它决定右键菜单是「置顶」还是「取消置顶」
+        "pinned": pinned,
         // 「未标记」与补漏行只用于查看历史，挂个常驻未读只会让人以为是新消息
         "unread": if peer.is_empty() || !tracked { 0 } else { st.unread },
         "last": st.last,
         "summary": st.summary,
     })
+}
+
+/// 会话行的顺序：置顶的永远在最前（与最近说的先后无关），组内按最后一条时间倒序。
+/// 只排发给前端的这一份：会话表存盘的先后不动，取消置顶后就回到原位（微信那个手感）
+fn sort_session_rows(rows: &mut [Value]) {
+    rows.sort_by(|a, b| {
+        let pa = a["pinned"].as_bool().unwrap_or(false);
+        let pb = b["pinned"].as_bool().unwrap_or(false);
+        pb.cmp(&pa).then_with(|| {
+            b["last"]
+                .as_i64()
+                .unwrap_or_default()
+                .cmp(&a["last"].as_i64().unwrap_or_default())
+        })
+    });
 }
 
 /// 会话显示名：会话表里存的那份优先（用户可以重命名，新话题的名字就是在这里
@@ -1116,6 +1150,7 @@ fn migrate_sessions(f: &mut SessionsFile, peers: &HashMap<String, Peer>, history
             name: peers.get(id).map(|p| p.display_name()).unwrap_or_default(),
             created: now,
             read: now,
+            pinned: false,
         })
         .collect();
     f.active = f.sessions[0].id.clone();
@@ -1350,19 +1385,29 @@ pub fn session_delete(hub: State<'_, Arc<Hub>>, id: String) -> Result<Value, Str
     Ok(hub.sessions_json())
 }
 
-/// 当前生效的收件目录。`custom` = 用户改过没有，前端据此置灰「恢复默认」。
+/// 置顶 / 取消置顶：只认本机，不同步给对端
+#[tauri::command]
+pub fn session_pin(hub: State<'_, Arc<Hub>>, id: String, pinned: bool) -> Result<Value, String> {
+    hub.set_session_pinned(&id, pinned)?;
+    Ok(hub.sessions_json())
+}
+
+/// 当前生效的收件目录。`custom` = 用户改过没有，前端据此置灰「恢复默认」；
+/// `layout` = 根目录内部怎么摆（day / month / flat），抽屉里的下拉靠它回填。
 ///
 /// 这里顺手建一次目录：新目录本来要等第一个文件落进来才建，而用户很可能
 /// 先点「打开目录」——那时候路径不存在，只会拿到一句“路径不存在”，看不出是没建
 #[tauri::command]
 pub fn inbox_dir(store: State<'_, Arc<Store>>) -> Value {
+    let prefs = store.load_prefs();
     let p = store.inbox_dir();
     if let Err(e) = std::fs::create_dir_all(&p) {
         eprintln!("[net] 收件目录 {} 建不出来: {e}", p.display());
     }
     json!({
         "path": p.to_string_lossy(),
-        "custom": !store.load_prefs().inbox.is_empty(),
+        "custom": !prefs.inbox.is_empty(),
+        "layout": prefs.inbox_layout,
     })
 }
 
@@ -1509,6 +1554,42 @@ pub async fn pick_folder(app: AppHandle, title: Option<String>) -> Result<Option
     Ok(folder.and_then(|f| f.into_path().ok()).map(|p| p.to_string_lossy().to_string()))
 }
 
+/// 待发送区要显示的东西：名字、大小、是不是文件夹。
+///
+/// 前端拿不到文件系统，光有路径分不出「这是个文件夹」还是「名字里带点的文件」，
+/// 也拿不到大小，所以选择/拖拽之后统一回来问一遍。只读元信息，不碰文件内容。
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PathMeta {
+    pub path: String,
+    pub name: String,
+    pub size: u64,
+    pub is_dir: bool,
+    /// 路径已经不在了（拖进来之后被移走/删掉）：仍然留在待发送区，
+    /// 但给前端一个明确标记，发出去之前就能提示，而不是等 Rust 侧报错
+    pub missing: bool,
+}
+
+/// 一次问一批路径的元信息。顺序与入参一致，前端好按位置对回自己的列表。
+/// 查不到的路径不丢：`missing = true` 让界面把它标出来，用户自己决定移不移
+#[tauri::command]
+pub async fn stat_paths(paths: Vec<String>) -> Vec<PathMeta> {
+    paths
+        .into_iter()
+        .map(|p| {
+            let path = PathBuf::from(&p);
+            let name = path
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| p.clone());
+            match std::fs::metadata(&path) {
+                Ok(md) => PathMeta { path: p, name, size: md.len(), is_dir: md.is_dir(), missing: false },
+                Err(_) => PathMeta { path: p, name, size: 0, is_dir: false, missing: true },
+            }
+        })
+        .collect()
+}
+
 /// 发送用的文件选择：与选图对比用的 pick_images 分开，这里不限制张数也不限类型
 #[tauri::command]
 pub async fn pick_send_files(app: AppHandle) -> Result<Vec<String>, String> {
@@ -1601,21 +1682,21 @@ mod tests {
         // 会话行：自己没存过名字的基础对话跟着显示名走
         let mut map = HashMap::new();
         map.insert(p.id.clone(), p.clone());
-        let row = session_row("peer1", "peer1", "", 0, true, &HashMap::new(), &map);
+        let row = session_row("peer1", "peer1", "", 0, true, false, &HashMap::new(), &map);
         assert_eq!(row["name"], "办公室那台", "备注改了会话栏不能还叫设备名");
         // 但用户手工改过名的框不能跟着动（存过的那份优先）
-        let row = session_row("uuid9", "peer1", "打印问题", 0, true, &HashMap::new(), &map);
+        let row = session_row("uuid9", "peer1", "打印问题", 0, true, false, &HashMap::new(), &map);
         assert_eq!(row["name"], "打印问题");
     }
 
     #[test]
     fn 改备注名只带上还叫旧名的框() {
         let mut ss = vec![
-            Session { id: "peer1".into(), peer: "peer1".into(), name: "Mac".into(), created: 0, read: 0 },
-            Session { id: "u2".into(), peer: "peer1".into(), name: "Mac · 10-25".into(), created: 0, read: 0 },
-            Session { id: "u3".into(), peer: "peer1".into(), name: "报销单".into(), created: 0, read: 0 },
+            Session { id: "peer1".into(), peer: "peer1".into(), name: "Mac".into(), created: 0, read: 0, pinned: false },
+            Session { id: "u2".into(), peer: "peer1".into(), name: "Mac · 10-25".into(), created: 0, read: 0, pinned: false },
+            Session { id: "u3".into(), peer: "peer1".into(), name: "报销单".into(), created: 0, read: 0, pinned: false },
             // 别的那台的同名框不能被拖着一起改
-            Session { id: "peer2".into(), peer: "other".into(), name: "Mac".into(), created: 0, read: 0 },
+            Session { id: "peer2".into(), peer: "other".into(), name: "Mac".into(), created: 0, read: 0, pinned: false },
         ];
         assert!(rename_by_display(&mut ss, "peer1", "Mac", "办公室那台"));
         assert_eq!(ss[0].name, "办公室那台", "基础对话跟着备注名走");
@@ -1738,7 +1819,7 @@ mod tests {
         let reads: HashMap<&str, i64> = HashMap::new();
         let stats = session_stats(&msgs, &reads);
         let peers: HashMap<String, Peer> = HashMap::new();
-        let row = session_row("", "", "", 0, true, &stats, &peers);
+        let row = session_row("", "", "", 0, true, false, &stats, &peers);
         assert_eq!(row["name"], "未标记");
         assert_eq!(row["online"], false);
         assert_eq!(row["bound"], false, "没有地址就不能发，前端据此置灰");
@@ -1753,11 +1834,11 @@ mod tests {
         let msgs = vec![消息("一", "c", "in", 1), 消息("二", "c", "in", 2)];
         let stats = session_stats(&msgs, &HashMap::new());
         let peers = 映射(&[对端("c", "丙")]);
-        assert_eq!(session_row("c", "c", "", 0, false, &stats, &peers)["unread"], 0);
+        assert_eq!(session_row("c", "c", "", 0, false, false, &stats, &peers)["unread"], 0);
         // 同样的数据在会话表里（正常新建的会话）就要报未读
         let reads: HashMap<&str, i64> = [("c", 0i64)].into_iter().collect();
         let 有指针 = session_stats(&msgs, &reads);
-        assert_eq!(session_row("c", "c", "", 0, true, &有指针, &peers)["unread"], 2);
+        assert_eq!(session_row("c", "c", "", 0, true, false, &有指针, &peers)["unread"], 2);
     }
 
     #[test]
@@ -1771,8 +1852,8 @@ mod tests {
         let reads: HashMap<&str, i64> = [("a", 9i64), ("u1", 0i64)].into_iter().collect();
         let stats = session_stats(&msgs, &reads);
         let peers = 映射(&[对端("a", "甲")]);
-        let 基 = session_row("a", "a", "甲", 0, true, &stats, &peers);
-        let 话 = session_row("u1", "a", "甲 · 话题 2", 0, true, &stats, &peers);
+        let 基 = session_row("a", "a", "甲", 0, true, false, &stats, &peers);
+        let 话 = session_row("u1", "a", "甲 · 话题 2", 0, true, false, &stats, &peers);
         assert_eq!(基["unread"], 0, "基础对话读过了就不该挂未读");
         assert_eq!(话["unread"], 2, "新话题里的两条都没读过");
         // 能不能发只看所属那台：两个框的在线态与地址必须一样
@@ -1786,11 +1867,35 @@ mod tests {
     }
 
     #[test]
+    fn 置顶的排在列表最前且不改存盘顺序() {
+        let mut rows = vec![
+            json!({ "id": "老的", "pinned": true, "last": 10 }),
+            json!({ "id": "刚说的", "pinned": false, "last": 300 }),
+            json!({ "id": "中间的", "pinned": false, "last": 200 }),
+            json!({ "id": "置顶且新", "pinned": true, "last": 50 }),
+        ];
+        sort_session_rows(&mut rows);
+        let ids: Vec<&str> = rows.iter().map(|r| r["id"].as_str().unwrap()).collect();
+        assert_eq!(
+            ids,
+            vec!["置顶且新", "老的", "刚说的", "中间的"],
+            "置顶的占前两位（组内按时间倒序），没置顶的留在后面也按时间"
+        );
+        // 老 payload / 老会话文件没有 pinned 字段：当没置顶，不能因为“缺字段”就冒到前面
+        let mut old = vec![
+            json!({ "id": "缺字段", "last": 1 }),
+            json!({ "id": "新的", "last": 9, "pinned": false }),
+        ];
+        sort_session_rows(&mut old);
+        assert_eq!(old[0]["id"], "新的");
+    }
+
+    #[test]
     fn 落点判据与冒用退回() {
         let f = SessionsFile {
             sessions: vec![
-                Session { id: "a".into(), peer: "a".into(), name: "甲".into(), created: 1, read: 0 },
-                Session { id: "u1".into(), peer: "a".into(), name: "甲 · 话题 2".into(), created: 1, read: 0 },
+                Session { id: "a".into(), peer: "a".into(), name: "甲".into(), created: 1, read: 0, pinned: false },
+                Session { id: "u1".into(), peer: "a".into(), name: "甲 · 话题 2".into(), created: 1, read: 0, pinned: false },
             ],
             active: "a".into(),
             ..SessionsFile::default()
@@ -1840,23 +1945,23 @@ mod tests {
         let stats = session_stats(&[], &HashMap::new());
         // 登记过对端、且会话表里没存过名字 → 用它的设备名
         assert_eq!(
-            session_row("abcd1234efgh", "abcd1234efgh", "", 0, true, &stats, &peers)["name"],
+            session_row("abcd1234efgh", "abcd1234efgh", "", 0, true, false, &stats, &peers)["name"],
             "楼上的机器"
         );
         // 只从旧历史里露出来的设备没有名字可用，露一截 ID 也比「未知设备」分得清
         assert_eq!(
-            session_row("zz11223344", "zz11223344", "", 0, false, &stats, &peers)["name"],
+            session_row("zz11223344", "zz11223344", "", 0, false, false, &stats, &peers)["name"],
             "设备 zz112233"
         );
         // 会话表里存过名字就以它为准：重命名与对端上报都要能跟上
-        assert_eq!(session_row("zz11223344", "zz11223344", "小李", 0, true, &stats, &peers)["name"], "小李");
+        assert_eq!(session_row("zz11223344", "zz11223344", "小李", 0, true, false, &stats, &peers)["name"], "小李");
         // 存的名字优先于设备名：用户把框改成「工作」后，对方改名不该把它打回去
         assert_eq!(
-            session_row("abcd1234efgh", "abcd1234efgh", "工作", 0, true, &stats, &peers)["name"],
+            session_row("abcd1234efgh", "abcd1234efgh", "工作", 0, true, false, &stats, &peers)["name"],
             "工作"
         );
         // 只知道会话 ID、连所属那台都认不出（手改过会话文件）：至少得有个不重复的名字
-        assert_eq!(session_row("u1deadbeef00", "", "", 0, false, &stats, &peers)["name"], "会话 u1deadbe");
+        assert_eq!(session_row("u1deadbeef00", "", "", 0, false, false, &stats, &peers)["name"], "会话 u1deadbe");
     }
 
     fn 映射(peers: &[Peer]) -> HashMap<String, Peer> {
@@ -1896,6 +2001,7 @@ mod tests {
                 name: "甲机".into(),
                 created: 1,
                 read: 7,
+                pinned: false,
             }],
             active: String::new(),
             ..SessionsFile::default()
@@ -1915,7 +2021,7 @@ mod tests {
         ];
         let stats = session_stats(&msgs, &HashMap::new());
         let mut f = SessionsFile {
-            sessions: vec![Session { id: "a".into(), peer: "a".into(), name: "甲".into(), created: 1, read: 0 }],
+            sessions: vec![Session { id: "a".into(), peer: "a".into(), name: "甲".into(), created: 1, read: 0, pinned: false }],
             active: "a".into(),
             hidden: vec!["ub".into()],
         };
@@ -1951,6 +2057,7 @@ mod tests {
             name: "甲".into(),
             created: 1,
             read: 0,
+            pinned: false,
         };
         let mut off = 对端("a", "甲");
         off.online = false;

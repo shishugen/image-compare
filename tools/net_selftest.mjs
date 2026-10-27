@@ -41,6 +41,29 @@ if (!PASS) {
   process.exit(2);
 }
 const DEV_ID = device.id;
+
+/* 收件落脚点跟着 prefs.json 的 `inbox_layout` 走（day / month / flat）：自检拿这台机器
+ * 的**真实偏好**算一遍，而不是假定根目录 —— 假定错了会连着红一大片，看起来像落盘坏了。
+ * 工位目录（UUID 批次）永远在根下，不受摆放规则影响 */
+const ROOT_INBOX = path.join(DATA, "inbox");
+let boxLayout = "day";
+try {
+  boxLayout = JSON.parse(fs.readFileSync(path.join(DATA, "prefs.json"), "utf8")).inbox_layout || "day";
+} catch {
+  /* 远程模式 / 首启动没这份文件：按出厂口径算 */
+}
+if (!["day", "month", "flat"].includes(boxLayout)) boxLayout = "day";
+const pad2 = (n) => String(n).padStart(2, "0");
+const today = new Date();
+const ymd = `${today.getFullYear()}-${pad2(today.getMonth() + 1)}`;
+const INBOX =
+  boxLayout === "day"
+    ? path.join(ROOT_INBOX, `${ymd}-${pad2(today.getDate())}`)
+    : boxLayout === "month"
+      ? path.join(ROOT_INBOX, ymd)
+      : ROOT_INBOX;
+/** 落点目录的相对说法，用在断言的标题里（"." 表示根） */
+const BOX = path.relative(DATA, INBOX) || ".";
 // 与 client.rs 一样报自己的显示名：远程模式读不到 device.json，用个固定名字
 const DEV_NAME = device.name || "selftest-remote-peer";
 const sha = (b) => crypto.createHash("sha256").update(b).digest("hex");
@@ -154,6 +177,34 @@ const madePaths = [];
 function mark(p) {
   if (LOCAL) madePaths.push(p);
 }
+/**
+ * 把落点目录里同一基名的历史残留**立马清掉**（含 `名字 (1)` 这类序号），再把路径
+ * 登记给收尾那次删除。只登记不删是不够的：本次发送会撞上残留而被加序号，
+ * 「消息里的名字就是原名」就对不上了；换个摆放规则那次没清干净的残留就会这么传下去。
+ */
+function markFamily(dir, base) {
+  if (!LOCAL) return;
+  // 先把本次即将落地的原名登记上：目录里干净时下面的循环什么都不会做，
+  // 不先登记就会留下这一轮刚落的文件（上一次就是这么把残留传下去的）
+  mark(path.join(dir, base));
+  const stem = path.parse(base).name;
+  let names = [];
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return; // 目录还没建：第一次收东西时服务端自己建
+  }
+  for (const n of names) {
+    if (n !== base && !n.startsWith(`${stem} (`)) continue;
+    const p = path.join(dir, n);
+    try {
+      fs.rmSync(p, { recursive: true, force: true });
+    } catch (e) {
+      console.log(`清历史残留 ${p} 失败: ${e.message}`);
+    }
+    mark(p);
+  }
+}
 /** messages.jsonl 最后一条（新到的消息一定在最末尾） */
 function lastMessage() {
   const lines = jsonlLines();
@@ -179,11 +230,16 @@ function sessionRows() {
     return [];
   }
 }
+/**
+ * 找最近一条匹配的历史。**从末尾往前**找：同名文件每轮自检都会再发一遍，
+ * 从头找会命中上一轮那条（path 指向换摆放规则之前的旧落点，peer 也是上一轮的）
+ */
 function findMessage(sub) {
-  for (const l of jsonlLines()) {
-    if (!l.includes(sub)) continue;
+  const lines = jsonlLines();
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    if (!lines[i].includes(sub)) continue;
     try {
-      const m = JSON.parse(l);
+      const m = JSON.parse(lines[i]);
       if (m.text === sub || m.name === sub || (m.text || "").includes(sub)) return m;
     } catch {}
   }
@@ -244,19 +300,21 @@ console.log(`目标 http://${HOST}:${PORT}  模式 ${LOCAL ? "本机（可核对
   }
 }
 
-/* 5. 中文名单文件流式上传：收完应摊平成 inbox/<名字>，不再有 UUID 工位目录 */
+/* 5. 中文名单文件流式上传：收完应摊平成 <摆放>/<名字>，不再有 UUID 工位目录 */
 {
   const batch = "selftest" + Date.now();
   const name = "自检 中文文件.txt";
   const content = Buffer.from("图片对比局域网自检内容 ×".repeat(400), "utf8");
-  mark(path.join(DATA, "inbox", name));
+  markFamily(INBOX, name);
   const r = await putFile({ batch, rel: name, name, content, isLast: true });
   check("中文名单文件回 200", r.status === 200, r.status + " " + r.text);
-  const landed = path.join(DATA, "inbox", name);
-  checkLocal("落盘是 inbox/<文件名>（跟微信一样不套一层 UUID 目录）", () =>
+  const landed = path.join(INBOX, name);
+  checkLocal(`${BOX}/<文件名>：摆了日期子目录就不再套 UUID，也真在里面`, () =>
     fs.existsSync(landed) && fs.readFileSync(landed).equals(content)
   );
-  checkLocal("UUID 工位目录已被清掉", () => !fs.existsSync(path.join(DATA, "inbox", batch)));
+  checkLocal("UUID 工位目录已被清掉（工位永远在根上，不受摆放规则影响）", () =>
+    !fs.existsSync(path.join(ROOT_INBOX, batch))
+  );
   checkLocal("消息里 kind=file、大小与路径都对", () => {
     const m = lastMessage();
     return m && m.kind === "file" && m.size === content.length && m.name === name && m.path === landed;
@@ -268,14 +326,14 @@ console.log(`目标 http://${HOST}:${PORT}  模式 ${LOCAL ? "本机（可核对
   const batch = "selftestbad" + Date.now();
   const content = Buffer.from("真内容", "utf8");
   const rel = "自检坏校验.txt";
-  mark(path.join(DATA, "inbox", rel));
-  mark(path.join(DATA, "inbox", batch));
+  markFamily(INBOX, rel);
+  mark(path.join(ROOT_INBOX, batch));
   // /file 的签名摘要就是 X-Sha256，所以两者必须一起假造：
   // 签名能过（说明确实进了写盘分支），落盘后算出的真实哈希与 X-Sha256 不符 -> 422
   const fake = sha(Buffer.from("对端不该收到的摘要", "utf8"));
   const r = await putFile({ batch, rel, name: rel, content, isLast: true, shaOverride: fake });
   check("sha256 不符回 422", r.status === 422, r.status + " " + r.text);
-  checkLocal("校验失败后不留下文件", () => !fs.existsSync(path.join(DATA, "inbox", rel)));
+  checkLocal("校验失败后不留下文件", () => !fs.existsSync(path.join(INBOX, rel)));
 }
 
 /* 7. 重名不覆盖：同一名字再发一次应落成 “名字 (1)” */
@@ -285,10 +343,10 @@ console.log(`目标 http://${HOST}:${PORT}  模式 ${LOCAL ? "本机（可核对
   const dup = Buffer.from("第二次发的内容，和第一次不一样", "utf8");
   const r = await putFile({ batch, rel: name, name, content: dup, isLast: true });
   check("重名文件回 200", r.status === 200, r.status + " " + r.text);
-  const second = path.join(DATA, "inbox", "自检 中文文件 (1).txt");
+  const second = path.join(INBOX, "自检 中文文件 (1).txt");
   mark(second);
   checkLocal("原件保留、新到的加 (1) 序号", () => {
-    const first = path.join(DATA, "inbox", name);
+    const first = path.join(INBOX, name);
     return (
       fs.existsSync(second) &&
       fs.readFileSync(second).equals(dup) &&
@@ -298,11 +356,11 @@ console.log(`目标 http://${HOST}:${PORT}  模式 ${LOCAL ? "本机（可核对
 }
 
 /* 8. 文件夹批次：所有 rel 都以文件夹名打头（真实发送端就是这样），
-      收完应是 inbox/<文件夹名>/…，且消息报整批大小而不是最后一个文件的大小 */
+      收完应是 <摆放>/<文件夹名>/…，且消息报整批大小而不是最后一个文件的大小 */
 {
   const batch = "selftestdir" + Date.now();
   const top = "自检文件夹";
-  mark(path.join(DATA, "inbox", top));
+  markFamily(INBOX, top);
   const a = Buffer.from("A".repeat(1024), "utf8");
   const b = Buffer.from("中文内容".repeat(700), "utf8");
   let bad = "";
@@ -315,9 +373,9 @@ console.log(`目标 http://${HOST}:${PORT}  模式 ${LOCAL ? "本机（可核对
     if (r.status !== 200) bad = `${rel} 回 ${r.status} ${r.text}`;
   }
   check("同一批次连发两个文件均回 200", !bad, bad);
-  checkLocal("整个目录树搬到 inbox/<文件夹名> 下", () =>
-    fs.existsSync(path.join(DATA, "inbox", top, "甲.txt")) &&
-    fs.readFileSync(path.join(DATA, "inbox", top, "内层", "乙.txt")).equals(b)
+  checkLocal(`整个目录树搬到 ${BOX}/<文件夹名> 下`, () =>
+    fs.existsSync(path.join(INBOX, top, "甲.txt")) &&
+    fs.readFileSync(path.join(INBOX, top, "内层", "乙.txt")).equals(b)
   );
   checkLocal("文件夹消息报整批大小且归类为 folder", () => {
     const m = lastMessage();
@@ -356,7 +414,7 @@ const B_NAME = "自检乙机";
   const mine = "自检甲消息 " + stamp;
   const theirs = "自检乙消息 " + stamp;
   const fileRel = "自检乙机的文件.txt";
-  mark(path.join(DATA, "inbox", fileRel));
+  markFamily(INBOX, fileRel);
   const content = Buffer.from("两份身份共用一台接收端", "utf8");
   const r1 = await postText(mine);
   const r2 = await postText(theirs, { id: B_ID, name: B_NAME });
@@ -418,7 +476,7 @@ const B_NAME = "自检乙机";
   const topic2 = "自检话题二 " + stamp;
   const hijack = "自检冒用他人会话 " + stamp; // 拿 B_ID 那个框的 ID 往本机框里塞消息
   const fileRel = "自检话题里的文件.txt";
-  mark(path.join(DATA, "inbox", fileRel));
+  markFamily(INBOX, fileRel);
   const replies = [];
   replies.push(await postText(noHead));
   replies.push(await postText(topic1, undefined, { id: T1, name: T1_NAME }));

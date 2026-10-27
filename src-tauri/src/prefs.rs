@@ -1,11 +1,11 @@
 //! 用户偏好的读写命令：布局（1/2/4 图）、同步开关、滚轮行为，
-//! 以及传输视图的「本机接收」（提示音开关、收件目录）。
+//! 以及传输视图的「本机接收」（提示音开关、收件目录、收件目录的摆放）。
 //!
 //! 只有两条命令，因为这份数据很小：前端启动时读一次，之后每次改动整体回写
 //! （`Store::save_prefs` 是原子写，崩了也不会留半截）。每一项都可选：只改布局时
 //! 不会顺手把同步状态重置掉，传输那边改收件目录也不会冲掉对比视图的布局。
 
-use crate::store::Store;
+use crate::store::{Store, INBOX_LAYOUTS};
 use serde_json::Value;
 use std::path::Path;
 use std::sync::Arc;
@@ -39,9 +39,9 @@ fn check_inbox(v: &str) -> Result<String, String> {
 
 /// 局部更新：传进来的字段覆盖，没传的保持磁盘上的原值。
 ///
-/// 参数名都是单词（`layout`/`sync`/`wheel`/`notify`/`inbox`），不涉及 serde 的 camelCase 陷阱；
 /// 值必须在 Rust 侧就验一遍 —— 前端拿不到一个它不认的布局，否则切到一个
-/// 没有 CSS 的布局会让四个窗都不显示，比「设置没生效」难查得多。
+/// 没有 CSS 的布局会让四个窗都不显示，比「设置没生效」难查得多。多词参数
+/// （`inbox_layout`）按 Tauri 默认走 camelCase，前端传的是 `inboxLayout`。
 #[tauri::command]
 pub fn set_prefs(
     store: State<'_, Arc<Store>>,
@@ -50,6 +50,7 @@ pub fn set_prefs(
     wheel: Option<String>,
     notify: Option<bool>,
     inbox: Option<String>,
+    inbox_layout: Option<String>,
 ) -> Result<Value, String> {
     let mut p = store.load_prefs();
     if let Some(l) = layout {
@@ -68,6 +69,14 @@ pub fn set_prefs(
     // 比拒绝这次修改危险得多
     if let Some(i) = inbox {
         p.inbox = check_inbox(&i)?;
+    }
+    // 摆放方式也必须在落盘前拦住：一个前端不认的值会让 normalize 静默改回默认，
+    // 表现是「下拉选了按月，重开又变回按天」
+    if let Some(l) = inbox_layout {
+        if !INBOX_LAYOUTS.contains(&l.as_str()) {
+            return Err(format!("未知的收件摆放方式: {l:?}"));
+        }
+        p.inbox_layout = l;
     }
     // normalize 会静默把脏值改回默认，这里先显式拦住：设置点了没反应还不出错，
     // 是最难归因的一种失败

@@ -344,8 +344,19 @@ fn handle_file(
             if is_last {
                 let fin = hub.batch_finish(&batch);
                 // 收件箱按微信的习惯摆放：一张图就是 inbox/<图名>，一个文件夹就是
-                // inbox/<文件夹名>/…；UUID 批次目录只是传输途中的工位，收完摊平后删掉
-                let landing = flatten_batch(&hub.store.inbox_dir(), &root, &name);
+                // inbox/<文件夹名>/…；UUID 批次目录只是传输途中的工位，收完摊平后删掉。
+                // 摊平的落脚点可能是 inbox 根，也可能是它下面按天/按月分的日期子目录
+                let mut target = hub.store.inbox_delivery_dir();
+                if let Err(e) = fs::create_dir_all(&target) {
+                    // 日期目录建不出来（盘满/权限）就退回根目录：宁可今天这几样混在
+                    // 根上，也不要因为缺一层子目录让整批退回去看 uuid 目录名
+                    eprintln!(
+                        "[net] 建收件日期目录 {} 失败，退回根目录: {e}",
+                        target.display()
+                    );
+                    target = hub.store.inbox_dir();
+                }
+                let landing = flatten_batch(&target, &root, &name);
                 let landing_name = landing
                     .file_name()
                     .map(|s| s.to_string_lossy().to_string())
@@ -515,8 +526,9 @@ fn build_inbox_message(
     }
 }
 
-/// 把批次工位目录里的唯一顶层条目移到收件箱根。挪不动（权限/异常名字）就退回工位目录，
-/// 总之不能丢文件；多于一个顶层条目（理论上不会发生）也留在工位目录里。
+/// 把批次工位目录里的唯一顶层条目移到收件落脚点（inbox 根，或它下面按日期分的
+/// 子目录）。挪不动（权限/异常名字）就退回工位目录，总之不能丢文件；
+/// 多于一个顶层条目（理论上不会发生）也留在工位目录里。
 fn flatten_batch(inbox: &Path, root: &Path, declared_name: &str) -> PathBuf {
     let entries = match fs::read_dir(root) {
         Ok(e) => e.filter_map(|x| x.ok()).collect::<Vec<_>>(),

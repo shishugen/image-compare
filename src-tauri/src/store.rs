@@ -203,6 +203,9 @@ pub struct Session {
     pub created: i64,
     /// 本机读到哪了：未读数 = 该会话里比它新的入向消息条数
     pub read: i64,
+    /// 置顶：列表里永远排在最前（微信那套）。只认本机，不同步给对端
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 /// sessions.json 的整体结构
@@ -417,6 +420,11 @@ pub struct Preferences {
     /// 免得把一个合法的软链目录换成它指向的地方，用户看到的路径就变了）
     #[serde(default)]
     pub inbox: String,
+    /// 收件目录内部怎么摆："day" 一天一个文件夹（2026-10-27）/ "month" 一个月一个
+    /// （2026-10）/ "flat" 全铺在根上。老 prefs.json 没这一项，读时由 normalize 补成
+    /// `INBOX_LAYOUT_DEFAULT`——所以升级上来就是按天分，不需要用户再点一次
+    #[serde(default)]
+    pub inbox_layout: String,
 }
 
 fn default_sync() -> bool {
@@ -431,6 +439,12 @@ fn default_notify() -> bool {
     true
 }
 
+/// 收件箱内部的摆放方式（prefs.json 的 `inbox_layout`）
+pub const INBOX_LAYOUTS: [&str; 3] = ["day", "month", "flat"];
+/// 出厂：一天一个文件夹。按天分的层次最浅、找“昨天那批”最快；量大的时候
+/// 还能在界面上切成按月，不必因为出厂值不好用就去翻 prefs.json
+pub const INBOX_LAYOUT_DEFAULT: &str = "day";
+
 impl Default for Preferences {
     /// 出厂态就是前端 HTML 里写死的那一份（两图 + 同步开 + 滚轮缩放 + 响一声 +
     /// 默认收件目录），两边不一致会让「读到空」与「读到默认」表现出差别，没必要
@@ -441,6 +455,7 @@ impl Default for Preferences {
             wheel: default_wheel(),
             notify: default_notify(),
             inbox: String::new(),
+            inbox_layout: INBOX_LAYOUT_DEFAULT.into(),
         }
     }
 }
@@ -461,6 +476,11 @@ impl Preferences {
         // 这里只能静默回默认（读取路径上没有可报错的出口），拦下脏值靠 set_prefs
         if !self.inbox.is_empty() && !Path::new(&self.inbox).is_absolute() {
             self.inbox.clear();
+        }
+        // 空串（老版本写的 prefs.json）与手改坏的都补回出厂口径：留一个前端
+        // 不认的值会让落盘规则静默退化成「不分目录」，而界面还显示着「按天」
+        if !INBOX_LAYOUTS.contains(&self.inbox_layout.as_str()) {
+            self.inbox_layout = INBOX_LAYOUT_DEFAULT.into();
         }
     }
 }
@@ -563,6 +583,30 @@ impl Store {
             self.dir.join("inbox")
         } else {
             PathBuf::from(d)
+        }
+    }
+
+    /// 这一批新收到的具体落在哪一级：`inbox_dir()` 是根，这里再按 `inbox_layout`
+    /// 拼上日期子目录（flat 时两者是同一个地方）。
+    ///
+    /// 用**本地**日期而不是 UTC：用户本地晚上 8 点收的文件却出现在“明天”那个
+    /// 文件夹里，比不分目录还难解释。跨零点那一瞬间落进哪一天都不算错，因此
+    /// 这里取的是收完那一刻（而不是开传那一刻）的时间。
+    pub fn inbox_delivery_dir(&self) -> PathBuf {
+        let p = self.load_prefs();
+        let root = if p.inbox.is_empty() {
+            self.dir.join("inbox")
+        } else {
+            PathBuf::from(&p.inbox)
+        };
+        let stamp = match p.inbox_layout.as_str() {
+            "month" => Some("%Y-%m"),
+            "day" => Some("%Y-%m-%d"),
+            _ => None,
+        };
+        match stamp {
+            Some(f) => root.join(chrono::Local::now().format(f).to_string()),
+            None => root,
         }
     }
 
@@ -913,6 +957,7 @@ mod tests {
                 name: "甲机".into(),
                 created: 1,
                 read: 2,
+                pinned: true,
             }],
             active: "a".into(),
             hidden: vec!["gone".into()],
@@ -923,6 +968,7 @@ mod tests {
         assert_eq!(back.sessions[0].id, "a", "会话主键得存住，不然重启后多个框会并成一个");
         assert_eq!(back.sessions[0].name, "甲机");
         assert_eq!(back.sessions[0].read, 2, "读指针丢了就等于未读记录丢了");
+        assert!(back.sessions[0].pinned, "置顶得存在盘上，重启不能又掉回下面");
         assert_eq!(back.hidden, vec!["gone".to_string()], "删过的会话得记住，不然重启就补回来");
         let _ = std::fs::remove_dir_all(&s.dir);
     }
@@ -940,6 +986,7 @@ mod tests {
         .unwrap();
         let f = s.load_sessions();
         assert_eq!(f.sessions[0].id, "a", "基础对话的 id 就是设备 ID，老历史才能归到它");
+        assert!(!f.sessions[0].pinned, "老文件没有 pinned 字段，读进来应当是没置顶");
         assert_eq!(f.active, "a", "焦点不用改：它本来指向的就是这个 id");
         assert_eq!(f.hidden, vec!["b".to_string()]);
         // 手改成空 id 的行会把所有会话混成一个，读进来就该丢掉
@@ -1054,6 +1101,60 @@ mod tests {
             s.dir.join("inbox"),
             "手改出来的相对路径要退回默认目录"
         );
+        let _ = std::fs::remove_dir_all(&other);
+        let _ = std::fs::remove_dir_all(&s.dir);
+    }
+
+    #[test]
+    fn 收件目录按天按月分子目录() {
+        let s = 临时存储("inbox-layout");
+        std::fs::create_dir_all(&s.dir).unwrap();
+        let root = s.dir.join("inbox");
+        let 今天 = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let 本月 = chrono::Local::now().format("%Y-%m").to_string();
+
+        // 出厂就是按天分；老 prefs.json 没有这一项，升级上来也该立刻生效
+        assert_eq!(s.inbox_delivery_dir(), root.join(&今天));
+        std::fs::write(s.file("prefs.json"), r#"{ "layout": "2" }"#).unwrap();
+        assert_eq!(
+            s.inbox_delivery_dir(),
+            root.join(&今天),
+            "老版本写的 prefs.json 缺 inbox_layout，读时得补成按天"
+        );
+
+        s.save_prefs(&Preferences {
+            inbox_layout: "month".into(),
+            ..Preferences::default()
+        })
+        .unwrap();
+        assert_eq!(s.inbox_delivery_dir(), root.join(&本月));
+
+        s.save_prefs(&Preferences {
+            inbox_layout: "flat".into(),
+            ..Preferences::default()
+        })
+        .unwrap();
+        assert_eq!(s.inbox_delivery_dir(), root, "不分目录时落点就是根");
+
+        // 手改坏的值退回按天：静默换成「全铺在根上」会让界面上的选项与磁盘不符
+        for bad in ["", "year", "week", "天"] {
+            std::fs::write(
+                s.file("prefs.json"),
+                format!(r#"{{ "inbox_layout": "{bad}" }}"#),
+            )
+            .unwrap();
+            assert_eq!(s.load_prefs().inbox_layout, "day", "脏值 {bad:?} 退回按天");
+        }
+
+        // 自定义根目录也照样往日期子目录里放
+        let other = std::env::temp_dir().join(format!("imgcmp-layout-{}", std::process::id()));
+        s.save_prefs(&Preferences {
+            inbox: other.to_string_lossy().to_string(),
+            inbox_layout: "day".into(),
+            ..Preferences::default()
+        })
+        .unwrap();
+        assert_eq!(s.inbox_delivery_dir(), other.join(&今天));
         let _ = std::fs::remove_dir_all(&other);
         let _ = std::fs::remove_dir_all(&s.dir);
     }

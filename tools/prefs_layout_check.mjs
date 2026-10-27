@@ -295,7 +295,7 @@ globalThis.IntersectionObserver = class {
 const DEFAULTS = { layout: "2", sync: true, wheel: "zoom" }; // 与 store.rs 的 Preferences::default 一份口径
 const LAYOUTS = ["1", "2", "4"];
 const prefsFile = { exists: false, bad: false, data: {} };
-const calls = { get: 0, set: 0 };
+const calls = { get: 0, set: 0, cmd: [] };
 
 function getPrefsStub() {
   calls.get++;
@@ -343,6 +343,8 @@ const isImageExt = (name) => IMAGE_EXTS.includes(extOf(name));
 const enc = (p) => "data:image/png;base64," + Buffer.from(p).toString("base64");
 
 async function invokeStub(cmd, args) {
+  // 右键菜单要验「点哪一项就走哪条命令、带的是哪张图」，所以每条都留一份
+  calls.cmd.push({ cmd, args: args || {} });
   switch (cmd) {
     case "get_prefs":
       return getPrefsStub();
@@ -364,6 +366,9 @@ async function invokeStub(cmd, args) {
     }
     case "take_pending_paths":
       return [];
+    // 右键菜单的「另存为」：桩里直接回一个落点，验的是「点了就走这条路、提示里带上落点」
+    case "save_path_as":
+      return "/tmp/另存为/" + String(args.src || "").split("/").pop();
     // 侧栏现在默认列「最近看过」：这三条得能应，不然 invoke 就抛「命令不存在」。
     // 这里固定回一份空历史：本文件验的是布局/同步/分隔条，不是历史源那条路（那在
     // tools/folder_browse_check.mjs 第 18 节），下面进门就先切到目录源
@@ -399,6 +404,7 @@ const tmp = join(os.tmpdir(), `prefs-layout-check-${crypto.randomBytes(6).toStri
 mkdirSync(tmp, { recursive: true });
 writeFileSync(join(tmp, "package.json"), JSON.stringify({ type: "module" }));
 for (const f of ["api.js", "view-compare.js", "tile.js"]) copyFileSync(join(here, "..", "js", f), join(tmp, f));
+const api = await import(join(tmp, "api.js"));
 await import(join(tmp, "view-compare.js"));
 // 田字查看的落点算法：直接 import 真实现来数几何（它不碰 DOM，不需要桩）
 const { tilePlacements } = await import(join(tmp, "tile.js"));
@@ -809,9 +815,66 @@ check(
 );
 check(
   "发送按钮的 title 不再写「离线时不可发送」，改说排队与补发",
-  !html.includes("离线时不可发送") && /离线时也能发：先存本机排队/.test(html)
+  !html.includes("离线时不可发送") && /离线也会先排队，它上线后自动补发/.test(html)
 );
 check("输入框的 placeholder 也告知离线能发、会排队", /离线也能发，会排队/.test(html));
+
+/* 待发送区：选好/拖进来的东西先摆着，点发送才真发。这几条只能静态守：
+   - DOM 拆了待发送区，真机上什么都不会显示，而按 id 造元素的桩照样全绿
+   - 若谁把 drop 接回 send_paths，「松手即发」就悄悄回来了（那个改动不会红任何行为断言） */
+check(
+  "待发送区在 HTML 里且默认藏起来，位置在输入框那一行之前",
+  (() => {
+    const at = html.indexOf('id="xfer-attach"');
+    const compose = html.indexOf('class="compose"');
+    if (at < 0 || compose <= at) return false;
+    // hidden 写在同一开标签上：从 id 往后取到「>」为止
+    const openTag = html.slice(at, html.indexOf(">", at) + 1);
+    return openTag.includes("hidden");
+  })() && xferJs.includes('el("xfer-attach")') && xferJs.includes('el("xfer-attach-row")')
+);
+check(
+  "拖进来 / 对比视图投递都只入待发送区，不再直接 send_paths（顶栏选文件那两个按钮已撤）",
+  !/routeDrop\([^)]*sendPaths/.test(xferJs) &&
+    /registerDropHandler\("transfer", \(paths\) => addAttach\(paths\)\)/.test(xferJs) &&
+    /addAttach\(\[pending\.path\], \{ allowNoSession: true \}\)/.test(xferJs) &&
+    !/pick_send_files/.test(xferJs)
+);
+check(
+  "发送按钮与 Enter 都走 sendComposer（附件先出、文字随后），不再是两条独立入口",
+  /addEventListener\("click", sendComposer\)/.test(xferJs) &&
+    /ev\.key === "Enter"[\s\S]{0,120}?sendComposer\(\)/.test(xferJs)
+);
+check(
+  "只有发成功的那部分才从输入区拿掉（失败留着，免得重选）",
+  /if \(sentPaths\) clearAttach\(\);/.test(xferJs) && /if \(sentText\) \{/.test(xferJs)
+);
+check(
+  "待发送区不认会话：切到哪个框就发给哪个（不再有「属于某某、先切回去发」那道锁）",
+  !/state\.attachSid/.test(xferJs) && /`点发送就发给「\$\{sessName\(state\.cur\)\}」`/.test(xferJs)
+);
+check(
+  "名字与大小问 Rust（stat_paths），且命令没回数组时能退回只认路径",
+  xferJs.includes('invoke("stat_paths"') && /if \(!Array\.isArray\(metas\)\)/.test(xferJs)
+);
+check(
+  "Rust 侧 stat_paths 已注册，且查不到的路径不丢（missing 标记交给界面标红）",
+  (() => {
+    // 上面那对 libRs / netMod 是在后面那段才读的，这里自己读一份，不靠声明顺序
+    const libSrc = readFileSync(join(here, "..", "src-tauri", "src", "lib.rs"), "utf8");
+    const netSrc = readFileSync(join(here, "..", "src-tauri", "src", "net", "mod.rs"), "utf8");
+    return (
+      libSrc.includes("net::stat_paths") &&
+      /pub async fn stat_paths/.test(netSrc) &&
+      /missing: true/.test(netSrc) &&
+      /pub missing: bool/.test(netSrc)
+    );
+  })()
+);
+check(
+  "待发送区有样式（两个 chip 形态 + × + 路径不在了的标红），不是裸 DOM",
+  /\.compose-attach \{/.test(css) && /\.attach-chip\.is-image \{/.test(css) && /\.attach-x \{/.test(css) && /\.attach-chip\.is-missing \{/.test(css)
+);
 check(
   "禁不禁只看这台加没加过（不再拿 sess.online 拦发送）",
   /const canSend = !!sess && sess\.bound;/.test(xferJs)
@@ -957,6 +1020,11 @@ check(
   /\.s-prev \{[^}]*min-width: 0;[^}]*text-overflow: ellipsis;/.test(cssBare)
 );
 check(
+  "置顶行底色深一档，但不能盖掉正在聊的那个框：选择器里排除了 .is-active，悬停也还要看得出来",
+  /\.session-row\.is-pinned:not\(\.is-active\) \{[^}]*background:/.test(cssBare) &&
+    /\.session-row\.is-pinned:not\(\.is-active\):hover \{[^}]*background: var\(--bg\);/.test(cssBare)
+);
+check(
   "行→窗这段走指针事件，不碰 HTML5 的 draggable/dataTransfer（dragDropEnabled 开着，那条通道只认从 Finder 递进来的路径）",
   (() => {
     const from = cmpJs.indexOf("const stripDrag = {");
@@ -969,6 +1037,176 @@ check(
   "落点只遍历当前档的可见窗（paneAtPoint 用 visiblePanes，不是 PANE_KEYS）",
   /function paneAtPoint[\s\S]{0,400}?visiblePanes\(\)/.test(cmpJs) &&
     !/function paneAtPoint[\s\S]{0,400}?PANE_KEYS/.test(cmpJs)
+);
+
+/* --------------------------- 图片右键菜单（中文那套） ---------------------------
+ * 五项全是已有命令，唯一的新东西是「指哪张图」与「会不会漏给原生菜单」。所以验三件事：
+ * 图窗与侧栏两处都能弹、各个动作各走各的命令且带对路径、任何一次点击或 Esc 都收得回去。
+ * 原生那套是 WebKit 自己弹的（Open Image / Copy Subject / Look Up…），样式改不了，
+ * 只能在 contextmenu 上拦下来 —— 所以「拦没拦」就看 preventDefault 这一条。
+ */
+// 先清空所有窗：「没图的那一窗」这条要的是一窗真没有 meta 的状态
+click(byId("btn-clear"));
+await settle();
+const menuNode = byId("img-menu");
+// 桩不解析 HTML：菜单在 index.html 里是带着 hidden 出厂的，这里得照初始态起；
+// 菜单项也得手工挂进去 —— 「点菜单里不关、点菜单外才关」要靠 contains 判
+menuNode.hidden = true;
+for (const id of ["ctx-save", "ctx-copy-img", "ctx-copy-path", "ctx-send", "ctx-reveal"]) {
+  menuNode.appendChild(byId(id));
+}
+// 菜单尺寸在桩里量不出来（getBoundingClientRect 只回 clientWidth/clientHeight），
+// 给它一份 172×160（真机上 .ctx-menu 的 min-width 就是这个数），贴边翻页才验得动
+menuNode.clientWidth = 172;
+menuNode.clientHeight = 160;
+function ctxMenuOn(node, x, y) {
+  const ev = {
+    type: "contextmenu",
+    clientX: x,
+    clientY: y,
+    target: node,
+    prevented: false,
+    preventDefault() {
+      this.prevented = true;
+    },
+    stopPropagation() {},
+  };
+  node.dispatchEvent(ev);
+  return ev;
+}
+const lastCmd = () => calls.cmd[calls.cmd.length - 1] || { cmd: "", args: {} };
+/** window 上的 pointerdown（外壳关菜单那条路）：桩里要手动把监听器跑一遍 */
+function pointerDownOn(node) {
+  const ev = { type: "pointerdown", target: node, button: 0, clientX: 0, clientY: 0, preventDefault() {}, stopPropagation() {} };
+  for (const [t, fn] of winListeners) if (t === "pointerdown") fn(ev);
+}
+check(
+  "没载图的窗右键：不弹自己的菜单、也不拦原生菜单（这几项都用不上，拦了等于点了没反应）",
+  (() => {
+    const ev = ctxMenuOn(byId("pane-a").querySelector(".viewport"), 400, 300);
+    return !ev.prevented && menuNode.hidden;
+  })()
+);
+
+await openTo("a", A0); // 窗里先有一张图，meta.path 才有值
+click(byId("btn-src-dir")); // 侧栏切回目录源：下面要拿真行去右键
+await settle();
+// 后面一律按「这一窗实际载的是哪张」比，不写死 A0：前面那段用例可能把它换成别的了
+const pathA = srcOf("a");
+const row0 = rows()[0];
+const rowPath = row0 && row0.dataset.path;
+
+check(
+  "侧栏行右键：菜单开在鼠标处、原生菜单被拦掉",
+  (() => {
+    const ev = ctxMenuOn(row0, 300, 200);
+    return (
+      !!rowPath &&
+      ev.prevented &&
+      !menuNode.hidden &&
+      menuNode.style.left === "300px" &&
+      menuNode.style.top === "200px"
+    );
+  })(),
+  rowPath
+);
+check(
+  "点菜单以外的地方只收菜单；点菜单里那不关（先关后 click 的话，真机上 click 就丢了）",
+  (() => {
+    pointerDownOn(menuNode.children[0]); // 菜单里的那颗：不许收
+    const kept = !menuNode.hidden;
+    pointerDownOn(byId("stage")); // 外面：收
+    return kept && menuNode.hidden;
+  })()
+);
+await settle();
+check(
+  "「复制文件路径」走 copy_text，带的是右键那一行的路径",
+  (() => {
+    ctxMenuOn(row0, 320, 220);
+    click(byId("ctx-copy-path"));
+    return true;
+  })()
+);
+await settle();
+check(
+  "复制完菜单自己收起，命令与路径都对",
+  menuNode.hidden && lastCmd().cmd === "copy_text" && lastCmd().args.text === rowPath,
+  `${lastCmd().cmd} ${lastCmd().args.text}`
+);
+check(
+  "「复制图片」走 copy_as_file，带的是图窗里那张图（与传输视图同一个命令，粘到微信就是图）",
+  (() => {
+    ctxMenuOn(byId("pane-a").querySelector(".viewport"), 260, 180);
+    click(byId("ctx-copy-img"));
+    return true;
+  })()
+);
+await settle();
+check(
+  "复制图片的参数就是 A 窗的 path",
+  lastCmd().cmd === "copy_as_file" && lastCmd().args.paths.length === 1 && lastCmd().args.paths[0] === pathA,
+  JSON.stringify(lastCmd().args)
+);
+check(
+  "贴着窗口右下角右键：菜单翻到鼠标左上方，不留半截在屏外",
+  (() => {
+    ctxMenuOn(byId("pane-a").querySelector(".viewport"), 1550, 880);
+    // 1550 + 172 + 8 > 1600 → 往左翻到 1550-172；880 + 160 + 8 > 900 → 往上翻到 880-160
+    return menuNode.style.left === "1378px" && menuNode.style.top === "720px";
+  })(),
+  `${menuNode.style.left}/${menuNode.style.top}`
+);
+check("Esc 收菜单，且不再往下传（不然同一个 Esc 还会把侧栏也收了）", (() => {
+  const ev = key("Escape");
+  return ev.prevented && menuNode.hidden;
+})());
+check(
+  "「另存为」走 save_path_as，提示里带上真落点（返回 null 是用户取消，不该报错）",
+  (() => {
+    ctxMenuOn(byId("pane-a").querySelector(".viewport"), 200, 160);
+    click(byId("ctx-save"));
+    return true;
+  })()
+);
+await settle();
+check(
+  "另存为的参数是 src（不是 path），提示里有 /tmp/另存为/",
+  lastCmd().cmd === "save_path_as" && lastCmd().args.src === pathA && statusText().includes("/tmp/另存为/"),
+  `${JSON.stringify(lastCmd().args)} → ${statusText()}`
+);
+check(
+  "「在文件夹中显示」走 reveal_in_folder，参数名是 path",
+  (() => {
+    ctxMenuOn(byId("pane-a").querySelector(".viewport"), 200, 160);
+    click(byId("ctx-reveal"));
+    return true;
+  })()
+);
+await settle();
+check("reveal_in_folder 的参数确实是 path", lastCmd().cmd === "reveal_in_folder" && lastCmd().args.path === pathA);
+check(
+  "「发送到聊天」把这张图交给传输视图（先放进待发送区，发给谁由那边选）",
+  (() => {
+    ctxMenuOn(byId("pane-a").querySelector(".viewport"), 200, 160);
+    click(byId("ctx-send"));
+    return true;
+  })()
+);
+await settle();
+const handed = api.takePendingSend();
+check(
+  "发送到聊天：视图切到 transfer，投递的正是 A 窗那张图（还没发出去），菜单也收了",
+  body.dataset.view === "transfer" && handed?.path === pathA && menuNode.hidden,
+  `${body.dataset.view} ${JSON.stringify(handed)}`
+);
+// 后面的用例都在对比视图里跑：切回来，顺带过一遍「切走即取消」那条路
+api.setPendingSend("/tmp/残留.png", "残留.png");
+api.setView("compare");
+await settle();
+check(
+  "切走聊天视图就当取消：没选会话就离开，残留的投递不会留到下一次",
+  api.takePendingSend() === null && body.dataset.view === "compare"
 );
 
 /* --------- 侧栏缩略图走 asset 协议：这三处不同时改，只会在真机上白屏，桩照不出来 --------- */
@@ -1228,6 +1466,54 @@ check(
 check(
   "启动建目录不再硬写 dir.join(\"inbox\")，而是问 store 要（不跟着改的话，换了目录收得到消息但目录建在老地方）",
   /create_dir_all\(store\.inbox_dir\(\)\)/.test(netMod) && !/create_dir_all\(dir\.join\("inbox"\)\)/.test(netMod)
+);
+check(
+  "抽屉里收件摆放给了三档，value 就是 Rust 认的那三个词（day / month / flat），多的少的都会安静不生效",
+  /<select id="inp-inbox-layout" class="select">[\s\S]{0,400}?<option value="day">[\s\S]{0,200}?<option value="month">[\s\S]{0,200}?<option value="flat">/.test(
+    html,
+  )
+);
+check(
+  "收件落脚点按 layout 拼日期子目录（day → %Y-%m-%d，month → %Y-%m），而且是本地时间（用 UTC 会把晚上收的东西挪到明天那个文件夹）",
+  /pub fn inbox_delivery_dir\(&self\) -> PathBuf \{[\s\S]{0,900}?"month" => Some\("%Y-%m"\),[\s\S]{0,120}?"day" => Some\("%Y-%m-%d"\),/.test(
+    storeRs,
+  ) && /chrono::Local::now\(\)\.format/.test(storeRs)
+);
+check(
+  "收完摊平用的是 inbox_delivery_dir()，不是 inbox_dir()（写回根目录的话日期子目录就白分了，文件还堆在根上）；日期目录建不出来时退回根目录，不能因为缺一层子目录把整批退回工位",
+  /let (?:mut )?target = hub\.store\.inbox_delivery_dir\(\);/.test(serverRs) &&
+    /flatten_batch\(&target, &root, &name\)/.test(serverRs) &&
+    /target = hub\.store\.inbox_dir\(\);/.test(serverRs) &&
+    !/flatten_batch\(&hub\.store\.inbox_dir\(\)/.test(serverRs)
+);
+check(
+  "老 prefs.json 缺 inbox_layout 时 normalize 补成按天，手改坏的值也回按天（静默退化成不分目录、界面还显示按天，比没得选更难查）",
+  /pub const INBOX_LAYOUTS: \[&str; 3\] = \["day", "month", "flat"\];/.test(storeRs) &&
+    /if !INBOX_LAYOUTS\.contains\(&self\.inbox_layout\.as_str\(\)\) \{\s*self\.inbox_layout = INBOX_LAYOUT_DEFAULT\.into\(\);/.test(
+      storeRs,
+    )
+);
+check(
+  "摆放方式在 Rust 白名单里硬拦、前端按 Tauri 默认传 inboxLayout，存不下就把下拉退回原值（停在一个没生效的选项上最难找东西）",
+  /inbox_layout: Option<String>,/.test(prefsRs) &&
+    /if !INBOX_LAYOUTS\.contains\(&l\.as_str\(\)\) \{\s*return Err/.test(prefsRs) &&
+    /saveRecvPrefs\(\s*\{ inboxLayout: next \}/.test(xferJs) &&
+    /if \(ok\) paintInboxLayout\(next\);\s*else paintInboxLayout\(prev\);/.test(xferJs)
+);
+check(
+  "inbox_dir 命令把 layout 一起带回来，抽屉打开时先回填下拉再刷路径（顺序反了样本路径会停在旧规则上）",
+  /"layout": prefs\.inbox_layout,/.test(netMod) &&
+    /if \(d && d\.layout\) paintInboxLayout\(String\(d\.layout\)\);\s*if \(d && d\.path\) paintInboxDir/.test(
+      xferJs,
+    )
+);
+check(
+  "抽屉里那条「新收到的文件落在 …」是本地日期拼出来的真路径（day/month 两档与 Rust 同一口径），不是写死的示例；路径长了能折行，不能把抽屉撑宽",
+  /function localDateStamp\(layout\) \{[\s\S]{0,400}?if \(layout === "month"\) return ym;[\s\S]{0,200}?if \(layout === "day"\) return/.test(
+    xferJs,
+  ) &&
+    html.includes('id="inbox-layout-sample"') &&
+    /\.hint code \{[^}]*word-break: break-all;/.test(css)
 );
 check(
   "sound.rs 三个平台分支齐：mac 走 afplay、Windows 走 MessageBeep、其余空实现（少一条要么是没声，要么是 dead_code 告警）",
@@ -1535,6 +1821,52 @@ check(
 check(
   "关掉就把画布尺寸归零：拼好的那份位图是几十 MB，关掉还留着是白占内存",
   /function tvClose\(\)[\s\S]{0,600}?tvCanvas\.width = 0;/.test(cmpJs)
+);
+
+/* ------------------- 图片右键菜单：文案与层叠顺序（静态钉住） -------------------
+ * 行为那十几条已经用桩跑过；这里钉的是「文案不能悄悄退回英文」「不能被别的浮层压下去」。
+ * 原生菜单的语言是 WebKit 按 app 本地化选的，改不了，所以只能拦住后自己画 ——
+ * 一旦下面任一条断了，用户看到的就又是截图里那套英文。
+ */
+const ctxRule = (cls) => {
+  const i = css.indexOf(`.${cls} {`);
+  return i < 0 ? "" : css.slice(i, css.indexOf("}", i) + 1);
+};
+const zOf = (cls) => {
+  const m = /z-index:\s*(\d+)/.exec(ctxRule(cls));
+  return m ? Number(m[1]) : -1;
+};
+check(
+  "菜单五项，全是中文，没有照抄 WebView 那套（Open Image / Copy Subject / Look Up）",
+  ["ctx-save", "ctx-copy-img", "ctx-copy-path", "ctx-send", "ctx-reveal"].every((id) => html.includes(`id="${id}"`)) &&
+        /id="ctx-send"[^>]*>发送到聊天</.test(html) &&
+    /id="ctx-save"[^>]*>另存为…</.test(html) &&
+    /id="ctx-copy-img"[^>]*>复制图片</.test(html) &&
+    /id="ctx-copy-path"[^>]*>复制文件路径</.test(html) &&
+    /id="ctx-reveal"[^>]*>在文件夹中显示</.test(html) &&
+    // 只看菜单本体（html）：js 的注释里写明了原生那套叫什么，那不是文案
+    !/Open Image|Copy Image|Copy Subject|Look Up|Inspect Element/.test(html)
+);
+check(
+  "「发送到聊天」先登记投递再去切视图（顺序反了就是切过去没东西可发）",
+  /act === "send"[\s\S]{0,200}?setPendingSend\(path, name\)[\s\S]{0,80}?setView\("transfer"\)/.test(cmpJs)
+);
+check(
+  "菜单压在抽屉(500)与放大层(900)之上：菜单 950（低了就会被 lightbox 盖住，右键等于没反应）",
+  zOf("ctx-menu") === 950 && zOf("lightbox") === 900
+);
+check(
+  "两处入口各自绑一遍：图窗 viewport（img 与上层的画布都冒泡到这里）与侧栏每一行",
+  /this\.viewport\.addEventListener\("contextmenu"/.test(cmpJs) &&
+    /row\.addEventListener\("contextmenu"/.test(cmpJs)
+);
+check(
+  "没有 document 级 contextmenu 拦截：输入框里的右键粘贴还得是系统那套",
+  !/document\.addEventListener\(\s*["']contextmenu/.test(cmpJs)
+);
+check(
+  "点外面关闭走 window 的 pointerdown + contains 判归属（用 click 的话按住拖出去再松手会漏；不判 contains 会把菜单里自己的点击也当成外面）",
+  /window\.addEventListener\("pointerdown"[\s\S]{0,300}?imgMenu\.contains/.test(cmpJs)
 );
 
 console.log(`\n合计 PASS=${passed} FAIL=${failed}`);

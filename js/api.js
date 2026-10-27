@@ -74,12 +74,31 @@ export function currentView() {
   return document.body.dataset.view || "compare";
 }
 
+/* --------------------------------------------------------------------------
+ * 跨视图投递：对比视图右键「发送到聊天」把一张图交给传输视图，由用户在会话栏里
+ * 点一个框决定发给谁（选中即发，与「发给朋友」同一个手感）。
+ * 两个视图是两个模块、谁也不 import 谁，所以拿这一小块当传送带。
+ * 切走传输视图就当取消 —— 不然下次进来点一个会话，会把上一轮的图莫名发出去。
+ * ------------------------------------------------------------------------ */
+let pendingSend = null;
+
+export function setPendingSend(path, name) {
+  pendingSend = path ? { path, name: name || "" } : null;
+}
+
+export function takePendingSend() {
+  const p = pendingSend;
+  pendingSend = null;
+  return p;
+}
+
 export function setView(name) {
   if (!VIEWS.includes(name)) {
     console.warn("[view] 未知视图:", name);
     return;
   }
   if (name === currentView()) return;
+  if (name !== "transfer") pendingSend = null;
   document.body.dataset.view = name;
   for (const btn of document.querySelectorAll(".nav-btn")) {
     btn.classList.toggle("is-active", btn.dataset.goto === name);

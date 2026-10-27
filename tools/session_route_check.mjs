@@ -16,7 +16,7 @@
  *
  * 运行：node tools/session_route_check.mjs
  */
-import { mkdirSync, copyFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, copyFileSync, readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import os from "node:os";
@@ -226,6 +226,8 @@ const world = {
     { id: "C", peer: "C", name: "丙机", created: at(9, 9), read: at(1, 23, 59) },
   ],
   active: "A",
+  // 投递用例临时把它打开：模拟「事件比 invoke 返回值慢」的真实时序
+  muteEmit: false,
   // 被删过会话的框：历史还在，但列表不再从历史里把它补回来（与 Rust 的 hidden 同口径）
   hidden: [],
   hist: [],
@@ -285,6 +287,8 @@ function sessionRowOf(id) {
     port: p?.port || 0,
     online: !!p?.online,
     bound: !!p,
+    // 置顶只有会话表里存过的那几行有：补漏行/未标记永远不置顶（Rust 传的也是 false）
+    pinned: !!stored?.pinned,
     created: stored?.created || 0,
     // 与 Rust 同口径：只数对方发来的、且只数读指针之后的；未标记与补漏行（还没建会话的）不挂未读
     unread:
@@ -302,7 +306,10 @@ function sessionsPayload() {
     ...new Set([...world.sessions.map((s) => s.id), ...world.hist.map(sidOf)]),
   ].filter((k) => world.sessions.some((s) => s.id === k) || !world.hidden.includes(k));
   return {
-    sessions: keys.map(sessionRowOf).sort((a, b) => b.last - a.last),
+    sessions: keys.map(sessionRowOf).sort((a, b) =>
+      // 与 Rust 的 sort_session_rows 同口径：置顶的永远在前，组内按最后一条时间倒序
+      Number(b.pinned) - Number(a.pinned) || b.last - a.last
+    ),
     active: world.active,
   };
 }
@@ -394,6 +401,12 @@ window.__TAURI__.core.invoke = async (cmd, args = {}) => {
       s.name = args.name;
       return sessionsPayload();
     }
+    case "session_pin": {
+      const s = world.sessions.find((x) => x.id === args.id);
+      if (!s) throw new Error("没有这个会话");
+      s.pinned = !!args.pinned;
+      return sessionsPayload();
+    }
     case "session_delete":
       world.sessions = world.sessions.filter((s) => s.id !== args.id);
       // 只删这个框与它的读指针：历史一条不动，但记下这个框，免得补漏行把它又请回来
@@ -456,7 +469,8 @@ window.__TAURI__.core.invoke = async (cmd, args = {}) => {
           reason: null,
         };
         world.hist.push(m);
-        emit("msg-updated", { message: m });
+        // muteEmit：「投递后不等事件也要看得见」那一条要的：真实环境里 msg-updated 比返回值慢一拍
+        if (!world.muteEmit) emit("msg-updated", { message: m });
         return m;
       });
     }
@@ -1094,9 +1108,9 @@ const stMsg = byId("st-msg");
 const statusLog = [];
 stMsg.log = statusLog;
 check(
-  "离线会话的发送/文件按钮都不再禁用（禁不禁只看这台加没加过）",
-  ["btn-xfer-send", "btn-xfer-file", "btn-xfer-folder"].every((i) => byId(i).disabled === false),
-  ["btn-xfer-send", "btn-xfer-file", "btn-xfer-folder"].map((i) => String(byId(i).disabled)).join(",")
+  "离线会话的发送按钮不再禁用（禁不禁只看这台加没加过）",
+  byId("btn-xfer-send").disabled === false,
+  String(byId("btn-xfer-send").disabled)
 );
 
 since = calls.length;
@@ -1164,12 +1178,33 @@ check(
 since = calls.length;
 api.routeDrop(["/tmp/甲.jpg", "/tmp/一个文件夹"]);
 await settle();
+// 微信那套：松手只入待发送区，一个都不发；点发送才真发
+const chips = byId("xfer-attach-row").children;
+check(
+  "拖进来的东西只入待发送区，一个都不发出去",
+  takeCalls("send_paths", since).length === 0 && byId("xfer-attach").hidden === false && chips.length === 2,
+  `calls=${takeCalls("send_paths", since).length} chips=${chips.length}`
+);
+check(
+  "待发送区写着这一批是发给哪一台",
+  /发给「乙机」/.test(byId("xfer-attach-title").text),
+  byId("xfer-attach-title").text
+);
+check(
+  "待发送的每颗都能单独移除（× 直接绑在按钮上）",
+  chips.every((c) => c.children.some((n) => n.classList.contains("attach-x") && n.listeners.length > 0)),
+  chips.map((c) => c.children.map((n) => n.className).join("|")).join(" / ")
+);
+since = calls.length;
+click(byId("btn-xfer-send"));
+await settle();
 const sp = takeCalls("send_paths", since);
 check(
-  "离线时拖进来的东西走 send_paths 排队（一件文件一个文件夹）",
+  "点发送才走 send_paths 排队（一件文件一个文件夹）",
   sp.length === 1 && sp[0][1].paths.length === 2 && sp[0][1].to === "B",
   JSON.stringify(sp[0] && sp[0][1])
 );
+check("发出去之后待发送区收起来", byId("xfer-attach").hidden === true, String(byId("xfer-attach").hidden));
 const qBubs = bubbles().filter((b) => b.classSet.has("is-queued"));
 check("排队的那批气泡都挂着待发", qBubs.length === 2, String(qBubs.length));
 check(
@@ -1686,6 +1721,320 @@ emit("sessions-changed", sessionsPayload());
 await settle();
 check("那一段跑完会话栏还原回桩后端的真列表", rows().length === sessionsPayload().sessions.length, `${rows().length}`);
 
+/* 20c) 会话栏右键：自己画的中文菜单（WebView 原生那套是 Reload / Inspect Element，
+      语言跟着系统走英语，跟聊天没关系）。置顶跟微信一个手感：排到最上面、底色深一档，
+      再右键一次就能取消，重启还在（存 sessions.json） */
+const chatMenuEl = byId("chat-menu");
+// index.html 里这三枚是菜单的子节点；桩不解析 HTML，这里照实挂上（contains 才判得了「点在菜单里」）
+for (const id of ["ctx-chat-pin", "ctx-chat-rename", "ctx-chat-del"]) chatMenuEl.appendChild(byId(id));
+// index.html 上带 hidden，桩不读属性，用例自己先盖上
+chatMenuEl.hidden = true;
+
+const rightClick = (node) => {
+  let blocked = false;
+  node.dispatchEvent({
+    type: "contextmenu",
+    target: node,
+    clientX: 120,
+    clientY: 160,
+    preventDefault: () => {
+      blocked = true;
+    },
+    stopPropagation() {},
+  });
+  return blocked;
+};
+const fireWindow = (type, target) => {
+  for (const [t, fn] of winListeners) if (t === type) fn({ type, target });
+};
+
+emit("sessions-changed", sessionsPayload());
+await settle();
+check(
+  "右键之前菜单是收着的（与 index.html 上的 hidden 一致）",
+  chatMenuEl.hidden === true,
+  `hidden=${chatMenuEl.hidden}`
+);
+const rowIdx = (id) => rows().findIndex((r) => r.dataset.id === id);
+check(
+  "默认按最后一条时间排：丙机今天 10:00 那条比甲机的晚",
+  rowIdx("C") >= 0 && rowIdx("A") > rowIdx("C"),
+  rows().map((r) => r.dataset.id).join(",")
+);
+
+// 右键甲机那一行：出来的是自己的中文菜单，系统菜单被挡掉
+const blockedSys = rightClick(rowOf("A"));
+check("右键会话行先 preventDefault：不再弹 Reload / Inspect Element 那套", blockedSys === true, `blocked=${blockedSys}`);
+check("弹出来的是自己画的那份菜单", chatMenuEl.hidden === false, `hidden=${chatMenuEl.hidden}`);
+check(
+  "还没置顶过的，第一项就是「置顶该聊天」",
+  byId("ctx-chat-pin").textContent === "置顶该聊天",
+  byId("ctx-chat-pin").textContent
+);
+check(
+  "菜单贴在鼠标处摊开（贴边才翻到另一边）",
+  chatMenuEl.style.left === "120px" && chatMenuEl.style.top === "160px",
+  `${chatMenuEl.style.left},${chatMenuEl.style.top}`
+);
+
+// 点「置顶该聊天」
+const sincePin = calls.length;
+click(byId("ctx-chat-pin"));
+await settle();
+const pin1 = takeCalls("session_pin", sincePin).at(-1)?.[1];
+check(
+  "点置顶只发一个 session_pin{id,pinned:true}，没有别的后端改动",
+  takeCalls("session_pin", sincePin).length === 1 && pin1?.id === "A" && pin1?.pinned === true,
+  JSON.stringify(pin1)
+);
+check("点完菜单自己收起", chatMenuEl.hidden === true, `hidden=${chatMenuEl.hidden}`);
+check("置顶行带 is-pinned（底色深一档）", rowOf("A")?.classSet.has("is-pinned"), rowOf("A")?.className);
+check(
+  "置顶的永远排最前，哪怕它不是最后说话的那个",
+  rows()[0]?.dataset.id === "A" && rowIdx("A") < rowIdx("C"),
+  rows().map((r) => r.dataset.id).join(",")
+);
+
+// 再右键一次：同一项变成「取消置顶」，点完回到按时间的位置
+rightClick(rowOf("A"));
+check(
+  "已经置顶过的，第一项变成「取消置顶」",
+  byId("ctx-chat-pin").textContent === "取消置顶",
+  byId("ctx-chat-pin").textContent
+);
+const sinceUnpin = calls.length;
+click(byId("ctx-chat-pin"));
+await settle();
+const pin2 = takeCalls("session_pin", sinceUnpin).at(-1)?.[1];
+check(
+  "取消置顶：pinned=false，行上的 is-pinned 也去掉",
+  pin2?.pinned === false && !rowOf("A")?.classSet.has("is-pinned"),
+  JSON.stringify(pin2)
+);
+check(
+  "取消之后回到按时间的位置（甲机本来就比丙机早）",
+  rowIdx("A") > rowIdx("C"),
+  rows().map((r) => r.dataset.id).join(",")
+);
+
+// 点菜单外面收起；点菜单里面不算「外面」
+rightClick(rowOf("C"));
+fireWindow("pointerdown", byId("ctx-chat-rename"));
+check("点在菜单里面（换到「重命名」上）不会先把菜单收掉", chatMenuEl.hidden === false, `hidden=${chatMenuEl.hidden}`);
+fireWindow("pointerdown", byId("xfer-stream"));
+check("点菜单外面就收起（系统菜单那个手感）", chatMenuEl.hidden === true, `hidden=${chatMenuEl.hidden}`);
+
+// 删除仍是两步：第一下只把文案改成「再点一次删除」
+world.sessions.push({ id: "TMP", peer: "A", name: "待删的框", created: NOW, read: NOW });
+emit("sessions-changed", sessionsPayload());
+await settle();
+rightClick(rowOf("TMP"));
+const sinceDel = calls.length;
+click(byId("ctx-chat-del"));
+await settle();
+check(
+  "第一下不删：文案先变成「再点一次删除」",
+  byId("ctx-chat-del").textContent === "再点一次删除" && takeCalls("session_delete", sinceDel).length === 0,
+  byId("ctx-chat-del").textContent
+);
+check("两步确认在同一个菜单里完成（点第一下不会把菜单收掉）", chatMenuEl.hidden === false, `hidden=${chatMenuEl.hidden}`);
+click(byId("ctx-chat-del"));
+await settle();
+check(
+  "第二下才真删，且删的就是右键的那个框",
+  takeCalls("session_delete", sinceDel).some(([, a]) => a.id === "TMP"),
+  JSON.stringify(takeCalls("session_delete", sinceDel))
+);
+world.hidden = world.hidden.filter((x) => x !== "TMP");
+
+// 「未标记」那行不是一台真设备：菜单没有着落，只把系统菜单挡掉
+const unmarkedRow = rows().find((r) => r.dataset.id === "");
+const blockedUnmarked = rightClick(unmarkedRow);
+check(
+  "未标记行右键：挡住系统菜单、不弹置顶菜单，只说明这一行只能看",
+  blockedUnmarked === true && chatMenuEl.hidden === true && /只能查看/.test(byId("st-msg").textContent),
+  `blocked=${blockedUnmarked} hidden=${chatMenuEl.hidden} st="${byId("st-msg").textContent}"`
+);
+
+// 静态合约：菜单三项是中文、没有英文原生项；前后端各自的入口都在
+const html = readFileSync(join(here, "..", "js", "index.html"), "utf8");
+const xferJs = readFileSync(join(here, "..", "js", "view-transfer.js"), "utf8");
+const rustNet = readFileSync(join(here, "..", "src-tauri", "src", "net", "mod.rs"), "utf8");
+const rustStore = readFileSync(join(here, "..", "src-tauri", "src", "store.rs"), "utf8");
+// 只看菜单那一块：index.html 里的注释也写着「Reload / Inspect Element」为何被替掉，不能一刀切
+const menuAt = html.indexOf('id="chat-menu"');
+const menuHtml = menuAt < 0 ? "" : html.slice(menuAt, menuAt + 700);
+check(
+  "菜单三项都是中文（置顶 / 重命名 / 删除），菜单里没有 Reload / Inspect",
+  /置顶该聊天/.test(menuHtml) &&
+    /重命名/.test(menuHtml) &&
+    /删除聊天/.test(menuHtml) &&
+    !/Reload|Inspect Element/.test(menuHtml),
+  menuHtml.slice(0, 80)
+);
+check(
+  "右键入口挂在会话行上，不是全局 contextmenu",
+  /row\.addEventListener\("contextmenu"[\s\S]{0,400}?openChatMenu\(ev, s, row\)/.test(xferJs),
+  ""
+);
+check(
+  "置顶走后端存盘：命令 + 字段 + 排序都在",
+  /invoke\("session_pin"/.test(xferJs) &&
+    /pub fn session_pin/.test(rustNet) &&
+    /fn sort_session_rows/.test(rustNet) &&
+    /"pinned": pinned/.test(rustNet) &&
+    /pub pinned: bool/.test(rustStore),
+  ""
+);
+check(
+  "排序只作用在发给前端的那份上：存盘顺序不动（取消置顶才能回原位）",
+  /fn sort_session_rows\(rows: &mut \[Value\]\)/.test(rustNet),
+  ""
+);
+
+/* 20d) 聊天气泡里的图片右键：换成中文菜单（与对比视图同一批命令）
+      只拦图片 —— 文字气泡里的右键要的是系统的选词与拷贝（截图里用户报的就是图片这一处） */
+const imgMenuEl = byId("chat-img-menu");
+// index.html 里这五枚是菜单的子节点；桩不解析 HTML，这里照实挂上
+for (const id of ["cb-copy-img", "cb-save", "cb-copy-path", "cb-reveal", "cb-compare"]) imgMenuEl.appendChild(byId(id));
+imgMenuEl.hidden = true;
+
+const bubbleOf = (id) => {
+  const msg = bubbles().find((b) => b.dataset.id === id);
+  return msg ? msg.children.find((c) => c.classSet.has("bubble")) || null : null;
+};
+
+// 切回甲机，造一条带本机路径的图片进当前流（截图里就是收件箱那张）
+click(rowOf("A"));
+await settle();
+emit("msg-in", {
+  message: {
+    id: "img1",
+    dir: "in",
+    kind: "file",
+    name: "圣诞雪花树纹针织图案.png",
+    path: "/收件箱/圣诞雪花树纹针织图案.png",
+    size: 2024000,
+    state: "sent",
+    ts: at(0, 16),
+    peer: "A",
+  },
+});
+await settle();
+const imgBubble = bubbleOf("img1");
+const imgBlocked = rightClick(imgBubble);
+check(
+  "图片气泡右键先 preventDefault：不再弹 Open Image / Download / Copy Subject 那套",
+  imgBlocked === true,
+  `blocked=${imgBlocked}`
+);
+check("弹的是自己的中文菜单", imgMenuEl.hidden === false, `hidden=${imgMenuEl.hidden}`);
+check(
+  "菜单五枚都在（文案与命令的对应关系交给下面的静态合约）",
+  imgMenuEl.children.length === 5,
+  String(imgMenuEl.children.length)
+);
+check(
+  "菜单贴在鼠标处（与会话菜单共用 placeMenuAt）",
+  imgMenuEl.style.left === "120px" && imgMenuEl.style.top === "160px",
+  `${imgMenuEl.style.left},${imgMenuEl.style.top}`
+);
+
+const sinceCopy = calls.length;
+click(byId("cb-copy-img"));
+await settle();
+check(
+  "「复制图片」走 copy_as_file，路径就是这张图（粘到微信还是图）",
+  takeCalls("copy_as_file", sinceCopy).some(([, a]) => a.paths?.[0] === "/收件箱/圣诞雪花树纹针织图案.png"),
+  JSON.stringify(takeCalls("copy_as_file", sinceCopy))
+);
+check("点完菜单自己收起", imgMenuEl.hidden === true, `hidden=${imgMenuEl.hidden}`);
+
+rightClick(imgBubble);
+const sinceSave2 = calls.length;
+click(byId("cb-save"));
+await settle();
+check(
+  "「另存为…」走 save_path_as，src 是这张图",
+  takeCalls("save_path_as", sinceSave2).some(([, a]) => a.src === "/收件箱/圣诞雪花树纹针织图案.png"),
+  JSON.stringify(takeCalls("save_path_as", sinceSave2))
+);
+
+rightClick(imgBubble);
+const sinceReveal2 = calls.length;
+click(byId("cb-reveal"));
+await settle();
+check(
+  "「在文件夹中显示」走 reveal_in_folder",
+  takeCalls("reveal_in_folder", sinceReveal2).some(([, a]) => a.path === "/收件箱/圣诞雪花树纹针织图案.png"),
+  JSON.stringify(takeCalls("reveal_in_folder", sinceReveal2))
+);
+
+// 「在对比中打开」交给对比视图：桩里注册一个处理者，相当于那边已经就绪
+api.registerOpenHandler("compare", () => {});
+rightClick(imgBubble);
+click(byId("cb-compare"));
+await settle();
+check(
+  "「在对比中打开」切到对比视图（路径交给那边的打开处理者）",
+  document.body.dataset.view === "compare",
+  document.body.dataset.view
+);
+api.setView("transfer");
+await settle();
+
+// 文字气泡不拦：那里面要的是系统的选词与拷贝
+const textMsg = bubbles().find((b) => b.classSet.has("kind-text"));
+const textBubble = textMsg ? textMsg.children.find((c) => c.classSet.has("bubble")) : null;
+const textBlocked = rightClick(textBubble);
+check(
+  "文字气泡右键不拦：选词/拷贝仍是系统那套（菜单也不开）",
+  textBlocked === false && imgMenuEl.hidden === true,
+  `blocked=${textBlocked} hidden=${imgMenuEl.hidden}`
+);
+
+// 非图片文件也不拦：文件名要能选中、拷贝（只盯「有路径的图片」这一种）
+emit("msg-in", {
+  message: {
+    id: "doc1",
+    dir: "in",
+    kind: "file",
+    name: "报表.pdf",
+    path: "/收件箱/报表.pdf",
+    size: 1024,
+    state: "sent",
+    ts: at(0, 17),
+    peer: "A",
+  },
+});
+await settle();
+const docBlocked = rightClick(bubbleOf("doc1"));
+check(
+  "非图片文件右键不拦（.pdf 这类不该换成图片菜单）",
+  docBlocked === false && imgMenuEl.hidden === true,
+  `blocked=${docBlocked} hidden=${imgMenuEl.hidden}`
+);
+
+// 关得干净：点菜单外面就收起
+rightClick(imgBubble);
+fireWindow("pointerdown", byId("xfer-stream"));
+check("点菜单外面就收起（与系统菜单同一个手感）", imgMenuEl.hidden === true, `hidden=${imgMenuEl.hidden}`);
+
+check(
+  "只拦图片：contextmenu 挂在文件气泡上且判 IMAGE_EXT，没挂到整个消息流",
+  /bubble\.addEventListener\("contextmenu"[\s\S]{0,400}?IMAGE_EXT\.test\(nm\)/.test(xferJs) &&
+    !/stream\.addEventListener\("contextmenu"/.test(xferJs),
+  ""
+);
+const imgMenuAt = html.indexOf('id="chat-img-menu"');
+const imgMenuHtml = imgMenuAt < 0 ? "" : html.slice(imgMenuAt, imgMenuAt + 700);
+check(
+  "图片菜单五项都是中文，菜单里没有任何英文原生项",
+  ["复制图片", "另存为…", "复制文件路径", "在文件夹中显示", "在对比中打开"].every((t) => imgMenuHtml.includes(t)) &&
+    !/Open Image|Download Image|Copy Image|Copy Subject|Look Up|Share…|Inspect Element/.test(imgMenuHtml),
+  imgMenuHtml.slice(0, 60)
+);
+
 /* 21) 本机接收：提示音开关与收件目录（都存 prefs.json，与对比视图那份共用） */
 const notifyChk = () => byId("chk-notify-sound");
 const notifyTxt = () => byId("sw-notify-text");
@@ -1822,6 +2171,181 @@ check(
   "抽屉收起再打开会重读：磁盘上被改掉的开关能回到界面（不是只在启动读一次）",
   notifyChk().checked === false && notifyTxt().text === "不响",
   `checked=${notifyChk().checked} 文案="${notifyTxt().text}"`
+);
+
+/* 12) 对比视图右键「发送到聊天」：先摆进待发送区，选哪个框就发给哪个，点发送才真发 */
+const activeRow = () => rows().find((r) => r.classSet.has("is-active")) || null;
+const attachChips = () => [...byId("xfer-attach-row").children].map((c) => c.dataset.path);
+// 上一段拖进来的两张还摆在待发送区（现在切框不会再自动换掉），先清干净再验投递
+click(byId("xfer-attach-clear"));
+let deliverSince = calls.length;
+// 先走回对比视图再切过来：真机上就是这个动作，也才能触发 onViewChange 那一下
+api.setView("compare");
+api.setPendingSend("/tmp/投递/先摆着.png", "先摆着.png");
+api.setView("transfer");
+await settle();
+check(
+  "投递过来只入待发送区、不自动发（先摆着，等用户挑人）",
+  takeCalls("send_paths", deliverSince).length === 0 &&
+    byId("xfer-attach").hidden === false &&
+    attachChips().includes("/tmp/投递/先摆着.png"),
+  `calls=${takeCalls("send_paths", deliverSince).length} chips=${attachChips().join(",")}`
+);
+check(
+  "投递进来的这批还没认归属：标题写「点发送就发给…」而不是已发",
+  /点发送就发给「/.test(byId("xfer-attach-title").text) &&
+    !byId("xfer-attach-title").classSet.has("is-off-target"),
+  byId("xfer-attach-title").text
+);
+
+// 点会话只切会话，不发：发不发由下面那颗发送按钮定
+const otherRow = rows().find((r) => r.dataset.id && r !== activeRow());
+deliverSince = calls.length;
+click(otherRow);
+await settle();
+check(
+  "点会话只切框、一个都不发（微信是选人再点发送，不是点人就发）",
+  takeCalls("send_paths", deliverSince).length === 0 &&
+    rowOf(otherRow.dataset.id)?.classSet.has("is-active"),
+  `${takeCalls("send_paths", deliverSince).length} active=${rowOf(otherRow.dataset.id)?.classSet.has("is-active")}`
+);
+check(
+  "切到哪个框，待发送区就说发给哪个（选谁发给谁）",
+  /点发送就发给「/.test(byId("xfer-attach-title").text),
+  byId("xfer-attach-title").text
+);
+
+// 发送：to 必须是此刻选中的那个框；事件先关掉，气泡只能靠返回值自己画
+stream().scrollHeight = 1200;
+stream().scrollTop = 0;
+world.muteEmit = true;
+deliverSince = calls.length;
+const historySince = calls.length;
+click(byId("btn-xfer-send"));
+await settle();
+const delivered = takeCalls("send_paths", deliverSince);
+check(
+  "点发送才发：to 是此刻选中的那个框，路径就是投进来的那张图",
+  delivered.length === 1 &&
+    delivered[0][1].to === otherRow.dataset.id &&
+    delivered[0][1].paths[0] === "/tmp/投递/先摆着.png",
+  JSON.stringify(delivered[0] || null)
+);
+check(
+  "发完不等 msg-updated 也把气泡画上去（用户说的「没显示」就是这里）",
+  (() => {
+    // 历史是按 ts 排的，不能拿 at(-1) 认新消息；按路径找
+    const mine = world.hist.find((x) => x.path === "/tmp/投递/先摆着.png");
+    return !!mine && bubbles().some((n) => n.dataset.id === mine.id);
+  })(),
+  bubbles()
+    .map((b) => b.dataset.id)
+    .join(",") +
+    ` | hist=${world.hist.filter((x) => x.path === "/tmp/投递/先摆着.png").map((x) => x.id).join(",")}`
+);
+check(
+  "这条是靠返回值自己画上去的，不是靠重铺历史顶上去的",
+  takeCalls("msg_history", historySince).length === 0,
+  `msg_history 调了 ${takeCalls("msg_history", historySince).length} 次`
+);
+check(
+  "发完把流滚到底：图片气泡比文字高，停在视口外看着就像没发出去",
+  stream().scrollTop === 1200,
+  String(stream().scrollTop)
+);
+world.muteEmit = false;
+check(
+  "发完待发送区收起来",
+  byId("xfer-attach").hidden === true,
+  String(byId("xfer-attach").hidden)
+);
+
+/* 12b) 用户报的那一条：在 A 里粘/拖进来的图，切到 B 也要能直接发给 B（原来卡在「属于某某」的黄字） */
+api.routeDrop(["/tmp/切框/粘贴的图.png"]);
+await settle();
+check(
+  "拖进来只入待发送区，标题写发给当前这个框",
+  attachChips().length === 1 && /点发送就发给「/.test(byId("xfer-attach-title").text),
+  `${attachChips().join(",")} | ${byId("xfer-attach-title").text}`
+);
+const thirdRow = rows().find(
+  (r) => r.dataset.id && r.dataset.id !== otherRow.dataset.id && !r.classSet.has("is-unbound")
+);
+click(thirdRow);
+await settle();
+check(
+  "切到另一个会话不再锁住：还是「点发送就发给此刻这个」，不出黄字",
+  attachChips().length === 1 &&
+    /点发送就发给「/.test(byId("xfer-attach-title").text) &&
+    !byId("xfer-attach-title").classSet.has("is-off-target"),
+  byId("xfer-attach-title").text
+);
+deliverSince = calls.length;
+click(byId("btn-xfer-send"));
+await settle();
+const moved = takeCalls("send_paths", deliverSince);
+check(
+  "切过去点发送就发给新的那个框（不再被「先切回去发」拦住）",
+  moved.length === 1 && moved[0][1].to === thirdRow.dataset.id,
+  JSON.stringify(moved[0] || null)
+);
+
+/* 13) 发给「还没添加」的会话（自检话题框那一类）：点发送时拦下，图留在待发送区 */
+world.sessions.push({ id: "ghost", peer: "GHOST", name: "自检话题框", created: Date.now(), read: Date.now() });
+emit("sessions-changed", sessionsPayload());
+await settle();
+const ghostRow = rowOf("ghost");
+check(
+  "没添加的对端那一行带 is-unbound（名字淡一档，免得在会话栏里误点）",
+  !!ghostRow?.classSet.has("is-unbound"),
+  ghostRow?.classSet ? [...ghostRow.classSet].join(",") : "没这行"
+);
+
+api.setView("compare");
+api.setPendingSend("/tmp/投递/发不出去.png", "发不出去.png");
+api.setView("transfer");
+await settle();
+click(ghostRow);
+await settle();
+deliverSince = calls.length;
+const logBeforeGhost = statusLog.length;
+click(byId("btn-xfer-send"));
+await settle();
+check(
+  "发给没添加的对端：不发 send_paths、说「还没添加为对端」，图留在待发送区",
+  takeCalls("send_paths", deliverSince).length === 0 &&
+    statusLog.slice(logBeforeGhost).some((t) => String(t).includes("还没添加为对端")) &&
+    attachChips().includes("/tmp/投递/发不出去.png"),
+  `${takeCalls("send_paths", deliverSince).length} | ${statusLog.slice(logBeforeGhost).join(" | ")} | ${attachChips().join(",")}`
+);
+
+const xferSrc = readFileSync(join(here, "..", "js", "view-transfer.js"), "utf8");
+check(
+  "投递只入待发送区：stagePendingSend 走 addAttach（进视图就摆好，不用点会话）",
+  /async function stagePendingSend[\s\S]{0,700}?addAttach\(\[pending\.path\], \{ allowNoSession: true \}\)/.test(
+    xferSrc
+  )
+);
+check(
+  "openSession 不再顺手发：切会话那段里没有 send_paths / flushPendingSend",
+  !/async function openSession[\s\S]{0,1200}?(send_paths|flushPendingSend)/.test(xferSrc)
+);
+check(
+  "发送不等事件：runSend 拿到返回值先画气泡再滚到底",
+  /async function runSend[\s\S]{0,900}?routeMessage\(m, "send"\)[\s\S]{0,400}?scrollBottom\(\)/.test(xferSrc)
+);
+check(
+  "顶栏没有「发送文件 / 发送文件夹」两个按钮了（拖进来照样进待发送区）",
+  !/btn-xfer-file|btn-xfer-folder/.test(html) &&
+    !/pick_send_files|ui\.btnFile|ui\.btnFolder/.test(xferSrc) &&
+    /registerDropHandler\("transfer", \(paths\) => addAttach\(paths\)\)/.test(xferSrc),
+  [
+    /btn-xfer-file|btn-xfer-folder/.test(html) ? "按钮还在页面里" : "",
+    /pick_send_files|ui\.btnFile|ui\.btnFolder/.test(xferSrc) ? "脚本还在接线" : "",
+    /registerDropHandler\("transfer", \(paths\) => addAttach\(paths\)\)/.test(xferSrc) ? "" : "拖拽入口没了",
+  ]
+    .filter(Boolean)
+    .join(" / ") || "页面与脚本都清干净了"
 );
 
 console.log(failed ? `\n${failed} 项未通过` : "\n全部通过");

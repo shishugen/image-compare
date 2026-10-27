@@ -11,6 +11,7 @@
  * ========================================================================== */
 
 import {
+  assetSrc,
   copyPathAsFile,
   copyText,
   currentView,
@@ -24,11 +25,13 @@ import {
   isTauriRuntime,
   listen,
   noteViewSeen,
+  onViewChange,
   openInCompare,
   registerDropHandler,
   registerDropHoverHandler,
   registerPasteTextHandler,
   setStatus,
+  takePendingSend,
   toast,
 } from "./api.js";
 
@@ -36,8 +39,6 @@ const ui = {
   stream: el("xfer-stream"),
   input: el("xfer-input"),
   btnSend: el("btn-xfer-send"),
-  btnFile: el("btn-xfer-file"),
-  btnFolder: el("btn-xfer-folder"),
   peer: el("xfer-peer"),
   passphrase: el("inp-passphrase"),
   deviceName: el("inp-device-name"),
@@ -51,7 +52,7 @@ const ui = {
   candidates: el("xfer-candidates"),
   settings: el("xfer-settings"),
   btnSettings: el("btn-xfer-settings"),
-  // 本机接收（提示音 / 收件目录）
+  // 本机接收（提示音 / 收件目录 / 收件目录里的摆放）
   notifyChk: el("chk-notify-sound"),
   notifyText: el("sw-notify-text"),
   btnAudition: el("btn-notify-audition"),
@@ -59,14 +60,28 @@ const ui = {
   btnInboxChoose: el("btn-inbox-choose"),
   btnInboxReset: el("btn-inbox-reset"),
   btnInboxReveal: el("btn-inbox-reveal"),
+  inboxLayout: el("inp-inbox-layout"),
+  inboxSample: el("inbox-layout-sample"),
   dropHint: el("xfer-drop-hint"),
   dropText: el("xfer-drop-text"),
+  // 待发送区（选好/拖进来的东西先摆在这里，点发送才发）
+  attach: el("xfer-attach"),
+  attachRow: el("xfer-attach-row"),
+  attachTitle: el("xfer-attach-title"),
+  btnAttachClear: el("xfer-attach-clear"),
   older: el("xfer-older"),
   search: el("xfer-search"),
   chips: el("xfer-chips"),
   filterCount: el("xfer-filter-count"),
   sessions: el("xfer-sessions"),
   sessionRows: el("xfer-session-rows"),
+  // 会话行右键菜单（置顶 / 重命名 / 删除），替掉 WebView 那套英文原生菜单
+  chatMenu: el("chat-menu"),
+  chatPin: el("ctx-chat-pin"),
+  chatRename: el("ctx-chat-rename"),
+  chatDel: el("ctx-chat-del"),
+  // 聊天气泡里图片的右键菜单（与对比视图同批命令，中文）
+  chatImgMenu: el("chat-img-menu"),
   navBadge: el("nav-badge-xfer"),
   btnNewChat: el("btn-session-new"),
   chatPick: el("xfer-chat-pick"),
@@ -95,10 +110,17 @@ const state = {
   /** 当前对话框的会话 ID（不是对端 ID：同一台能有好几个框）。null = 还没有任何会话 */
   cur: null,
   sending: false,
+  /** 待发送区：选好/拖进来但还没发出去的东西，按选的顺序摆着。
+   *  它只是「下一句要发的东西」，不认会话 —— 跟着当前对话框走，所以切了框也能在这里直接发。
+   *  以前给这一批记一个归属（attachSid）并在切走后拦下，结果是粘一张图、切个框就卡在那
+   *  发不出去也删不掉的黄字上（用户报过），那层锁多余 */
+  attach: [],
   /** 当前搜索条件：kind 为 all/text/image/folder/archive/other，q 为关键词 */
   filter: { kind: "all", q: "" },
   /** 当前生效的收件目录，只给「打开目录」用（抽屉打开时读一次） */
   inboxDir: "",
+  /** 收件目录里的摆放：day / month / flat。记一份是为了在下拉存盘失败时能退回原值 */
+  inboxLayout: "day",
 };
 
 /**
@@ -283,8 +305,6 @@ function renderPeerHead() {
     }</span>`;
   }
   ui.btnSend.disabled = !canSend || state.sending;
-  ui.btnFile.disabled = ui.btnSend.disabled;
-  ui.btnFolder.disabled = ui.btnSend.disabled;
   ui.btnUnbind.disabled = !(sess && peer);
   ui.btnReprobe.disabled = !(sess && peer);
   // 备注名是改「这台」的，不是改某个对话框的：没有登记过的对端没得改
@@ -409,11 +429,224 @@ async function openSession(id) {
     toast(errText(err), "error");
   }
   await loadHistory();
+  // 待发送区标着「发给哪个框」：换了框得把这句话与「不在这个会话」的提示重新算一遍
+  renderAttach();
+}
+
+/** 对比视图右键「发送到聊天」带过来的一张图：先摆进待发送区，用户挑好框再点发送。
+ *  微信也是这个顺序（先放进输入框、再选人），而不是点完会话就发出去 ——
+ *  那样没给人“反悔”的机会，也看不出到底是发给了谁。 */
+async function stagePendingSend() {
+  const pending = takePendingSend();
+  if (!pending) return;
+  // 反复投同一张：别把 addAttach 那句“已经在待发送区了”和下面这句叠成两条 toast
+  if (state.attach.some((a) => a.path === pending.path)) {
+    toast(`「${pending.name}」已经在待发送区了`);
+    return;
+  }
+  await addAttach([pending.path], { allowNoSession: true });
+  toast(
+    state.cur === null
+      ? `「${pending.name}」已放入待发送区：在左边选一个会话，再点发送`
+      : `「${pending.name}」已放入待发送区：换选别的会话也行，点发送发给当前这个`
+  );
 }
 
 /** 会话栏重建的代价虽然小，但心跳每秒都推一次 peers-changed，
  *  不去重就会每秒拆建一次 DOM（连带丢掉悬停与列表的滚动位置） */
 let railSig = "";
+
+/* --------------------------------------------------------------------------
+ * 会话行右键菜单
+ *
+ * 为什么要自己画：右键点会话行时 WKWebView 会弹它自己那套原生菜单（Reload / Inspect
+ * Element），语言跟着系统走英语，跟聊天一项关系都没有。这里换成中文三项：置顶 /
+ * 重命名 / 删除（删除跟行内那枚一样要两步）。
+ *
+ * 置顶的口径跟微信一样：置顶的永远排在最上面（不按最后一条消息时间），底色深一档；
+ * 取消置顶就回到按时间的位置。存在 sessions.json 里，重启还在。
+ * ------------------------------------------------------------------------ */
+const railMenu = { row: null, s: null, armed: false };
+/** 「删除聊天」臂上之后没人点，几秒得自己退回去 */
+let railArmTimer = 0;
+
+function closeChatMenu() {
+  if (!ui.chatMenu || ui.chatMenu.hidden) return;
+  ui.chatMenu.hidden = true;
+  railMenu.row = null;
+  railMenu.s = null;
+  railMenu.armed = false;
+  clearTimeout(railArmTimer);
+  if (ui.chatDel) ui.chatDel.textContent = "删除聊天";
+}
+
+/** 菜单在鼠标处摊开：先显示再量尺寸，贴到窗口右/下边时翻到另一边。
+ *  会话菜单与聊天气泡里的图片菜单共用这一份 —— 贴边翻页只写一次 */
+function placeMenuAt(m, ev) {
+  m.hidden = false;
+  // 先把坐标清零再量：留旧坐标会把贴边翻页算错（图片菜单踩过这个）
+  m.style.left = "0px";
+  m.style.top = "0px";
+  const rect = m.getBoundingClientRect ? m.getBoundingClientRect() : { width: 0, height: 0 };
+  const gap = 8;
+  const vw = window.innerWidth || 0;
+  const vh = window.innerHeight || 0;
+  let x = ev.clientX || 0;
+  let y = ev.clientY || 0;
+  if (vw && x + rect.width + gap > vw) x = Math.max(gap, x - rect.width);
+  if (vh && y + rect.height + gap > vh) y = Math.max(gap, y - rect.height);
+  m.style.left = x + "px";
+  m.style.top = y + "px";
+}
+
+/** 在鼠标处摊开会话菜单（算法见 placeMenuAt） */
+function openChatMenu(ev, s, row) {
+  if (!ui.chatMenu) return;
+  if (ev.preventDefault) ev.preventDefault();
+  if (ev.stopPropagation) ev.stopPropagation();
+  if (!ui.chatMenu.hidden) closeChatMenu();
+  railMenu.row = row;
+  railMenu.s = s;
+  railMenu.armed = false;
+  // 文案跟当前状态走：已经置顶过的，第一项就是「取消置顶」
+  if (ui.chatPin) ui.chatPin.textContent = s.pinned ? "取消置顶" : "置顶该聊天";
+  if (ui.chatDel) ui.chatDel.textContent = "删除聊天";
+  placeMenuAt(ui.chatMenu, ev);
+}
+
+/* --------------------------------------------------------------------------
+ * 聊天气泡里图片的右键菜单
+ *
+ * 与对比视图那套（`#img-menu`）同一批命令、同一套中文文案，差别只有一项：
+ * 这里本来就在聊天里，所以没有「发送到聊天」，换成「在对比中打开」。
+ *
+ * 只拦图片：文字气泡里的右键要的是系统的选词与拷贝，文件气泡里有时也要选文件名，
+ * 拦住反而少东西 ——— 所以判断条件盯的是「有本机路径的图片」，不是整个消息流。
+ * ------------------------------------------------------------------------ */
+const bubbleMenu = { path: "", name: "" };
+
+function closeBubbleMenu() {
+  if (!ui.chatImgMenu || ui.chatImgMenu.hidden) return;
+  ui.chatImgMenu.hidden = true;
+  bubbleMenu.path = "";
+  bubbleMenu.name = "";
+}
+
+function openBubbleMenu(ev, rec) {
+  if (!ui.chatImgMenu || !rec.path) return;
+  if (ev.preventDefault) ev.preventDefault();
+  if (ev.stopPropagation) ev.stopPropagation();
+  if (!ui.chatImgMenu.hidden) closeBubbleMenu();
+  bubbleMenu.path = rec.path;
+  bubbleMenu.name = rec.name || rec.path;
+  placeMenuAt(ui.chatImgMenu, ev);
+}
+
+async function runBubbleMenu(act) {
+  const p = bubbleMenu.path;
+  const name = bubbleMenu.name;
+  closeBubbleMenu();
+  if (!p) return;
+  try {
+    if (act === "copy-img") {
+      // 与对比视图同一个命令：剪贴板里同时有文件与位图，粘到微信就是图
+      await copyPathAsFile([p]);
+    } else if (act === "save") {
+      const saved = await invoke("save_path_as", { src: p });
+      // null = 选文件框里按了取消：这不是失败，不用弹提示
+      if (saved) toast(`已保存到 ${saved}`);
+    } else if (act === "copy-path") {
+      await copyText(p);
+    } else if (act === "reveal") {
+      await invoke("reveal_in_folder", { path: p });
+    } else if (act === "compare") {
+      openInCompare([p]);
+    }
+  } catch (err) {
+    console.error("[xfer] 图片菜单操作失败:", act, err);
+    toast(errText(err) || `${name} 操作失败`, "error");
+  }
+}
+
+for (const [id, act] of [
+  ["cb-copy-img", "copy-img"],
+  ["cb-save", "save"],
+  ["cb-copy-path", "copy-path"],
+  ["cb-reveal", "reveal"],
+  ["cb-compare", "compare"],
+]) {
+  const btn = el(id);
+  if (btn) btn.addEventListener("click", () => runBubbleMenu(act));
+}
+
+/** 置顶 / 取消置顶：后端只改标记 + 存盘，顺序与底色都靠返回的那份 payload 重画 */
+async function pinSession(s) {
+  const pinned = !s.pinned;
+  try {
+    applySessions(await invoke("session_pin", { id: s.id, pinned }));
+    toast(pinned ? "已置顶：会一直排在列表最上面" : "已取消置顶，回到按最后一条消息时间排的位置");
+  } catch (err) {
+    toast(errText(err) || "置顶失败", "error");
+  }
+}
+
+if (ui.chatPin) {
+  ui.chatPin.addEventListener("click", () => {
+    const s = railMenu.s;
+    closeChatMenu();
+    if (s) pinSession(s);
+  });
+}
+if (ui.chatRename) {
+  ui.chatRename.addEventListener("click", () => {
+    const s = railMenu.s;
+    const row = railMenu.row;
+    closeChatMenu();
+    // 行还挂在 DOM 上才能就地换成输入框（列表刚重画过就不硬塞了）
+    if (s && row && row.isConnected) startRename(s, row);
+  });
+}
+if (ui.chatDel) {
+  ui.chatDel.addEventListener("click", () => {
+    const s = railMenu.s;
+    if (!s) return;
+    // 跟行内那枚一样要两步：右键一下手滑不该就把对话框删了
+    if (!railMenu.armed) {
+      railMenu.armed = true;
+      ui.chatDel.textContent = "再点一次删除";
+      clearTimeout(railArmTimer);
+      railArmTimer = setTimeout(() => {
+        railMenu.armed = false;
+        if (ui.chatDel) ui.chatDel.textContent = "删除聊天";
+      }, 4000);
+      return;
+    }
+    closeChatMenu();
+    removeOne(s);
+  });
+}
+// 点菜单以外就收起（系统菜单就是这个手感）；菜单里自己的点击不算「外面」。
+// 用 pointerdown 而不是 click：按住拖出菜单外再松手，菜单也不会留到下一轮。
+// 右键也会先过这里 —— 关掉旧菜单后紧接着的 contextmenu 会在新目标上再开一个
+window.addEventListener("pointerdown", (ev) => {
+  const t = ev.target;
+  if (ui.chatMenu && !ui.chatMenu.hidden && !(t && ui.chatMenu.contains && ui.chatMenu.contains(t))) {
+    closeChatMenu();
+  }
+  if (ui.chatImgMenu && !ui.chatImgMenu.hidden && !(t && ui.chatImgMenu.contains && ui.chatImgMenu.contains(t))) {
+    closeBubbleMenu();
+  }
+});
+const closeBothMenus = () => {
+  closeChatMenu();
+  closeBubbleMenu();
+};
+window.addEventListener("wheel", closeBothMenus, { passive: true });
+window.addEventListener("resize", closeBothMenus);
+window.addEventListener("blur", closeBothMenus);
+window.addEventListener("keydown", (ev) => {
+  if (ev.key === "Escape") closeBothMenus();
+});
 
 function renderSessionRail() {
   if (!ui.sessionRows) return;
@@ -422,7 +655,9 @@ function renderSessionRail() {
   renderNavBadge(state.sessionList);
   const sig = JSON.stringify([
     state.cur,
-    state.sessionList.map((s) => [s.id, s.peer, s.name, s.online, s.unread, s.last, s.summary]),
+    // bound 也得进签名：同一行从「没添加」变成「已添加」时名字那档颜色要跟着变
+    // pinned 同理：置顶/取消置顶要重画（底色与位置都在这一份里）
+    state.sessionList.map((s) => [s.id, s.peer, s.name, s.bound, s.pinned, s.online, s.unread, s.last, s.summary]),
   ]);
   if (sig === railSig) return;
   railSig = sig;
@@ -440,7 +675,12 @@ function renderSessionRail() {
 function sessionNode(s) {
   const unmarked = s.peer === UNMARKED;
   const row = document.createElement("div");
-  row.className = "session-row" + (s.id === state.cur ? " is-active" : "");
+  row.className =
+    "session-row" +
+    (s.id === state.cur ? " is-active" : "") +
+    (s.bound ? "" : " is-unbound") +
+    // 置顶行底色深一档（微信那种），排序在后端：这一行永远在最前
+    (s.pinned ? " is-pinned" : "");
   // 带上会话 ID：名字会重名也会改，同一台还能有好几个框，行归属只认这个
   row.dataset.id = s.id;
   row.dataset.peer = s.peer;
@@ -474,6 +714,16 @@ function sessionNode(s) {
     row.appendChild(acts);
   }
   row.addEventListener("click", () => openSession(s.id));
+  // 右键换成自己的中文菜单（系统那套是 Reload / Inspect Element）。
+  // 「未标记」不是一台真设备：改名/置顶/删除都没有着落，只把系统菜单挡掉
+  row.addEventListener("contextmenu", (ev) => {
+    if (unmarked) {
+      if (ev.preventDefault) ev.preventDefault();
+      toast("这一行是老历史里没记对端的消息，只能查看");
+      return;
+    }
+    openChatMenu(ev, s, row);
+  });
   return row;
 }
 
@@ -767,6 +1017,15 @@ function buildBubble(m) {
     bubble.appendChild(actsBox);
     rec.actsBox = actsBox;
     attachActions(rec, m);
+    // 图片气泡右键换成中文菜单。文字气泡与非图片文件不拦 —— 那里要的是系统的选词与拷贝，
+    // 拦住反而少东西（截图里用户报的就是图片这一处）
+    bubble.addEventListener("contextmenu", (ev) => {
+      // rec.path 是接收完（xfer-done）才补上的，占位气泡当时还没有，兜底看在建气泡时那份
+      const p = rec.path || m.path;
+      const nm = rec.name || m.name || "";
+      if (!(rec.kind === "file" && p && IMAGE_EXT.test(nm))) return;
+      openBubbleMenu(ev, { path: p, name: nm });
+    });
   } else {
     const body = document.createElement("div");
     body.className = "msg-text";
@@ -1452,6 +1711,167 @@ function renderFilterEmpty(hit) {
 }
 
 /* --------------------------------------------------------------------------
+ * 待发送区：选好/拖进来的东西先摆着，点发送才真发（微信那套）
+ * ------------------------------------------------------------------------ */
+
+/** 一次最多摆多少个：摆太多横向铺到看不完，也顺手挡住误拖一整个大目录 */
+const ATTACH_LIMIT = 50;
+
+function baseName(p) {
+  const parts = String(p || "").split(/[\\/]/).filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : String(p || "");
+}
+
+/** 扩展名方块上那两三个字母：没有后缀就给 FILE，不留空 */
+function extLabel(name, isDir) {
+  if (isDir) return "DIR";
+  const m = /\.([A-Za-z0-9]{1,5})$/.exec(String(name || ""));
+  return m ? m[1].toUpperCase() : "FILE";
+}
+
+function fallbackBox(text) {
+  const fb = document.createElement("span");
+  fb.className = "attach-fallback";
+  fb.textContent = text;
+  return fb;
+}
+
+/** 选完/拖完/粘完只入列，不发网络。名字与大小问 Rust（前端分不出文件夹，也拿不到大小）
+ *  opts.allowNoSession：还没选会话也让进（对比视图投递过来的那张图） */
+async function addAttach(paths, opts = {}) {
+  const incoming = (paths || []).filter(Boolean);
+  if (!incoming.length) return;
+  // 拖拽/粘贴默认要有个明确的收件框；投递进来的那张例外，先摆着再选人
+  if (state.cur === null && !opts.allowNoSession) {
+    toast("先在左边开一个会话，再往里放文件", "error");
+    return;
+  }
+  // 同一个文件拖两次不该出现两颗；已经摆着的算命中，不再重复问后端
+  const have = new Set(state.attach.map((a) => a.path));
+  const fresh = incoming.filter((p) => !have.has(p));
+  if (!fresh.length) {
+    toast("这些已经在待发送区了", "error");
+    return;
+  }
+
+  let metas = null;
+  try {
+    metas = await invoke("stat_paths", { paths: fresh });
+  } catch (err) {
+    // 问不到元信息不该拦住发送：退回只认路径，名字从路径尾巴取
+    console.warn("[xfer] 取文件信息失败，待发送区只显示名字:", err);
+  }
+  // 命令没回数组（旧版后端 / 桩环境）也走退路：待发送区不能因为一个查询失败就空着
+  if (!Array.isArray(metas)) {
+    metas = fresh.map((p) => ({ path: p, name: baseName(p), size: 0, isDir: false, missing: false }));
+  }
+
+  const room = ATTACH_LIMIT - state.attach.length;
+  const take = metas.slice(0, Math.max(0, room));
+  for (const m of take) {
+    state.attach.push({
+      path: m.path,
+      name: m.name || baseName(m.path),
+      size: Number(m.size) || 0,
+      isDir: !!m.isDir,
+      missing: !!m.missing,
+    });
+  }
+  renderAttach();
+
+  const over = metas.length - take.length;
+  if (over > 0) toast(`待发送区最多放 ${ATTACH_LIMIT} 个，多出来的 ${over} 个没放进来`, "error");
+  const gone = take.filter((m) => m.missing).length;
+  if (gone) toast(`有 ${gone} 个路径已经找不到了，发送前先移除`, "error");
+}
+
+function removeAttach(path) {
+  state.attach = state.attach.filter((a) => a.path !== path);
+  renderAttach();
+}
+
+function clearAttach() {
+  state.attach = [];
+  renderAttach();
+}
+
+/** 一颗待发送：图片给缩略图，其余给扩展名方块 + 名字 + 大小（都是 dom 拼，不走 innerHTML：文件名里有尖括号不能当标签） */
+function attachChip(a) {
+  const isImage = !a.isDir && IMAGE_EXT.test(a.name);
+  const chip = document.createElement("div");
+  chip.className = `attach-chip ${isImage ? "is-image" : "is-file"}` + (a.missing ? " is-missing" : "");
+  chip.dataset.path = a.path;
+  chip.title = a.missing ? `${a.path}\n这个路径已经找不到了` : a.path;
+
+  if (isImage) {
+    const src = a.missing ? null : assetSrc(a.path);
+    if (src) {
+      const img = document.createElement("img");
+      img.alt = a.name;
+      img.src = src;
+      // asset 协议拿不到就退回扩展名方块：留一个灰窟窿比没有更让人怀疑程序坏了
+      img.addEventListener(
+        "error",
+        () => {
+          img.remove();
+          chip.appendChild(fallbackBox(extLabel(a.name, false)));
+        },
+        { once: true }
+      );
+      chip.appendChild(img);
+    } else {
+      chip.appendChild(fallbackBox(extLabel(a.name, false)));
+    }
+  } else {
+    const ext = document.createElement("span");
+    ext.className = "attach-ext";
+    ext.textContent = extLabel(a.name, a.isDir);
+    chip.appendChild(ext);
+
+    const body = document.createElement("div");
+    body.className = "attach-body";
+    const name = document.createElement("span");
+    name.className = "attach-name";
+    name.textContent = a.name;
+    const size = document.createElement("span");
+    size.className = "attach-size";
+    size.textContent = a.missing ? "路径已不存在" : a.isDir ? "文件夹（整个发过去）" : fmtSize(a.size);
+    body.appendChild(name);
+    body.appendChild(size);
+    chip.appendChild(body);
+  }
+
+  const x = document.createElement("button");
+  x.type = "button";
+  x.className = "attach-x";
+  x.textContent = "×";
+  x.title = "从待发送区移除（不发送）";
+  // 直接绑在按钮上：挂父级委托要依赖事件冒泡，自检桩里派发不冒泡，真机上多一层也无益
+  x.addEventListener("click", (ev) => {
+    ev?.stopPropagation?.();
+    removeAttach(a.path);
+  });
+  chip.appendChild(x);
+  return chip;
+}
+
+function renderAttach() {
+  if (!ui.attach || !ui.attachRow) return;
+  const list = state.attach;
+  ui.attach.hidden = !list.length;
+  ui.attachRow.textContent = "";
+  if (!list.length) return;
+
+  // 这批东西不认会话：跟着当前对话框走，切到哪个框就发给哪个（用户报过“属于某某、发不出去”的黄字）
+  const who = state.cur === null
+    ? "还没选会话：在左边点一个，再点发送"
+    : `点发送就发给「${sessName(state.cur)}」`;
+  // 多会话下必须把「发给谁」写出来：不写的话切了个框还以为这批是给上一个框的
+  ui.attachTitle.textContent = `待发送 ${list.length} 个 · ${who}`;
+  for (const a of list) ui.attachRow.appendChild(attachChip(a));
+}
+
+/* --------------------------------------------------------------------------
  * 发送
  * ------------------------------------------------------------------------ */
 
@@ -1470,44 +1890,74 @@ function requireSession() {
   return true;
 }
 
-async function sendText() {
-  const text = ui.input.value;
-  if (!text.trim()) {
-    toast("先写点内容", "error");
+/** 一次点击把待发送区的文件与输入框里的文字一起发出去。
+ *  微信也是先摆着再点发送；附件先出、文字随后，两条只弹一次 toast */
+async function sendComposer() {
+  const text = ui.input.value.trim();
+  if (!text && !state.attach.length) {
+    toast("先写点内容，或选好要发送的文件", "error");
     return;
   }
   if (!requireSession()) return;
-  ui.input.value = "";
-  ui.input.style.height = "";
-  // `to` 是会话 ID：同一台的几个框各自发到自己那个框里，后端拿它去带 X-Session
-  await runSend(() => invoke("send_text", { text, to: state.cur }));
+
+  const gone = state.attach.filter((a) => a.missing);
+  if (gone.length) {
+    toast(`待发送区有 ${gone.length} 个路径已经不在了，先移除再发`, "error");
+    return;
+  }
+
+  const paths = state.attach.map((a) => a.path);
+  let sentPaths = false;
+  let sentText = false;
+  let queued = false;
+
+  const ok = await runSend(async () => {
+    const out = [];
+    // 先文件后文字：附件是刚选的那一批，文字落在它下面读起来才顺
+    if (paths.length) {
+      const res = await invoke("send_paths", { paths, to: state.cur });
+      out.push(...(Array.isArray(res) ? res : [res]));
+      sentPaths = true;
+    }
+    if (text) {
+      out.push(await invoke("send_text", { text, to: state.cur }));
+      sentText = true;
+    }
+    queued = out.some((m) => m && m.state === "queued");
+    return out;
+  });
+
+  // 成功的部分才从输入区拿掉；失败就留着，省得用户从头再选一遍
+  if (sentPaths) clearAttach();
+  if (sentText) {
+    ui.input.value = "";
+    ui.input.style.height = "";
+  }
+  if (ok) toast(queued ? "对方离线，已排队，上线自动发出" : "已送达");
 }
 
-async function sendPaths(paths) {
-  if (!paths || !paths.length) return;
-  if (!requireSession()) return;
-  clearEmptyHint();
-  await runSend(() => invoke("send_paths", { paths, to: state.cur }));
-}
-
-/** 发送期间的统一收口：禁用按钮、错误提示、结束后按最新状态恢复 */
+/** 发送期间的统一收口：按钮禁上、错误提示、结束后按最新状态恢复。
+ *  成功文案交给调用方合并（文字 + 附件是两次 invoke，各说一次会连弹两个） */
 async function runSend(task) {
   clearEmptyHint();
   state.sending = true;
   ui.btnSend.disabled = true;
-  ui.btnFile.disabled = true;
-  ui.btnFolder.disabled = true;
   try {
-    const res = await task();
-    // 后端不再拿「离线」当错误：返回来的可能是刚入队的那一条（文件是一批）。
-    // 两种回执得说清楚，否则用户以为东西已经送出去了
-    const list = Array.isArray(res) ? res : [res];
-    const queued = list.some((m) => m && m.state === "queued");
-    toast(queued ? "对方离线，已排队，上线自动发出" : "已送达");
+    const out = await task();
+    // 不等 msg-updated 再画：事件比 invoke 返回值慢一拍，而用户点完发送该立刻看见自己发出去的东西。
+    // 图片气泡又比文字高，追加在末尾正好落在视口外，不滚到底看着就像没发出去（用户报过这一条）
+    const msgs = (Array.isArray(out) ? out : [out]).filter((m) => m && m.id);
+    let shown = false;
+    for (const m of msgs) shown = routeMessage(m, "send") || shown;
+    // 万一会话 ID 与消息里的 sid 对不上（老数据/异路径），重铺一遍兜底，不能只发在后台
+    if (msgs.length && !shown) await loadHistory();
+    if (msgs.length && !filterActive()) scrollBottom();
+    return true;
   } catch (err) {
     const msg = errText(err);
     console.error("[xfer] 发送失败:", err);
     toast(msg, "error");
+    return false;
   } finally {
     state.sending = false;
     await refreshStatus();
@@ -1572,6 +2022,47 @@ function paintInboxDir(path, custom) {
   if (ui.inboxValue) ui.inboxValue.textContent = path || "读取失败";
   // 已经在默认目录上时「恢复默认」没有意义，灰掉比点了没反应好懂
   if (ui.btnInboxReset) ui.btnInboxReset.disabled = !custom;
+  paintInboxSample(path, state.inboxLayout);
+}
+
+/** 三档摆放的中文名：只用在 toast 里，抽屉里的下拉自己带文案 */
+const INBOX_LAYOUT_NAME = {
+  day: "一天一个文件夹",
+  month: "一个月一个文件夹",
+  flat: "不分目录",
+};
+
+/**
+ * 与 Rust 侧 `chrono::Local::format("%Y-%m" / "%Y-%m-%d")` 同一口径的本地日期串。
+ * 抽屉里那行「新收到的文件落在 …」要靠它拼出一个真路径，写死示例会跟实际
+ * 落点对不上（跨月那天看抽屉，示例还停在示例里那个日期）。
+ */
+function localDateStamp(layout) {
+  const d = new Date();
+  const p2 = (n) => String(n).padStart(2, "0");
+  const ym = `${d.getFullYear()}-${p2(d.getMonth() + 1)}`;
+  if (layout === "month") return ym;
+  if (layout === "day") return `${ym}-${p2(d.getDate())}`;
+  return "";
+}
+
+function paintInboxSample(path, layout) {
+  if (!ui.inboxSample) return;
+  if (!path) {
+    ui.inboxSample.textContent = "…";
+    return;
+  }
+  const stamp = localDateStamp(layout);
+  ui.inboxSample.textContent = stamp ? `${path}/${stamp}/` : `${path}/`;
+}
+
+function paintInboxLayout(layout) {
+  // 读回一个前端不认的值时按下拉第一项（= 出厂按天）显示：界面上的选项
+  // 必须与 Rust 那边实际用的规则一致，两边不一致比没得选更难查
+  const v = INBOX_LAYOUT_NAME[layout] ? layout : "day";
+  state.inboxLayout = v;
+  if (ui.inboxLayout) ui.inboxLayout.value = v;
+  paintInboxSample(state.inboxDir, v);
 }
 
 /** 抽屉每次打开都重读：另一个抽屉可能刚改过同一份 prefs.json，用户也可能手改过磁盘 */
@@ -1585,6 +2076,7 @@ async function refreshRecvPrefs() {
   }
   try {
     const d = await invoke("inbox_dir");
+    if (d && d.layout) paintInboxLayout(String(d.layout));
     if (d && d.path) paintInboxDir(String(d.path), !!d.custom);
   } catch (_) {}
 }
@@ -1630,6 +2122,21 @@ async function revealInboxDir() {
   } catch (err) {
     toast(errText(err), "error");
   }
+}
+
+/** 切换收件目录的摆放。存不下就把下拉退回原值 —— 停在一个没生效的选项上，
+ * 用户下次收东西会跑到别的地方去找 */
+async function chooseInboxLayout(ev) {
+  const next = ev?.target?.value || "day";
+  const prev = state.inboxLayout;
+  if (next === prev) return;
+  // 参数名按 Tauri 默认 camelCase：Rust 那边是 `inbox_layout`
+  const ok = await saveRecvPrefs(
+    { inboxLayout: next },
+    `收件目录改成「${INBOX_LAYOUT_NAME[next] || next}」，只影响之后收到的文件`,
+  );
+  if (ok) paintInboxLayout(next);
+  else paintInboxLayout(prev);
 }
 
 /**
@@ -1681,12 +2188,12 @@ function bindManual() {
 /* --------------------------------------------------------------------------
  * 事件绑定
  * ------------------------------------------------------------------------ */
-ui.btnSend.addEventListener("click", sendText);
+ui.btnSend.addEventListener("click", sendComposer);
 ui.input.addEventListener("keydown", (ev) => {
   // Enter 发送、Shift+Enter 换行；输入法组合期间不能截走 Enter
   if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing) {
     ev.preventDefault();
-    sendText();
+    sendComposer();
   }
 });
 ui.input.addEventListener("input", () => {
@@ -1694,26 +2201,14 @@ ui.input.addEventListener("input", () => {
   ui.input.style.height = Math.min(ui.input.scrollHeight, 160) + "px";
 });
 
-ui.btnFile.addEventListener("click", async () => {
-  try {
-    const paths = await invoke("pick_send_files");
-    if (paths?.length) await sendPaths(paths);
-  } catch (err) {
-    toast(errText(err), "error");
-  }
-});
+// 顶栏那两个「发送文件 / 发送文件夹」撤掉了（用户要求聊天框上面不再显示）：
+// 拖进来、复制粘贴、从对比视图「发送到聊天」这三条都能往待发送区放东西，
+// 选完照样只入列不发，点发送才发 —— 少两个按钮不改这套口径。
+// 拖文件进窗口也只入待发送区：松手即发会让人没机会确认发的是哪个、发给谁
+registerDropHandler("transfer", (paths) => addAttach(paths));
 
-ui.btnFolder.addEventListener("click", async () => {
-  try {
-    const dir = await invoke("pick_folder");
-    if (dir) await sendPaths([dir]);
-  } catch (err) {
-    toast(errText(err), "error");
-  }
-});
-
-// 拖文件进窗口即发送：注册给 api.js 的拖拽路由（对比视图不会走到这里）
-registerDropHandler("transfer", (paths) => sendPaths(paths));
+// 「全部移除」：只改本地列表，不碰网络
+ui.btnAttachClear?.addEventListener("click", () => clearAttach());
 
 // 焦点不在输入框上时粘文字：先填到输入框让用户看一眼再发，不直接往对端推
 registerPasteTextHandler("transfer", (text) => {
@@ -1744,8 +2239,8 @@ registerDropHoverHandler("transfer", (phase) => {
       : !bound
         ? `「${sess.name}」还没添加：先配对才能发给它`
         : online
-          ? `松开即发送给「${sess.name}」`
-          : `松开即发送：「${sess.name}」离线，会排队等它上线自动发出`;
+          ? `松开即放入待发送：「${sess.name}」`
+          : `松开即放入待发送：「${sess.name}」离线，点发送后排队等它上线补发`;
 });
 
 // 放大层：点背景/关闭按钮/Esc 都能退出，图本身可以缩放与平移，只在有该 DOM 时绑定
@@ -1922,6 +2417,7 @@ if (ui.btnAudition) {
 if (ui.btnInboxChoose) ui.btnInboxChoose.addEventListener("click", chooseInboxDir);
 if (ui.btnInboxReset) ui.btnInboxReset.addEventListener("click", resetInboxDir);
 if (ui.btnInboxReveal) ui.btnInboxReveal.addEventListener("click", revealInboxDir);
+if (ui.inboxLayout) ui.inboxLayout.addEventListener("change", chooseInboxLayout);
 
 /* 搜索：输入就筛。不加防抖——纯内存遍历几百个气泡，比等防抖窗口更快出结果 */
 if (ui.search) {
@@ -1970,6 +2466,11 @@ document.querySelectorAll("[data-close-drawer]").forEach((btn) =>
  * 初始化与事件订阅
  * ------------------------------------------------------------------------ */
 listen("peers-changed", renderStatus);
+// 对比视图右键「发送到聊天」切过来时把那张图摆进待发送区。
+// 挂在切换回调上而不是某个会话的点击上：进来就得看见它，选谁由用户随后决定
+onViewChange((name) => {
+  if (name === "transfer") stagePendingSend();
+});
 // 会话的新建与删除都从这里走：陌生设备的第一条消息就是在这里把行放进会话栏的
 listen("sessions-changed", applySessions);
 listen("msg-in", (payload) => {

@@ -230,13 +230,6 @@
                 <span class="dot dot-off"></span><b>读取连接状态中…</b>
               </div>
 
-              <div class="tb-sep"></div>
-
-              <div class="tb-group">
-                <button id="btn-xfer-file" class="btn" disabled title="选择一个或多个文件发送">发送文件</button>
-                <button id="btn-xfer-folder" class="btn" disabled title="整个文件夹递归成逐文件发送，保留目录结构">发送文件夹</button>
-              </div>
-
               <div class="tb-spacer"></div>
 
               <div class="tb-group">
@@ -288,21 +281,31 @@
                      中间按自然日插日期分隔线 -->
                 <div class="stream" id="xfer-stream"></div>
 
+                <!-- 待发送区：选好/拖进来的文件先落在这里，像微信那样看一眼再点发送。
+                     图片给缩略图，其余给扩展名方块 + 名字 + 大小，右上角 × 单个移除 -->
+                <div class="compose-attach" id="xfer-attach" hidden>
+                  <div class="attach-head">
+                    <span id="xfer-attach-title">待发送</span>
+                    <button class="link-btn" id="xfer-attach-clear" title="把这些都从待发送区拿掉，不发送">全部移除</button>
+                  </div>
+                  <div class="attach-row" id="xfer-attach-row"></div>
+                </div>
+
                 <div class="compose">
                   <textarea
                     id="xfer-input"
                     class="input compose-input"
                     rows="2"
-                    placeholder="写点什么，Enter 发送、Shift+Enter 换行；把文件拖进窗口或 ⌘V 粘贴即发送（对方离线也能发，会排队自动补发）"
+                    placeholder="写点什么，Enter 发送、Shift+Enter 换行；选好或拖进来的文件先放在上面，点发送才发出去（对方离线也能发，会排队自动补发）"
                   ></textarea>
-                  <button id="btn-xfer-send" class="btn btn-primary" disabled title="对方离线时也能发：先存本机排队，它上线后自动补发；只有还没配对的发不出去">发送</button>
+                  <button id="btn-xfer-send" class="btn btn-primary" disabled title="把输入框里的文字与待发送区的文件一起发出去；对方离线也会先排队，它上线后自动补发">发送</button>
                 </div>
 
-                <!-- 拖拽悬停遮罩：像微信那样，看到提示就可以松手 -->
+                <!-- 拖拽悬停遮罩：像微信那样，看到提示就可以松手（松手只是放进待发送区） -->
                 <div class="drop-hint" id="xfer-drop-hint" hidden>
                   <div class="drop-hint-inner">
-                    <b id="xfer-drop-text">松开即发送</b>
-                    <span>支持一次拖多个，文件、图片、文件夹都行</span>
+                    <b id="xfer-drop-text">松开即放入待发送</b>
+                    <span>支持一次拖多个，文件、图片、文件夹都行；放进去之后还能再改，点发送才发出去</span>
                   </div>
                 </div>
 
@@ -350,6 +353,16 @@
                       <button id="btn-inbox-reveal" class="btn btn-ghost" title="在访达 / 资源管理器里打开这个目录">打开目录</button>
                     </div>
                     <p class="hint">只影响<strong>新收到</strong>的文件；之前收到的留在老目录里，聊天记录照样能预览、另存、定位。改到外置盘或网络盘上之后，盘一拔掉那些气泡就打不开了。</p>
+
+                    <label class="field">
+                      <span>收件目录里怎么摆</span>
+                      <select id="inp-inbox-layout" class="select">
+                        <option value="day">一天一个文件夹</option>
+                        <option value="month">一个月一个文件夹</option>
+                        <option value="flat">不分，直接放在根目录</option>
+                      </select>
+                    </label>
+                    <p class="hint">新收到的文件落在 <code id="inbox-layout-sample">…</code>。一个文件夹整批发过来时，它是上面这个目录里的一个同名子文件夹；改选项只影响之后收到的，已经收好的不会被搬动。</p>
 
                     <div class="cand-box" id="xfer-candidates"></div>
 
@@ -493,6 +506,40 @@
            缩放的格子之间会被浏览器画出亚像素亮缝，那条缝是渲染造的，反而会被当成图没接上 -->
       <div class="lb-tile" id="lightbox-tile-stage"></div>
       <div class="lb-cap" id="lightbox-cap"></div>
+    </div>
+
+    <!-- 图片右键菜单：替掉 WebView 自己那套英文原生菜单（它的语言跟 app 本地化走，
+         也不是给这个场景配的）。只留对比视图真用得上的五项，全部走已有命令，
+         没有新增后端。点菜单外面就收起，与系统菜单同一个手感 -->
+    <div class="ctx-menu" id="img-menu" role="menu" aria-label="图片操作" hidden>
+        <button class="ctx-item" id="ctx-send" role="menuitem">发送到聊天</button>
+      <button class="ctx-item" id="ctx-copy-img" role="menuitem">复制图片</button>
+      <button class="ctx-item" id="ctx-save" role="menuitem">另存为…</button>
+      <button class="ctx-item" id="ctx-copy-path" role="menuitem">复制文件路径</button>
+      <div class="ctx-sep"></div>
+      <button class="ctx-item" id="ctx-reveal" role="menuitem">在文件夹中显示</button>
+    </div>
+
+    <!-- 会话列表右键菜单：同样替掉 WebView 那套英文原生菜单（与图片右键同一套做法）。
+         置顶是主项，跟微信一样：置顶后永远排在最上面、底色深一档，再右键一次就能取消。
+         删除跟行内那枚一样要两步（先变成「再点一次删除」），免得右键一下手滑就没了 -->
+    <div class="ctx-menu" id="chat-menu" role="menu" aria-label="会话操作" hidden>
+      <button class="ctx-item" id="ctx-chat-pin" role="menuitem">置顶该聊天</button>
+      <button class="ctx-item" id="ctx-chat-rename" role="menuitem">重命名</button>
+      <div class="ctx-sep"></div>
+      <button class="ctx-item" id="ctx-chat-del" role="menuitem">删除聊天</button>
+    </div>
+
+    <!-- 聊天气泡里图片的右键菜单：与对比视图那套同一批中文项、同一批命令，
+         差别只有一项 —— 这里本来就在聊天里，所以没有「发送到聊天」，换成「在对比中打开」。
+         只拦图片：文字气泡里的右键仍是系统的选词与拷贝 -->
+    <div class="ctx-menu" id="chat-img-menu" role="menu" aria-label="图片操作" hidden>
+      <button class="ctx-item" id="cb-copy-img" role="menuitem">复制图片</button>
+      <button class="ctx-item" id="cb-save" role="menuitem">另存为…</button>
+      <button class="ctx-item" id="cb-copy-path" role="menuitem">复制文件路径</button>
+      <div class="ctx-sep"></div>
+      <button class="ctx-item" id="cb-reveal" role="menuitem">在文件夹中显示</button>
+      <button class="ctx-item" id="cb-compare" role="menuitem">在对比中打开</button>
     </div>
 
     <!-- module 作用域：顶层声明不再落到 window，避免与 Tauri 注入的全局（isTauri 等）撞名 -->

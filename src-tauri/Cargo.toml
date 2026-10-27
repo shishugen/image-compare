@@ -26,6 +26,10 @@ tiny_http = "0.12"
 sha2 = "0.11"
 uuid = { version = "1", features = ["v4"] }
 hostname = "0.4"
+# 收件箱按天/按月分子目录要用到本地日期。chrono 与 iana-time-zone 本来就已在依赖树里
+# （mdns-sd 那条链带进来的），加直接依赖只是把它抬到台面上，不引入新 crate；
+# 只要 clock，不要 serde/格式化之外的那些特性
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # 只用来做前端文字复制的最后一道兜底（WebView 拦下 clipboard API 时），不需要图片能力，
 # 关掉默认特性可以避免拖进整套 image 解码依赖
 arboard = { version = "3", default-features = false }
