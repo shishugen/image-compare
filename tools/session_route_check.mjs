@@ -2971,12 +2971,59 @@ if (byId("xfer-settings").classSet.has("is-open")) {
   click(byId("btn-xfer-settings"));
   await settle();
 }
+const pairTab = () => byId("xfer-tab-pair");
+const prefsTab = () => byId("xfer-tab-prefs");
+const pagePair = () => byId("xfer-page-pair");
+const pagePrefs = () => byId("xfer-page-prefs");
+const setTitle = () => byId("xfer-settings-title").text;
+const stCount21 = () => calls.filter(([c]) => c === "storage_stats").length;
+// 这一页要读的就三样：get_prefs（开关与节拍）、inbox_dir（路径）、storage_stats（那几个数字）
+const readsPrefs = () => calls.filter(([c]) => c === "get_prefs" || c === "inbox_dir" || c === "storage_stats").length;
+
+// 打开抽屉落在哪一页：桩不读 HTML，hidden 完全由 JS 写，所以这三条测的就是切页本身
+if (pagePrefs().hidden !== true) {
+  click(prefsTab());
+  await settle();
+  click(pairTab());
+  await settle();
+}
+// 基线取在点开抽屉之前：取在后面就把打开那一瞬的读取算进了基线，这条断言就虚了
+const getC0 = readsPrefs();
 click(byId("btn-xfer-settings"));
 await settle();
 check(
-  "打开抽屉把磁盘上那两项填进界面：开关勾着、文案响一声、路径是默认那个",
+  "打开抽屉落在「配对」那一页：设置那一页藏着，标题也跟着页走",
+  pagePair().hidden === false && pagePrefs().hidden === true && setTitle() === "配对",
+  `pair=${pagePair().hidden} prefs=${pagePrefs().hidden} 标题="${setTitle()}"`
+);
+check(
+  "只停在「配对」那一页时不新增任何读取：prefs、收件目录、存储统计都没惊动",
+  readsPrefs() === getC0,
+  `多读了 ${readsPrefs() - getC0} 次`
+);
+
+const stOnPair = stCount21();
+click(prefsTab());
+await settle();
+check(
+  "切到「设置」那一页才把磁盘上那两项填进界面：开关勾着、文案响一声、路径是默认那个",
   notifyChk().checked === true && notifyTxt().text === "响一声" && inboxVal().textContent === DEFAULT_INBOX,
   `checked=${notifyChk().checked} 文案="${notifyTxt().text}" 路径="${inboxVal().textContent}"`
+);
+check(
+  "标题跟着当前页变「设置」：两页不顶着同一个名字",
+  setTitle() === "设置" && pagePrefs().hidden === false && pagePair().hidden === true,
+  `标题="${setTitle()}" pair=${pagePair().hidden}`
+);
+const stAfterPrefs = stCount21();
+click(pairTab());
+await settle();
+click(prefsTab());
+await settle();
+check(
+  "同一次打开里来回切页不重复统计存储（递归走目录树不便宜，要重看靠那颗「刷新」）",
+  stCount21() === stAfterPrefs && stAfterPrefs === stOnPair + 1,
+  `首次进设置页读了 ${stAfterPrefs - stOnPair} 次，来回切完共 ${stCount21() - stOnPair} 次`
 );
 check("没改过目录时「恢复默认」是灰的（点了没意义，比点了不报错更难懂）", inboxReset().disabled === true);
 
@@ -3128,8 +3175,14 @@ prefs.heartbeat_ms = 10000; // 假装磁盘上这一项被改过了（手改 pre
 notifyChk().checked = true; // 只改 DOM 不发事件：界面上停着一个旧状态，这才是重读要修的东西
 hbSel().value = "1000";
 await settle();
+// 先确保抽屉是开着的（上面的用例已经把它切到「设置」那一页了，这里只管开合）
+if (!byId("xfer-settings").classSet.has("is-open")) {
+  click(byId("btn-xfer-settings"));
+  await settle();
+}
 click(byId("btn-xfer-settings"));
 await settle();
+check("收起时页不丢：还停在「设置」那一页（下次打开直接回到人刚待过的那页）", pagePrefs().hidden === false, String(pagePrefs().hidden));
 click(byId("btn-xfer-settings"));
 await settle();
 check(
@@ -3184,7 +3237,7 @@ world.hist.push({
   hidden: true,
 });
 check(
-  "抽屉一打开自己就读一次数字，四行都摆出来了（不用先点那颗刷新）",
+  "切到「设置」那一页自己就读一次数字，四行都摆出来了（不用先点那颗刷新）",
   stRows().length === 4 && stCount() >= 1,
   `行数=${stRows().length} 读了 ${stCount()} 次`
 );

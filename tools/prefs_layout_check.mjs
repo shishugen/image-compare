@@ -792,6 +792,17 @@ check("抽屉有 Esc/收起之外的关闭入口", html.includes('data-close-dra
 /* 传输视图那个配对抽屉也得按这里对：session_route_check 的 DOM 桩会按 id 自动造元素，
    HTML 里拆了这两个控件那边照样全绿 —— 这类「拆了 DOM 没拆 JS 引用」只能靠静态合约兜 */
 const xferJs = readFileSync(join(here, "..", "js", "view-transfer.js"), "utf8");
+// 抽屉 toggle 与切页两个函数体。磁盘那几样只该在切页时读，toggle 里只重置「本次读过没有」
+const drawerToggleBody = (() => {
+  const at = xferJs.indexOf('ui.btnSettings.addEventListener("click"');
+  const end = xferJs.indexOf("\n});", at);
+  return at >= 0 && end > at ? xferJs.slice(at, end) : "";
+})();
+const applyPageBody = (() => {
+  const at = xferJs.indexOf("function applySettingsPage");
+  const end = xferJs.indexOf("\n}", at);
+  return at >= 0 && end > at ? xferJs.slice(at, end) : "";
+})();
 check(
   "配对设置抽屉里有备注名那一栏（输入框 + 保存按钮）",
   html.includes('id="inp-peer-alias"') && html.includes('id="btn-peer-alias"')
@@ -801,6 +812,68 @@ check(
   xferJs.includes('el("inp-peer-alias")') && xferJs.includes('el("btn-peer-alias")') && xferJs.includes('invoke("set_peer_alias"')
 );
 check("解绑的提示说清了不会再自动连回来", html.includes("不会再自动连回来"));
+
+/* 配对设置抽屉拆成了两页（配对 / 设置）。谁在哪一页、默认露哪页，
+   全是「按 id 自动造元素」的桩根本看不见的拆分布局 —— 只能拿静态合约钉住 */
+const pairPage = (() => {
+  const a = html.indexOf('id="xfer-page-pair"');
+  const b = html.indexOf('id="xfer-page-prefs"');
+  return a >= 0 && b > a ? html.slice(a, b) : "";
+})();
+const prefsPage = (() => {
+  const a = html.indexOf('id="xfer-page-prefs"');
+  const b = html.indexOf("</aside>", a);
+  return a >= 0 && b > a ? html.slice(a, b) : "";
+})();
+check(
+  "两页容器、两枚页签、会跟着页走的标题都在 HTML 里",
+  ["xfer-page-pair", "xfer-page-prefs", "xfer-tab-pair", "xfer-tab-prefs", "xfer-settings-title"].every((id) => html.includes(`id="${id}"`))
+);
+check(
+  "默认露出的是「配对」那一页：设置那一页的开标签上写着 hidden",
+  (() => {
+    const at = html.indexOf('id="xfer-page-prefs"');
+    if (at < 0) return false;
+    const openTag = html.slice(html.lastIndexOf("<", at), html.indexOf(">", at) + 1);
+    return openTag.includes("hidden") && !/<div[^>]*id="xfer-page-pair"[^>]*hidden/.test(html);
+  })()
+);
+check(
+  "页签文案与抽屉初始标题对得上：默认那页就是标题写着的那个",
+  /id="xfer-tab-pair"[^>]*>配对<\/button>/.test(html) &&
+    /id="xfer-tab-prefs"[^>]*>设置<\/button>/.test(html) &&
+    /id="xfer-settings-title">配对<\/b>/.test(html)
+);
+check(
+  "配对那一页不含本机偏好，设置那一页不含对端动作（各归各的，不重不漏）",
+  ["inbox-dir-value", "storage-rows", "inp-heartbeat", "chk-notify-sound"].every((id) => prefsPage.includes(`id="${id}"`) && !pairPage.includes(`id="${id}"`)) &&
+    ["inp-passphrase", "xfer-candidates", "inp-manual-addr", "inp-peer-alias", "btn-unbind"].every((id) => pairPage.includes(`id="${id}"`) && !prefsPage.includes(`id="${id}"`))
+);
+check(
+  "切页只改 hidden，不重建那一页（重建会把刚填一半的口令与正在跑的臂一起弄没）",
+  !/ui\.page(Pair|Prefs)\.(innerHTML|textContent|className)/.test(xferJs) && /ui\.pagePair\.hidden = /.test(xferJs)
+);
+check(
+  "两枚页签各自绑自己的点击：桩里没有 closest，靠冒泡委托的那套在这儿是哑的",
+  /ui\.tabPair\?\.addEventListener\("click"/.test(xferJs) && /ui\.tabPrefs\?\.addEventListener\("click"/.test(xferJs)
+);
+check(
+  "磁盘那三样只挂在「设置」那一页露出时；抽屉 toggle 里只重置「本次读过没有」",
+  applyPageBody.includes("refreshRecvPrefs();") &&
+    applyPageBody.includes("refreshStorage();") &&
+    !drawerToggleBody.includes("refreshRecvPrefs();") &&
+    !drawerToggleBody.includes("refreshStorage();") &&
+    drawerToggleBody.includes("prefsPageLoaded = false")
+);
+check(
+  "页签与页容器的类名 HTML、CSS 两边都在（只有一边就是看不见的哑炮）",
+  /class="set-tabs"/.test(html) && /class="set-tab is-on"/.test(html) && /class="set-page"/.test(html) &&
+    /\.set-tabs \{/.test(css) && /\.set-tab \{/.test(css) && /\.set-tab\.is-on \{/.test(css) && /\.set-page \{/.test(css)
+);
+check(
+  "纵向节奏从 .drawer-body 那层搬到了页上（多包一层不能把间距弄没）",
+  /\.set-page \{[^}]*flex-direction: column;[^}]*gap: 10px;/.test(css)
+);
 
 /* 离线排队那一套：JS 只负责挂类名与文案，样式全在 CSS 里。这种拆分布在
    session_route_check 那种「按 id 自动造元素」的桩里根本测不出来（改了 JS 没改 CSS
@@ -1614,8 +1687,9 @@ check(
     /if \(!picked\) return;/.test(xferJs)
 );
 check(
-  "这两项只在抽屉打开那一刻读（进启动路径就会多一份 get_prefs + inbox_dir 往返，也会拿到一份可能旧的）",
-  /if \(ui\.settings\.classList\.contains\("is-open"\)\) \{?\s*refreshRecvPrefs\(\);/.test(xferJs) &&
+  "这两项只在「设置」那一页露出时读（进启动路径就会多一份 get_prefs + inbox_dir 往返，也会拿到一份可能旧的）",
+  applyPageBody.includes("refreshRecvPrefs();") &&
+    !drawerToggleBody.includes("refreshRecvPrefs();") &&
     /async function refreshRecvPrefs\(\) \{[\s\S]{0,200}?invoke\("get_prefs"\)/.test(xferJs)
 );
 
@@ -2306,8 +2380,9 @@ check(
     /const n = Number\(res\?\.deleted_count\) \|\| 0;[\s\S]{0,300}?await refreshStorage\(\);/.test(xferJs)
 );
 check(
-  "那几个数字不进任何轮询：只在抽屉打开、点刷新、清理之后重读（递归走一遍目录树不便宜）",
-  /if \(ui\.settings\.classList\.contains\("is-open"\)\) \{\s*refreshRecvPrefs\(\);\s*refreshStorage\(\);\s*\}/.test(xferJs) &&
+  "那几个数字不进任何轮询：只在「设置」那一页露出、点刷新、清理之后重读（递归走一遍目录树不便宜）",
+  applyPageBody.includes("refreshStorage();") &&
+    !drawerToggleBody.includes("refreshStorage();") &&
     !/setInterval\([\s\S]{0,120}?refreshStorage/.test(xferJs) &&
     /if \(ui\.btnStorageRefresh\) ui\.btnStorageRefresh\.addEventListener\("click", refreshStorage\)/.test(xferJs)
 );

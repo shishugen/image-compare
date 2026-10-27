@@ -52,6 +52,12 @@ const ui = {
   candidates: el("xfer-candidates"),
   settings: el("xfer-settings"),
   btnSettings: el("btn-xfer-settings"),
+  // 抽屉里的两页与两枚页签：「配对」只管设备身份，本机偏好全在「设置」那一页
+  tabPair: el("xfer-tab-pair"),
+  tabPrefs: el("xfer-tab-prefs"),
+  pagePair: el("xfer-page-pair"),
+  pagePrefs: el("xfer-page-prefs"),
+  setTitle: el("xfer-settings-title"),
   // 本机接收（提示音 / 收件目录 / 收件目录里的摆放）
   notifyChk: el("chk-notify-sound"),
   notifyText: el("sw-notify-text"),
@@ -2757,7 +2763,7 @@ function paintInboxLayout(layout) {
   paintInboxSample(state.inboxDir, v);
 }
 
-/** 抽屉每次打开都重读：另一个抽屉可能刚改过同一份 prefs.json，用户也可能手改过磁盘 */
+/** 「设置」那一页每次露出都重读：另一个抽屉可能刚改过同一份 prefs.json，用户也可能手改过磁盘 */
 async function refreshRecvPrefs() {
   try {
     const p = await invoke("get_prefs");
@@ -3227,12 +3233,41 @@ ui.btnReprobe.addEventListener("click", async () => {
 ui.btnNewChat?.addEventListener("click", togglePick);
 // 点弹层外面就收起，不强迫用户先找到那个开着的开关
 ui.stream.addEventListener("pointerdown", hidePick);
+/* 抽屉两页：配对（设备身份与对端）/ 设置（本机接收、存储、在线探测）。
+   页签只切 hidden，不重建 DOM —— 重建会把用户刚填一半的口令与正在跑的臂一起弄没 */
+let settingsPage = "pair";
+// 本次露出抽屉内「设置」那一页读过没有：来回切页不该反复递归走一遍目录树
+let prefsPageLoaded = false;
+
+function applySettingsPage() {
+  const onPrefs = settingsPage === "prefs";
+  if (ui.pagePair) ui.pagePair.hidden = onPrefs;
+  if (ui.pagePrefs) ui.pagePrefs.hidden = !onPrefs;
+  ui.tabPair?.classList.toggle("is-on", !onPrefs);
+  ui.tabPrefs?.classList.toggle("is-on", onPrefs);
+  // 抽屉标题跟着当前页走：挂着「配对设置」会让人在设置那一页里找口令
+  if (ui.setTitle) ui.setTitle.textContent = onPrefs ? "设置" : "配对";
+  if (!onPrefs || prefsPageLoaded) return;
+  prefsPageLoaded = true;
+  // 这一页的三项全在 prefs.json 与磁盘上：只有它真露出来才值得去读（存储那一项还要递归走目录树）
+  refreshRecvPrefs();
+  refreshStorage();
+}
+
+ui.tabPair?.addEventListener("click", () => {
+  settingsPage = "pair";
+  applySettingsPage();
+});
+ui.tabPrefs?.addEventListener("click", () => {
+  settingsPage = "prefs";
+  applySettingsPage();
+});
 ui.btnSettings.addEventListener("click", () => {
   ui.settings.classList.toggle("is-open");
-  // 打开时读一次最新值：收起时没人看这几项，不值得时刻维护
+  // 收起时没人看这几项，不值得时刻维护；重新露出算新的一次，得重读磁盘那份
   if (ui.settings.classList.contains("is-open")) {
-    refreshRecvPrefs();
-    refreshStorage();
+    prefsPageLoaded = false;
+    applySettingsPage();
   }
 });
 

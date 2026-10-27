@@ -234,7 +234,7 @@
 
               <div class="tb-group">
                 <button id="btn-xfer-find" class="btn btn-ghost" title="在所有会话的历史里搜（⌘F）">搜全部会话</button>
-                <button id="btn-xfer-settings" class="btn btn-ghost" title="配对口令 / 设备发现 / 手动 IP">配对设置</button>
+                <button id="btn-xfer-settings" class="btn btn-ghost" title="两页：配对（口令 / 设备发现 / 手动 IP）与设置（本机接收 / 存储 / 在线探测）">配对设置</button>
               </div>
             </header>
 
@@ -317,116 +317,129 @@
                   </div>
                 </div>
 
-                <!-- 配对设置抽屉 -->
+                <!-- 配对设置抽屉：入口一枚，里面两页。以前口令、收件目录、心跳节拍、
+                     解绑全挤在同一屏，只想改「响一声」的人得越过四五个不相关的框 ——
+                     配对是配对、设置是设置，各占一页，抽屉标题跟着当前页走 -->
                 <aside class="drawer" id="xfer-settings">
                   <div class="drawer-head">
-                    <b>配对设置</b>
+                    <b id="xfer-settings-title">配对</b>
                     <button class="link-btn" data-close-drawer="xfer-settings">收起</button>
                   </div>
+                  <div class="set-tabs" id="xfer-set-tabs">
+                    <button class="set-tab is-on" id="xfer-tab-pair">配对</button>
+                    <button class="set-tab" id="xfer-tab-prefs">设置</button>
+                  </div>
                   <div class="drawer-body">
-                    <label class="field">
-                      <span>本机设备名</span>
-                      <input id="inp-device-name" class="input" placeholder="对端看到的名字" />
-                    </label>
-                    <label class="field">
-                      <span>配对口令</span>
-                      <input id="inp-passphrase" class="input" type="password" autocomplete="off" placeholder="≥4 个字符，每台都填一样" />
-                    </label>
-                    <button id="btn-pair-save" class="btn btn-primary">保存口令与设备名</button>
-                    <p class="hint">口令只存本机，用于互认与请求签名。局域网内是明文传输，别用来传敏感文件。</p>
-
-                    <!-- 本机接收：这两项与对比视图那几项存在同一份 prefs.json 里，
-                         各自只传自己关心的字段（set_prefs 是局部更新），不会互相盖掉 -->
-                    <div class="set-sub">本机接收</div>
-                    <label class="field">
-                      <span>收到消息时</span>
-                      <label class="switch">
-                        <input id="chk-notify-sound" type="checkbox" checked />
-                        <span class="switch-track"><span class="switch-thumb"></span></span>
-                        <span class="switch-text" id="sw-notify-text">响一声</span>
+                    <!-- 第一页：设备身份与对端 -->
+                    <div class="set-page" id="xfer-page-pair">
+                      <label class="field">
+                        <span>本机设备名</span>
+                        <input id="inp-device-name" class="input" placeholder="对端看到的名字" />
                       </label>
-                    </label>
-                    <div class="drawer-acts">
-                      <button id="btn-notify-audition" class="btn btn-ghost" title="无视开关直接响一声，用来确认这台机器放不放得出声">试听</button>
+                      <label class="field">
+                        <span>配对口令</span>
+                        <input id="inp-passphrase" class="input" type="password" autocomplete="off" placeholder="≥4 个字符，每台都填一样" />
+                      </label>
+                      <button id="btn-pair-save" class="btn btn-primary">保存口令与设备名</button>
+                      <p class="hint">口令只存本机，用于互认与请求签名。局域网内是明文传输，别用来传敏感文件。</p>
+
+                      <div class="cand-box" id="xfer-candidates"></div>
+
+                      <label class="field">
+                        <span>对端 IP:端口</span>
+                        <input id="inp-manual-addr" class="input" placeholder="192.168.1.23 或 192.168.1.23:45790" />
+                      </label>
+                      <button id="btn-bind-addr" class="btn">手动添加对端</button>
+                      <p class="hint">mDNS 被网络策略屏蔽时的兜底；端口留空会从 45789 起逐个试探。可以同时添加多台，每台一个对话框。</p>
+
+                      <label class="field">
+                        <span>对端备注名</span>
+                        <input id="inp-peer-alias" class="input" maxlength="40" placeholder="像微信那样给它起个备注，留空则用对方报的设备名" />
+                      </label>
+                      <button id="btn-peer-alias" class="btn">保存备注名</button>
+                      <p class="hint">备注只存本机、只改本机显示（会话栏 / 顶栏 / 新建聊天的默认名），对端那边看不到任何变化。</p>
+
+                      <div class="drawer-acts">
+                        <button id="btn-reprobe" class="btn btn-ghost">重新探测在线</button>
+                        <button id="btn-unbind" class="btn btn-ghost danger">解绑当前对端</button>
+                      </div>
+                      <p class="hint">解绑只是不再主动发给它，而且不会再自动连回来 —— 要恢复得在上面的候选里点一下或再填一次 IP。聊天历史与收到的文件都留着。Windows 首次监听会弹防火墙提示，必须勾「允许访问（私有网络）」。</p>
                     </div>
-                    <p class="hint">响的是本进程，窗口关着也响；一整个文件夹收完只响一声，同一条消息重发不重响。</p>
 
-                    <label class="field">
-                      <span>收件目录（新收到的文件落这里）</span>
-                      <code class="inbox-dir" id="inbox-dir-value">读取中…</code>
-                    </label>
-                    <div class="drawer-acts">
-                      <button id="btn-inbox-choose" class="btn">选择…</button>
-                      <button id="btn-inbox-reset" class="btn btn-ghost">恢复默认</button>
-                      <button id="btn-inbox-reveal" class="btn btn-ghost" title="在访达 / 资源管理器里打开这个目录">打开目录</button>
+                    <!-- 第二页：本机偏好，全存在同一份 prefs.json 里 -->
+                    <div class="set-page" id="xfer-page-prefs" hidden>
+                      <!-- 本机接收：这三项与对比视图那几项存在同一份 prefs.json 里，
+                           各自只传自己关心的字段（set_prefs 是局部更新），不会互相盖掉 -->
+                      <div class="set-sub">本机接收</div>
+                      <label class="field">
+                        <span>收到消息时</span>
+                        <label class="switch">
+                          <input id="chk-notify-sound" type="checkbox" checked />
+                          <span class="switch-track"><span class="switch-thumb"></span></span>
+                          <span class="switch-text" id="sw-notify-text">响一声</span>
+                        </label>
+                      </label>
+                      <div class="drawer-acts">
+                        <button id="btn-notify-audition" class="btn btn-ghost" title="无视开关直接响一声，用来确认这台机器放不放得出声">试听</button>
+                      </div>
+                      <p class="hint">响的是本进程，窗口关着也响；一整个文件夹收完只响一声，同一条消息重发不重响。</p>
+
+                      <label class="field">
+                        <span>收件目录（新收到的文件落这里）</span>
+                        <code class="inbox-dir" id="inbox-dir-value">读取中…</code>
+                      </label>
+                      <div class="drawer-acts">
+                        <button id="btn-inbox-choose" class="btn">选择…</button>
+                        <button id="btn-inbox-reset" class="btn btn-ghost">恢复默认</button>
+                        <button id="btn-inbox-reveal" class="btn btn-ghost" title="在访达 / 资源管理器里打开这个目录">打开目录</button>
+                      </div>
+                      <p class="hint">只影响<strong>新收到</strong>的文件；之前收到的留在老目录里，聊天记录照样能预览、另存、定位。改到外置盘或网络盘上之后，盘一拔掉那些气泡就打不开了。</p>
+
+                      <label class="field">
+                        <span>收件目录里怎么摆</span>
+                        <select id="inp-inbox-layout" class="select">
+                          <option value="day">一天一个文件夹</option>
+                          <option value="month">一个月一个文件夹</option>
+                          <option value="flat">不分，直接放在根目录</option>
+                        </select>
+                      </label>
+                      <p class="hint">新收到的文件落在 <code id="inbox-layout-sample">…</code>。一个文件夹整批发过来时，它是上面这个目录里的一个同名子文件夹；改选项只影响之后收到的，已经收好的不会被搬动。</p>
+
+                      <!-- 存储：这一页露出来时读一次（递归走一遍目录树不便宜，不进任何轮询），手动「刷新」再拉一遍。
+                           清理只动收件目录里“改得够早而且没被任何还看得见的记录引用”的那部分 -->
+                      <div class="set-sub">存储</div>
+                      <div class="storage-rows" id="storage-rows"></div>
+                      <div class="drawer-acts">
+                        <button id="btn-storage-refresh" class="btn btn-ghost" title="重新统计一遍">刷新</button>
+                        <button id="btn-storage-reveal" class="btn btn-ghost" title="在访达 / 资源管理器里打开收件目录">打开收件目录</button>
+                      </div>
+                      <label class="field">
+                        <span>清理收件文件</span>
+                        <select id="inp-inbox-clean" class="select">
+                          <option value="3">改于 3 个月以前</option>
+                          <option value="6">改于 6 个月以前</option>
+                          <option value="12">改于 1 年以前</option>
+                        </select>
+                      </label>
+                      <div class="drawer-acts">
+                        <button id="btn-inbox-clean" class="btn btn-ghost">清理</button>
+                      </div>
+                      <p class="hint">只清收件目录里修改时间早于那一档、而且没被任何还看得见的聊天记录引用的文件（一个月按 30 天算）。聊天里引着的一个都不动，对端那份、聊天记录本身与粘贴暂存区也不动。</p>
+
+                      <!-- 在线探测：同样存在 prefs.json、走同一对命令（只传 heartbeatMs，不碰其它字段）。
+                           间隔是本机偏好，所以在这页；「重新探测在线」与「解绑」是对端动作，在配对那一页 -->
+                      <div class="set-sub">在线探测</div>
+                      <label class="field">
+                        <span>探测对端是否在线的间隔</span>
+                        <select id="inp-heartbeat" class="select">
+                          <option value="1000">1 秒</option>
+                          <option value="2000">2 秒</option>
+                          <option value="5000">5 秒</option>
+                          <option value="10000">10 秒</option>
+                        </select>
+                      </label>
+                      <p class="hint">本机每隔这一档 ping 一次已添加的对端：连续 3 次不通才算离线，对方上线也是在这一拍里自动补发排队的消息（最多等一个间隔）。改完下一拍就生效，不用重开；间隔越长越省电、局域网里探得越轻，代价是发现上线与判离线都跟着慢。</p>
                     </div>
-                    <p class="hint">只影响<strong>新收到</strong>的文件；之前收到的留在老目录里，聊天记录照样能预览、另存、定位。改到外置盘或网络盘上之后，盘一拔掉那些气泡就打不开了。</p>
-
-                    <label class="field">
-                      <span>收件目录里怎么摆</span>
-                      <select id="inp-inbox-layout" class="select">
-                        <option value="day">一天一个文件夹</option>
-                        <option value="month">一个月一个文件夹</option>
-                        <option value="flat">不分，直接放在根目录</option>
-                      </select>
-                    </label>
-                    <p class="hint">新收到的文件落在 <code id="inbox-layout-sample">…</code>。一个文件夹整批发过来时，它是上面这个目录里的一个同名子文件夹；改选项只影响之后收到的，已经收好的不会被搬动。</p>
-
-                    <!-- 存储：抽屉打开时读一次（递归走一遍目录树不便宜，不进任何轮询），手动「刷新」再拉一遍。
-                         清理只动收件目录里“改得够早而且没被任何还看得见的记录引用”的那部分 -->
-                    <div class="set-sub">存储</div>
-                    <div class="storage-rows" id="storage-rows"></div>
-                    <div class="drawer-acts">
-                      <button id="btn-storage-refresh" class="btn btn-ghost" title="重新统计一遍">刷新</button>
-                      <button id="btn-storage-reveal" class="btn btn-ghost" title="在访达 / 资源管理器里打开收件目录">打开收件目录</button>
-                    </div>
-                    <label class="field">
-                      <span>清理收件文件</span>
-                      <select id="inp-inbox-clean" class="select">
-                        <option value="3">改于 3 个月以前</option>
-                        <option value="6">改于 6 个月以前</option>
-                        <option value="12">改于 1 年以前</option>
-                      </select>
-                    </label>
-                    <div class="drawer-acts">
-                      <button id="btn-inbox-clean" class="btn btn-ghost">清理</button>
-                    </div>
-                    <p class="hint">只清收件目录里修改时间早于那一档、而且没被任何还看得见的聊天记录引用的文件（一个月按 30 天算）。聊天里引着的一个都不动，对端那份、聊天记录本身与粘贴暂存区也不动。</p>
-
-                    <!-- 在线探测：同样存在 prefs.json、走同一对命令（只传 heartbeatMs，不碰其它字段） -->
-                    <div class="set-sub">在线探测</div>
-                    <label class="field">
-                      <span>探测对端是否在线的间隔</span>
-                      <select id="inp-heartbeat" class="select">
-                        <option value="1000">1 秒</option>
-                        <option value="2000">2 秒</option>
-                        <option value="5000">5 秒</option>
-                        <option value="10000">10 秒</option>
-                      </select>
-                    </label>
-                    <p class="hint">本机每隔这一档 ping 一次已添加的对端：连续 3 次不通才算离线，对方上线也是在这一拍里自动补发排队的消息（最多等一个间隔）。改完下一拍就生效，不用重开；间隔越长越省电、局域网里探得越轻，代价是发现上线与判离线都跟着慢。</p>
-
-                    <div class="cand-box" id="xfer-candidates"></div>
-
-                    <label class="field">
-                      <span>对端 IP:端口</span>
-                      <input id="inp-manual-addr" class="input" placeholder="192.168.1.23 或 192.168.1.23:45790" />
-                    </label>
-                    <button id="btn-bind-addr" class="btn">手动添加对端</button>
-                    <p class="hint">mDNS 被网络策略屏蔽时的兜底；端口留空会从 45789 起逐个试探。可以同时添加多台，每台一个对话框。</p>
-
-                    <label class="field">
-                      <span>对端备注名</span>
-                      <input id="inp-peer-alias" class="input" maxlength="40" placeholder="像微信那样给它起个备注，留空则用对方报的设备名" />
-                    </label>
-                    <button id="btn-peer-alias" class="btn">保存备注名</button>
-                    <p class="hint">备注只存本机、只改本机显示（会话栏 / 顶栏 / 新建聊天的默认名），对端那边看不到任何变化。</p>
-
-                    <div class="drawer-acts">
-                      <button id="btn-reprobe" class="btn btn-ghost">重新探测在线</button>
-                      <button id="btn-unbind" class="btn btn-ghost danger">解绑当前对端</button>
-                    </div>
-                    <p class="hint">解绑只是不再主动发给它，而且不会再自动连回来 —— 要恢复得在上面的候选里点一下或再填一次 IP。聊天历史与收到的文件都留着。Windows 首次监听会弹防火墙提示，必须勾「允许访问（私有网络）」。</p>
                   </div>
                 </aside>
               </div>

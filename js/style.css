@@ -1412,6 +1412,49 @@ textarea.input {
   color: var(--text);
 }
 
+/* 配对设置抽屉的两枚页签：配对 / 设置。放在 drawer-head 与 drawer-body 之间，
+   不抢抽屉的 Esc 与「收起」（那一击的目标是页签自己，不是抽屉背景） */
+.set-tabs {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 6px;
+  padding: 8px 12px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.set-tab {
+  padding: 5px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius) var(--radius) 0 0;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.set-tab:hover {
+  color: var(--text);
+}
+
+/* 当前那一页：底边压掉分界线（颜色必须是抽屉自己的 --bg-panel，不是页面底色），
+   看起来就是从抽屉里长出来的 */
+.set-tab.is-on {
+  margin-bottom: -1px;
+  padding-bottom: 6px;
+  border-bottom-color: var(--bg-panel);
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* 两页各自装自己那一段。原来的纵向间距是 .drawer-body 那层 flex gap 给的，
+   现在多包了一层，就把同一套 column + gap 搬到页上，视觉节奏不变 */
+.set-page {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
 /* 收件目录是当前生效的绝对路径，可能很长而且不带空格 ——
    不强制拆行会把抽屉撑出横向滚动条，用户反而看不到自己选到哪去了 */
 .inbox-dir {
