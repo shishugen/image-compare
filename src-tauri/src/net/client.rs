@@ -196,8 +196,16 @@ pub fn spawn_heartbeat(hub: Arc<Hub>) {
     });
 }
 
-/// 发一条文字到 `sess` 那个对话框（目标地址取自会话所属的那台）
-pub fn send_text(hub: &Arc<Hub>, peer: &Peer, sess: &Session, text: String) -> Result<Message, String> {
+/// 发一条文字到 `sess` 那个对话框（目标地址取自会话所属的那台）。
+/// `quote` 带上时是引用回复：卡片跟着消息落盘，wire 里多一个字段而已，
+/// 老对端的 InMsg 不拒绝未知字段，收不下也只是降级成普通文字
+pub fn send_text(
+    hub: &Arc<Hub>,
+    peer: &Peer,
+    sess: &Session,
+    text: String,
+    quote: Option<store::Quote>,
+) -> Result<Message, String> {
     let msg = Message {
         id: uuid::Uuid::new_v4().simple().to_string(),
         dir: "out".into(),
@@ -207,6 +215,7 @@ pub fn send_text(hub: &Arc<Hub>, peer: &Peer, sess: &Session, text: String) -> R
         ts: store::now_ms(),
         peer: peer.id.clone(),
         sid: sess.id.clone(),
+        quote,
         ..Default::default()
     };
     hub.store.append_message(&msg)?;
@@ -225,10 +234,13 @@ pub(crate) fn try_send_text(
     msg: &Message,
 ) -> Result<Message, String> {
     let text = msg.text.clone().unwrap_or_default();
-    // ts 用当初那一刻：补发的消息在对端显示的仍是用户写它的时间
-    let body = serde_json::json!({ "msg_id": msg.id, "ts": msg.ts, "text": text })
-        .to_string()
-        .into_bytes();
+    // ts 用当初那一刻：补发的消息在对端显示的仍是用户写它的时间。
+    // 引用卡片只在真有时才进 wire：老版本报文形状一字不改，不白撑一个 null
+    let mut payload = serde_json::json!({ "msg_id": msg.id, "ts": msg.ts, "text": text });
+    if let Some(q) = &msg.quote {
+        payload["quote"] = serde_json::to_value(q).map_err(|e| format!("序列化引用失败: {e}"))?;
+    }
+    let body = payload.to_string().into_bytes();
     let headers = {
         let mut h = signed_headers(hub, &store::sha256_hex(&body));
         h.extend(session_headers(sess));

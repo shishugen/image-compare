@@ -233,6 +233,7 @@
               <div class="tb-spacer"></div>
 
               <div class="tb-group">
+                <button id="btn-xfer-find" class="btn btn-ghost" title="在所有会话的历史里搜（⌘F）">搜全部会话</button>
                 <button id="btn-xfer-settings" class="btn btn-ghost" title="配对口令 / 设备发现 / 手动 IP">配对设置</button>
               </div>
             </header>
@@ -260,7 +261,7 @@
                     id="xfer-search"
                     class="input xfer-search"
                     type="search"
-                    placeholder="在当前会话里搜名字或文字，Esc 清空"
+                    placeholder="在当前会话里搜名字或文字（⌘F 搜全部会话），Esc 清空"
                     title="只搜当前会话已加载的历史，不发请求"
                   />
                   <div class="chip-row" id="xfer-chips">
@@ -289,6 +290,13 @@
                     <button class="link-btn" id="xfer-attach-clear" title="把这些都从待发送区拿掉，不发送">全部移除</button>
                   </div>
                   <div class="attach-row" id="xfer-attach-row"></div>
+                </div>
+
+                <!-- 引用预览条：点了气泡菜单里的「引用回复」先摆在这里（与待发送区同一套版式），
+                     Enter/点发送时跟着正文一起带走；× 只取消引用，不动已写的内容 -->
+                <div class="quote-bar" id="xfer-quote" hidden>
+                  <span id="xfer-quote-text"></span>
+                  <button class="link-btn" id="xfer-quote-x" title="取消引用，已写的内容不动">×</button>
                 </div>
 
                 <div class="compose">
@@ -363,6 +371,27 @@
                       </select>
                     </label>
                     <p class="hint">新收到的文件落在 <code id="inbox-layout-sample">…</code>。一个文件夹整批发过来时，它是上面这个目录里的一个同名子文件夹；改选项只影响之后收到的，已经收好的不会被搬动。</p>
+
+                    <!-- 存储：抽屉打开时读一次（递归走一遍目录树不便宜，不进任何轮询），手动「刷新」再拉一遍。
+                         清理只动收件目录里“改得够早而且没被任何还看得见的记录引用”的那部分 -->
+                    <div class="set-sub">存储</div>
+                    <div class="storage-rows" id="storage-rows"></div>
+                    <div class="drawer-acts">
+                      <button id="btn-storage-refresh" class="btn btn-ghost" title="重新统计一遍">刷新</button>
+                      <button id="btn-storage-reveal" class="btn btn-ghost" title="在访达 / 资源管理器里打开收件目录">打开收件目录</button>
+                    </div>
+                    <label class="field">
+                      <span>清理收件文件</span>
+                      <select id="inp-inbox-clean" class="select">
+                        <option value="3">改于 3 个月以前</option>
+                        <option value="6">改于 6 个月以前</option>
+                        <option value="12">改于 1 年以前</option>
+                      </select>
+                    </label>
+                    <div class="drawer-acts">
+                      <button id="btn-inbox-clean" class="btn btn-ghost">清理</button>
+                    </div>
+                    <p class="hint">只清收件目录里修改时间早于那一档、而且没被任何还看得见的聊天记录引用的文件（一个月按 30 天算）。聊天里引着的一个都不动，对端那份、聊天记录本身与粘贴暂存区也不动。</p>
 
                     <!-- 在线探测：同样存在 prefs.json、走同一对命令（只传 heartbeatMs，不碰其它字段） -->
                     <div class="set-sub">在线探测</div>
@@ -536,13 +565,14 @@
     <!-- 会话列表右键菜单：同样替掉 WebView 那套英文原生菜单（与图片右键同一套做法）。
          置顶是主项，跟微信一样：置顶后永远排在最上面、底色深一档，再右键一次就能取消。
          删除跟行内那枚一样要两步（先变成「再点一次删除」），免得右键一下手滑就没了 -->
-    <!-- 会话行的右键菜单。三项对「未标记」那一行不适用（置顶/改名都要有落点），
-         打开时把前两项与那根隔断一起赋 hidden，只剩删除 —— 自定义项是 display:block，
-         光给 hidden 属性不管用，样式里另有一条 .ctx-menu > [hidden] -->
+    <!-- 会话行的右键菜单。置顶/改名对「未标记」那一行不适用（它们都要有落点），
+         打开时把前两项与那根隔断一起赋 hidden；清空与删除未标记的也支持。
+         自定义项是 display:block，光给 hidden 属性不管用，样式里另有一条 .ctx-menu > [hidden] -->
     <div class="ctx-menu" id="chat-menu" role="menu" aria-label="会话操作" hidden>
       <button class="ctx-item" id="ctx-chat-pin" role="menuitem">置顶该聊天</button>
       <button class="ctx-item" id="ctx-chat-rename" role="menuitem">重命名</button>
       <div class="ctx-sep" id="ctx-chat-sep"></div>
+      <button class="ctx-item" id="ctx-chat-clear" role="menuitem">清空聊天记录</button>
       <button class="ctx-item" id="ctx-chat-del" role="menuitem">删除聊天</button>
     </div>
 
@@ -552,6 +582,8 @@
          撤回只给一分钟内自己发出去的那条，删除永远有（只删本机，对方那份不动） -->
     <div class="ctx-menu" id="chat-msg-menu" role="menu" aria-label="消息操作" hidden>
       <button class="ctx-item" id="cb-copy-text" role="menuitem">复制正文</button>
+      <button class="ctx-item" id="cb-quote" role="menuitem">引用回复</button>
+      <button class="ctx-item" id="cb-forward" role="menuitem">转发到别的会话</button>
       <button class="ctx-item" id="cb-copy-img" role="menuitem">复制图片</button>
       <button class="ctx-item" id="cb-save" role="menuitem">另存为…</button>
       <button class="ctx-item" id="cb-copy-path" role="menuitem">复制文件路径</button>
@@ -560,6 +592,43 @@
       <div class="ctx-sep" id="ctx-msg-sep"></div>
       <button class="ctx-item" id="ctx-msg-recall" role="menuitem">撤回这一条</button>
       <button class="ctx-item" id="ctx-msg-del" role="menuitem">删除（只删本机）</button>
+    </div>
+
+    <!-- 放大层的右键菜单（中文）：对比视图与聊天气泡都换成中文菜单后，这一层是唯一
+         还会弹系统英文菜单的地方。没有本机路径（剪贴板纯位图）就不拦 —— 系统菜单里
+         「拷贝图像」那一项比一排灰色的文件项有用 -->
+    <div class="ctx-menu" id="lightbox-menu" role="menu" aria-label="放大层操作" hidden>
+      <button class="ctx-item" id="lbm-copy-img" role="menuitem">复制图片</button>
+      <button class="ctx-item" id="lbm-save" role="menuitem">另存为…</button>
+      <button class="ctx-item" id="lbm-copy-path" role="menuitem">复制文件路径</button>
+      <button class="ctx-item" id="lbm-reveal" role="menuitem">在文件夹中显示</button>
+      <button class="ctx-item" id="lbm-compare" role="menuitem">在对比中打开</button>
+    </div>
+
+    <!-- 转发浮层：气泡菜单里点「转发到别的会话」弹这里（与新聊天那套同组件），
+         列的是除这一条所在会话以外的所有会话，点一条就走现有发送命令 -->
+    <div class="fwd-pick" id="xfer-fwd-pick" hidden>
+      <div class="pick-title">转发到哪个会话</div>
+      <div class="pick-list" id="xfer-fwd-list"></div>
+      <button class="link-btn" id="xfer-fwd-cancel">取消</button>
+    </div>
+
+    <!-- 跨会话全局搜索的浮层：⌘F / 顶栏「搜全部会话」弹这里。走后端 search_messages
+         查整份历史（不是只筛已铺出来的那几条），点一条跳到那个会话里定位闪烁 -->
+    <div class="find-pick" id="xfer-find" hidden>
+      <div class="find-head">
+        <div class="pick-title">搜全部会话</div>
+        <button class="link-btn" id="xfer-find-x" title="关闭（Esc）">×</button>
+      </div>
+      <input id="xfer-find-q" class="input" type="search" placeholder="搜正文、文件名或引用摘录…" autocomplete="off" />
+      <div class="chip-row" id="xfer-find-chips">
+        <button class="chip is-on" data-kind="all">全部</button>
+        <button class="chip" data-kind="text">文字</button>
+        <button class="chip" data-kind="image">图片</button>
+        <button class="chip" data-kind="file">文件</button>
+        <button class="chip" data-kind="folder">文件夹</button>
+      </div>
+      <div class="find-list" id="xfer-find-list"></div>
     </div>
 
     <!-- module 作用域：顶层声明不再落到 window，避免与 Tauri 注入的全局（isTauri 等）撞名 -->

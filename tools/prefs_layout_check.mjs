@@ -1615,7 +1615,7 @@ check(
 );
 check(
   "这两项只在抽屉打开那一刻读（进启动路径就会多一份 get_prefs + inbox_dir 往返，也会拿到一份可能旧的）",
-  /if \(ui\.settings\.classList\.contains\("is-open"\)\) refreshRecvPrefs\(\);/.test(xferJs) &&
+  /if \(ui\.settings\.classList\.contains\("is-open"\)\) \{?\s*refreshRecvPrefs\(\);/.test(xferJs) &&
     /async function refreshRecvPrefs\(\) \{[\s\S]{0,200}?invoke\("get_prefs"\)/.test(xferJs)
 );
 
@@ -1977,12 +1977,12 @@ check(
    任何一环丢了 node 自检都还是绿的 —— 漏一项 / 漏一条 [hidden] 规则 / 干脆没拦右键 */
 const msgMenuBlock = (() => {
   const i = html.indexOf('id="chat-msg-menu"');
-  return i < 0 ? "" : html.slice(i, i + 900);
+  return i < 0 ? "" : html.slice(i, i + 1100);
 })();
 check(
-  "气泡右键菜单是一份中文的：撤回与删除两项都在，且没有一条 WebView 原生菜单那套英文项",
+  "气泡右键菜单是一份中文的：撤回与删除都搬进来了，且没有一条 WebView 原生菜单那套英文项",
   msgMenuBlock.length > 0 &&
-    ["复制正文", "复制图片", "另存为…", "复制文件路径", "在文件夹中显示", "在对比中打开", "撤回这一条", "删除（只删本机）"].every(
+    ["复制正文", "引用回复", "转发到别的会话", "复制图片", "另存为…", "复制文件路径", "在文件夹中显示", "在对比中打开", "撤回这一条", "删除（只删本机）"].every(
       (t) => msgMenuBlock.includes(t)
     ) &&
     !/Look Up|Translate|Search with|Copy Link|Share…|Speech|Inspect Element|Open Image|Download Image|Copy Subject/.test(
@@ -2021,6 +2021,295 @@ check(
 check(
   "撤回之后的提示样式还在（菜单搬走之后不能顺手把这一条也删了）",
   /\.msg\.is-recalled \.bubble \{/.test(css) && /\.msg-recalled \{/.test(css)
+);
+
+/* 放大层的右键菜单（中文五项）：最后一处还弹系统英文菜单的地方。行为那几条活在
+   session_route_check 的 20e；这里钉的是「菜单本体在不在、拦的是不是整层、收菜单
+   与关层不能互咬」——全是接线上的事，断一环自检未必响 */
+const lbMenuBlock = (() => {
+  const i = html.indexOf('id="lightbox-menu"');
+  return i < 0 ? "" : html.slice(i, i + 600);
+})();
+check(
+  "放大层菜单五项都在且全中文：复制图片 / 另存为… / 复制文件路径 / 在文件夹中显示 / 在对比中打开",
+  lbMenuBlock.length > 0 &&
+    ["lbm-copy-img", "lbm-save", "lbm-copy-path", "lbm-reveal", "lbm-compare"].every(
+      (id) => lbMenuBlock.includes(`id="${id}"`)
+    ) &&
+    ["复制图片", "另存为…", "复制文件路径", "在文件夹中显示", "在对比中打开"].every((t) => lbMenuBlock.includes(t)) &&
+    !/Copy Image|Save Image|Copy Subject|Look Up|Inspect Element|Save As/.test(lbMenuBlock),
+  lbMenuBlock.slice(0, 60)
+);
+check(
+  "拦的是整层：contextmenu 挂在 ui.lightbox 上；没本机路径时 openLbMenu 自己不拦（剪贴板纯位图那回，系统的「拷贝图像」是唯一有用的项）",
+  /ui\.lightbox\.addEventListener\("contextmenu", openLbMenu\)/.test(xferJs) &&
+    /function openLbMenu\(ev\) \{\s*if \(!ui\.lbMenu \|\| !lightboxPath\) return;/.test(xferJs) &&
+    !/lightboxImg\.addEventListener\("contextmenu"/.test(xferJs)
+);
+check(
+  "五项全走已有命令，不新开后端：复制走 copyPathAsFile、另存为走 save_path_as、路径走 copyText、显示走 reveal_in_folder",
+  /if \(act === "copy-img"\) \{\s*await copyPathAsFile\(\[p\]\);/.test(xferJs) &&
+    /await invoke\("save_path_as", \{ src: p \}\)/.test(xferJs) &&
+    /await copyText\(p\)/.test(xferJs) &&
+    /await invoke\("reveal_in_folder", \{ path: p \}\)/.test(xferJs)
+);
+check(
+  "「在对比中打开」先关层再切视图：overlay 带着走会把黑幕盖在对比视图上",
+  /} else if \(act === "compare"\) \{[\s\S]{0,120}?closeLightbox\(\);\s*openInCompare\(\[p\]\);/.test(xferJs)
+);
+check(
+  "收菜单不吃层：点外面那一下只收菜单（lbKeepLayerOnce 只吃一次），背景那一击不再被当成「关层」；关层时菜单不能留在屏上指着空气",
+  /if \(fromOutside\) lbKeepLayerOnce = true;/.test(xferJs) &&
+    /if \(lbKeepLayerOnce\) \{\s*lbKeepLayerOnce = false;\s*return;\s*\}/.test(xferJs) &&
+    /closeLbMenu\(true\)/.test(xferJs) &&
+    /lightboxPath = null;\s*\/\/[^\n]+\n\s*closeLbMenu\(\);/.test(xferJs)
+);
+check(
+  "滚轮/改窗口大小/失焦/Esc 一次收齐菜单与浮层（closeAllMenus 管 chat+msg+lb+fwd+find 五家，不能搬走一项就漏了哪份）",
+  /const closeAllMenus = \(\) => \{[\s\S]{0,180}?closeChatMenu\(\);[\s\S]{0,40}?closeMsgMenu\(\);[\s\S]{0,40}?closeLbMenu\(\);[\s\S]{0,40}?closeFwdPick\(\);[\s\S]{0,40}?closeFind\(\);/.test(xferJs) &&
+    !/closeBothMenus/.test(xferJs) &&
+    /window\.addEventListener\("wheel", closeAllMenus/.test(xferJs) &&
+    /ev\.key === "Escape"\) closeAllMenus\(\)/.test(xferJs)
+);
+
+/* 引用回复的静态合约：这一项横跨 Rust 两端与前端三层，最容易坏的恰恰是
+   「两端各写一份」的字段对齐 —— 改一处漏另一处不会报错，只会让引用默默丢掉 */
+check(
+  "Quote 结构体与 Message.quote 字段在 Rust 侧存在，且全部 serde(default) 兜底（老文件/老对端反序列化不能报错）",
+  /pub struct Quote \{[\s\S]{0,700}?\}/.test(storeRs) &&
+    /pub quote: Option<Quote>/.test(storeRs) &&
+    /#\[serde\(default, skip_serializing_if = "Option::is_none"\)\]\n    pub quote: Option<Quote>,/.test(storeRs) &&
+    /quote: None,/.test(storeRs)
+);
+check(
+  "quote 一路对齐：命令参数 → client 落库与 wire → server 原样落库，三段都在（缺一段就是前端传了后端丢）",
+  /quote: Option<store::Quote>/.test(netMod) &&
+    /payload\["quote"\] = serde_json::to_value\(q\)/.test(clientRs) &&
+    /quote,\n        \.\.Default::default\(\)/.test(clientRs) &&
+    /quote: parsed\.quote/.test(serverRs) &&
+    /#\[serde\(default\)\]\n        quote: Option<store::Quote>,/.test(serverRs)
+);
+check(
+  "前端引用三件套的 DOM 与样式都落了地：预览条三个 id、卡片与条的样式、闪一下的 keyframes",
+  ["xfer-quote", "xfer-quote-text", "xfer-quote-x"].every((id) => html.includes(`id="${id}"`)) &&
+    ["xfer-quote", "xfer-quote-text", "xfer-quote-x"].every((id) => xferJs.includes(`el("${id}")`)) &&
+    /\.quote-card \{/.test(css) &&
+    /\.quote-bar \{/.test(css) &&
+    /@keyframes msg-flash/.test(css) &&
+    /\.msg\.is-flash \.bubble \{/.test(css)
+);
+
+/* 转发的静态合约：零新后端命令是这一项的设计核心 —— 坏的点不在后端，在
+   「分流别接反、浮层别把当前会话列进去、z-index 别把菜单压在浮层下面」 */
+const fwdBlock = (() => {
+  const i = html.indexOf('id="xfer-fwd-pick"');
+  return i < 0 ? "" : html.slice(i, i + 400);
+})();
+check(
+  "转发浮层的 DOM 与接线都在：菜单项 id、浮层三个 id、el() 引用、显隐判据（撤过的不给；有正文或有本机路径才给）、点项先于路径闸门分流",
+  fwdBlock.length > 0 &&
+    html.includes('id="cb-forward"') &&
+    ["xfer-fwd-pick", "xfer-fwd-list", "xfer-fwd-cancel"].every((id) => html.includes(`id="${id}"`)) &&
+    ["xfer-fwd-pick", "xfer-fwd-list", "xfer-fwd-cancel"].every((id) => xferJs.includes(`el("${id}")`)) &&
+    /show\(ui\.msgForward, !t\.m\.recalled && \(\(t\.isText && !!\(t\.m\.text \|\| ""\)\.trim\(\)\) \|\| t\.hasFile\)\)/.test(xferJs) &&
+    /if \(act === "forward"\) \{\s*openFwdPick\(t\);\s*return;/.test(xferJs)
+);
+check(
+  "分流不接反、零新后端命令：有路径的文件走 send_paths（paths 就是本机那一份），其余走 send_text 且不把原 quote 带上（转发是全新 id 的新消息）",
+  /if \(t\.hasFile && t\.path\) \s*\{[\s\S]{0,120}?invoke\("send_paths", \{ paths: \[t\.path\], to: s\.id \}\);/.test(xferJs) &&
+    /invoke\("send_text", \{ text: String\(t\.m\.text \|\| ""\), to: s\.id \}\)/.test(xferJs)
+);
+check(
+  "浮层列的是别的会话：排除这一条所在的那个框（转发给自己没有意义），别的新后端命令都不调",
+  /for \(const s of state\.sessionList\) \{\s*if \(s\.id === state\.cur\) continue;/.test(xferJs)
+);
+check(
+  "浮层夹层：z-index 940 在 lightbox 900 与 ctx-menu 950 之间（菜单压不过浮层、浮层盖得过放大层），hidden 属性得配 display:none（fixed 块不吃默认 [hidden]）；点外面与 Esc 都收得掉",
+  /\.fwd-pick \{[\s\S]{0,400}?z-index: 940;/.test(css) &&
+    /\.fwd-pick\[hidden\] \{[^}]*display: none;/.test(css) &&
+    /ui\.fwdPick && !ui\.fwdPick\.hidden && !\(t && ui\.fwdPick\.contains && ui\.fwdPick\.contains\(t\)\)/.test(xferJs) &&
+    /if \(ui\.fwdCancel\) ui\.fwdCancel\.addEventListener\("click", closeFwdPick\)/.test(xferJs)
+);
+
+/* 清空聊天记录的静态合约：前端一次调用、后端一次整体重写 —— 最容易坏的是
+   「少注册命令」（invoke 直接 command not found）与「把保框删成删框」 */
+const chatMenuHtml = (() => {
+  const i = html.indexOf('id="chat-menu"');
+  return i < 0 ? "" : html.slice(i, i + 500);
+})();
+check(
+  "会话菜单四项都在且全中文：置顶 / 重命名 / 清空 / 删除（清空不能只在前端行为测试里活，HTML 本体坏了菜单直接缺项）",
+  ["ctx-chat-pin", "ctx-chat-rename", "ctx-chat-sep", "ctx-chat-clear", "ctx-chat-del"].every(
+    (id) => chatMenuHtml.includes(`id="${id}"`)
+  ) &&
+    ["置顶该聊天", "重命名", "清空聊天记录", "删除聊天"].every((t) => chatMenuHtml.includes(t)),
+  chatMenuHtml.slice(0, 60)
+);
+check(
+  "session_clear 三段都在：store 的 clear_session（写 hidden）→ 命令层 → generate_handler 注册（漏注册只会在真运行时炸，node 桩里永远是绿的）",
+  /pub fn clear_session\(&self, sid: &str\)/.test(storeRs) &&
+    /m\.sid_of\(\) == sid && !m\.hidden/.test(storeRs) &&
+    /m\.hidden = true;/.test(storeRs) &&
+    /pub fn session_clear\(hub: State<'_, Arc<Hub>>, id: String\)/.test(netMod) &&
+    /hub\.store\.clear_session\(&id\)/.test(netMod) &&
+    /net::session_clear,/.test(libRs)
+);
+check(
+  "两步确认与「保框」：第一下只臂上不真调；清了只重铺当前流 —— 不能走 removeOne 那条删框的路（streams.delete 会把会话表里的框一起抹掉的错觉就是这么来的），也不调 session_delete",
+  /if \(!railMenu\.clearArmed\) \{[\s\S]{0,320}?railClearTimer = setTimeout\([\s\S]{0,240}?\}, 4000\);\s*return;\s*\}/.test(xferJs) &&
+    /closeChatMenu\(\);\s*clearSession\(s\);/.test(xferJs) &&
+    /async function clearSession\(s\) \{[\s\S]{0,700}?invoke\("session_clear", \{ id: s\.id \}\)/.test(xferJs) &&
+    !/function clearSession[\s\S]{0,700}?streams\.delete/.test(xferJs) &&
+    !/function clearSession[\s\S]{0,700}?session_delete/.test(xferJs)
+);
+check(
+  "两枚臂互不干涉：删除与清空各自一份 armed，收菜单时一起退回（臂上清空后去点删除不能被误当成第二次确认）",
+  /const railMenu = \{ row: null, s: null, armed: false, clearArmed: false \};/.test(xferJs) &&
+    /function closeChatMenu\(\) \{[\s\S]{0,300}?railMenu\.armed = false;\s*railMenu\.clearArmed = false;[\s\S]{0,200}?ui\.chatDel\.textContent = "删除聊天";\s*if \(ui\.chatClear\) ui\.chatClear\.textContent = CHAT_CLEAR_LABEL;/.test(xferJs)
+);
+
+/* 全局搜索的静态合约：一枚新命令 + 一枚新浮层。最容易坏的恰是两处看不见摸不着的：
+   「命令没注册」（node 桩里永远是绿的，真运行时才炸）与「⌘F 又改回抢会话内那条框」
+   （两套并存的口径就这么被悄悄合并掉） */
+const findHtml = (() => {
+  const i = html.indexOf('id="xfer-find"');
+  return i < 0 ? "" : html.slice(i, i + 700);
+})();
+check(
+  "浮层的 DOM 与接线都在：顶栏按钮 + 浮层四个 id + 五档 chip，HTML 与 el() 一一对得上（缺 id 就是静悄悄少一个入口）",
+  findHtml.length > 0 &&
+    ["xfer-find", "xfer-find-x", "xfer-find-q", "xfer-find-chips", "xfer-find-list", "btn-xfer-find"].every(
+      (id) => html.includes(`id="${id}"`)
+    ) &&
+    ["xfer-find", "xfer-find-x", "xfer-find-q", "xfer-find-chips", "xfer-find-list", "btn-xfer-find"].every(
+      (id) => xferJs.includes(`el("${id}")`)
+    ) &&
+    ["全部", "文字", "图片", "文件", "文件夹"].every((t) => findHtml.includes(t)) &&
+    ["all", "text", "image", "file", "folder"].every((k) => findHtml.includes(`data-kind="${k}"`)),
+  findHtml.slice(0, 40)
+);
+check(
+  "search_messages 三段：命令层走 read_messages 全量（hidden 那道闸门就在出口）→ 反着读一遍后 ts 降序封顶 200 → generate_handler 注册",
+  /pub fn search_messages\(hub: State<'_, Arc<Hub>>, query: String, kind: Option<String>\)/.test(netMod) &&
+    /hub\.store\.read_messages\(usize::MAX\)\.into_iter\(\)\.rev\(\)/.test(netMod) &&
+    /const SEARCH_LIMIT: usize = 200;/.test(netMod) &&
+    /hits\.truncate\(SEARCH_LIMIT\)/.test(netMod) &&
+    /net::search_messages,/.test(libRs)
+);
+check(
+  "匹配面是三段拼起来的（正文 + 文件名 + 引用摘录）且折小写再比；摘要在折小写的串上定位、回原串取窗（摘录得保留用户原本的大小写）",
+  /let raw = format!\(\s*"\{\}\\n\{\}\\n\{\}"/.test(netMod) &&
+    /m\.quote\.as_ref\(\)\.map\(\|q\| q\.text\.clone\(\)\)/.test(netMod) &&
+    /if !hay\.contains\(&q\) \{\s*continue;/.test(netMod) &&
+    /fn search_snippet\(raw: &str, hay: &str, q: &str\) -> String/.test(netMod) &&
+    /const SEARCH_WINDOW: usize = 24;/.test(netMod)
+);
+check(
+  "大小写与空词只有 search_rows 那一份口径：折小写与「整串空白 = 什么都没填」都在那一段里，命令层不许再特判一遍（两处各判一次就会改一个漏一个）",
+  (() => {
+    const 折小写 = netMod.match(/query\.trim\(\)\.to_lowercase\(\)/g) || [];
+    return (
+      /fn search_rows\([\s\S]{0,200}?query: &str,[\s\S]{0,400}?let q = query\.trim\(\)\.to_lowercase\(\);\s*if q\.is_empty\(\) \{\s*return Vec::new\(\);/.test(netMod) &&
+      折小写.length === 1 &&
+      /search_rows\(\s*hub\.store\.read_messages\(usize::MAX\)\.into_iter\(\)\.rev\(\),\s*&query,/.test(netMod)
+    );
+  })(),
+  `query.trim().to_lowercase() 共 ${(netMod.match(/query\.trim\(\)\.to_lowercase\(\)/g) || []).length} 处`
+);
+check(
+  "取窗两头都得钳在原串长度内（定位不到时也算了 SEARCH_WINDOW*2：短句会让下面的切片直接 panic）",
+  /\(i \+ qs\.len\(\) \+ SEARCH_WINDOW\)\.min\(cs\.len\(\)\)/.test(netMod) &&
+    /None => \(0, \(SEARCH_WINDOW \* 2\)\.min\(cs\.len\(\)\)\),/.test(netMod)
+);
+check(
+  "⌘F 改道开浮层：会话内那条框不再被抢（两套并存、语义不变），顶栏按钮与⌘F 开同一扇门，点外面也收",
+  /=== "f"\) \{\s*ev\.preventDefault\(\);\s*openFind\(\);/.test(xferJs) &&
+    !/ui\.search\.focus\(\)/.test(xferJs) &&
+    /if \(ui\.findBtn\) ui\.findBtn\.addEventListener\("click", openFind\)/.test(xferJs) &&
+    /ui\.findPick && !ui\.findPick\.hidden && !\(t && ui\.findPick\.contains && ui\.findPick\.contains\(t\)\)/.test(xferJs) &&
+    html.includes("⌘F 搜全部会话")
+);
+check(
+  "浮层夹层：z-index 960 得高于 ctx-menu 950（搜索层要盖过气泡菜单），fixed 块得显式 display:none；结果行四段样式都在",
+  /\.find-pick \{[\s\S]{0,400}?z-index: 960;/.test(css) &&
+    /\.ctx-menu \{[\s\S]{0,300}?z-index: 950;/.test(css) &&
+    /\.find-pick\[hidden\] \{[^}]*display: none;/.test(css) &&
+    [".find-row {", ".find-sess {", ".find-time {", ".find-snip {", ".find-empty {"].every((s) => css.includes(s))
+);
+check(
+  "逐字符轻防抖 250ms 只挂在 input 上、Enter 不等；重画前改了词的那一份得丢弃；旧词还在就重新给结果",
+  /findTimer = setTimeout\(runFind, 250\)/.test(xferJs) &&
+    /ev\.key === "Enter"\) \{\s*clearTimeout\(findTimer\);\s*runFind\(\);/.test(xferJs) &&
+    /if \(String\(ui\.findQ\?\.value \|\| ""\)\.trim\(\) !== q\) return;/.test(xferJs) &&
+    /if \(ui\.findQ\.value\) runFind\(\);/.test(xferJs)
+);
+check(
+  "点一条的三步：先收浮层再切会话，没铺出来就逐页补（封顶 60 页沿用拉齐口径），补不到得说人话而不是静悄悄",
+  /async function gotoHit\(h\) \{\s*closeFind\(\);/.test(xferJs) &&
+    /await openSession\(h\.sid\);/.test(xferJs) &&
+    /while \(!s\.bubbles\.has\(h\.id\) && s\.hasMore && guard\+\+ < 60\) await loadOlder\(\);/.test(xferJs) &&
+    /toast\("原文还没加载出来"\)/.test(xferJs)
+);
+
+/* 存储一节的静态合约：递归走目录树的那几个数字与「删文件」这个入口都新写一份，
+   最容易坏的是「只写了命令忘了注册」与「把保留口径改反」（前者报错在后端，后者直接吞文件） */
+const storageHtml = (() => {
+  const i = html.indexOf('id="storage-rows"');
+  return i < 0 ? "" : html.slice(i, i + 700);
+})();
+check(
+  "存储一节的 DOM、接线与样式都在：四行容器 + 刷新/打开收件目录两颗 + 三档下拉与清理那枚（HTML 与 el() 一一对得上）",
+  storageHtml.length > 0 &&
+    ["storage-rows", "btn-storage-refresh", "btn-storage-reveal", "inp-inbox-clean", "btn-inbox-clean"].every(
+      (id) => html.includes(`id="${id}"`)
+    ) &&
+    ["storage-rows", "btn-storage-refresh", "btn-storage-reveal", "inp-inbox-clean", "btn-inbox-clean"].every(
+      (id) => xferJs.includes(`el("${id}")`)
+    ) &&
+    ['value="3"', 'value="6"', 'value="12"'].every((v) => storageHtml.includes(v)) &&
+    /\.storage-rows \{/.test(css) &&
+    /\.storage-row \{[\s\S]{0,200}?justify-content: space-between;/.test(css) &&
+    /\.storage-row b \{[\s\S]{0,120}?font-variant-numeric: tabular-nums;/.test(css),
+  storageHtml.slice(0, 40)
+);
+check(
+  "storage_stats 与 inbox_cleanup 都在三段上：store 算账 → 命令层 → generate_handler 注册（少注册只会在真运行时报 command not found）",
+  /pub fn storage_stats\(&self\) -> StorageStats/.test(storeRs) &&
+    /pub fn inbox_cleanup\(&self, before_ts: i64\) -> Result<\(u64, u64\), String>/.test(storeRs) &&
+    /pub fn storage_stats\(hub: State<'_, Arc<Hub>>\) -> store::StorageStats/.test(netMod) &&
+    /pub fn inbox_cleanup\(hub: State<'_, Arc<Hub>>, before_ts: i64\) -> Result<Value, String>/.test(netMod) &&
+    /net::storage_stats,/.test(libRs) &&
+    /net::inbox_cleanup,/.test(libRs)
+);
+check(
+  "统计一律走 symlink_metadata（logical size）：不跟随符号链接、也不把 iCloud 占位文件唤下来；递归只在一个地方写",
+  /fn walk_sizes\(root: &Path\) -> \(u64, u64\)/.test(storeRs) &&
+    /fs::symlink_metadata\(&p\)/.test(storeRs) &&
+    !/fs::metadata\(&p\)/.test(storeRs)
+);
+check(
+  "清理的保留口径：先看时间闸门、再看有没有被任何还看得见的消息引用；目录那一级靠 dir_has_kept 整层保住（改反就是默默吞掉用户还在用的文件）",
+  /let kept: HashSet<PathBuf> = self\s*\.read_messages\(usize::MAX\)/.test(storeRs) &&
+    /if mtime >= before_ts \{\s*continue;/.test(storeRs) &&
+    /if kept\.contains\(&p\) \|\| \(is_dir && dir_has_kept\(&p, &kept\)\) \{\s*continue;/.test(storeRs) &&
+    /fn dir_has_kept\(root: &Path, kept: &HashSet<PathBuf>\) -> bool/.test(storeRs)
+);
+check(
+  "清理那枚沿用两步确认：第一下只臂上文案、四秒自己退回；第二下才读当下那一档换算成时间戳调命令（臂上之后换档位得算新的）",
+  /if \(!cleanArmed\) \{[\s\S]{0,200}?cleanTimer = setTimeout\(disarmClean, 4000\);\s*return;\s*\}/.test(xferJs) &&
+    /disarmClean\(\);\s*const months = Number\(ui\.inboxCleanSel\?\.value\) \|\| 3;[\s\S]{0,160}?invoke\("inbox_cleanup", \{ beforeTs \}\)/.test(xferJs)
+);
+check(
+  "删完的数字两处都会重画：命令层 emit 一次 storage-changed，前端既听那一句也自己再拉一次（没开抽屉时下次打开得是新数）",
+  /hub\.emit\(\s*"storage-changed",/.test(netMod) &&
+    /listen\("storage-changed", \(payload\) => \{\s*if \(payload && payload\.stats\) renderStorage\(payload\.stats\);/.test(xferJs) &&
+    /const n = Number\(res\?\.deleted_count\) \|\| 0;[\s\S]{0,300}?await refreshStorage\(\);/.test(xferJs)
+);
+check(
+  "那几个数字不进任何轮询：只在抽屉打开、点刷新、清理之后重读（递归走一遍目录树不便宜）",
+  /if \(ui\.settings\.classList\.contains\("is-open"\)\) \{\s*refreshRecvPrefs\(\);\s*refreshStorage\(\);\s*\}/.test(xferJs) &&
+    !/setInterval\([\s\S]{0,120}?refreshStorage/.test(xferJs) &&
+    /if \(ui\.btnStorageRefresh\) ui\.btnStorageRefresh\.addEventListener\("click", refreshStorage\)/.test(xferJs)
 );
 
 console.log(`\n合计 PASS=${passed} FAIL=${failed}`);

@@ -243,6 +243,23 @@ const RECALL_SUMMARY = "撤回了一条消息";
 
 /** 与 Rust 的 Message::sid_of 同口径：没 sid 的老消息归它那台的基础对话 */
 const sidOf = (m) => m.sid || m.peer || "";
+// 与 Rust 的 search_snippet 同口径：命中处前后各 24 字符，截了两头加省略号
+//（下标在折小写的串上找，两边只折大小写不丢字符，回原串取窗不错位）
+const findSnippet = (raw, hay, q) => {
+  const cs = Array.from(raw);
+  const hs = Array.from(hay);
+  const qs = Array.from(q);
+  let at = -1;
+  for (let i = 0; i + qs.length <= hs.length; i++) {
+    if (hs.slice(i, i + qs.length).join("") === qs.join("")) {
+      at = i;
+      break;
+    }
+  }
+  const s = at < 0 ? 0 : Math.max(0, at - 24);
+  const e = at < 0 ? Math.min(cs.length, 48) : Math.min(cs.length, at + qs.length + 24);
+  return (s > 0 ? "…" : "") + cs.slice(s, e).join("") + (e < cs.length ? "…" : "");
+};
 
 /** 与 Rust 的 Peer::display_name 同口径：备注名优先，没备注才用对方上报的设备名 */
 const display = (p) =>
@@ -354,6 +371,25 @@ function focus(id) {
 }
 
 const calls = [];
+/* 桩里那份虚拟收件目录与那几个数字：真机是递归走一遍目录树，桩里不重演——
+   用例直接往 boxFiles 里摆文件（size + mtime），inbox_cleanup 就在那上面筛 */
+const boxFiles = new Map();
+// 除收件目录以外的那几个数字由用例直接盖（数据目录 / 粘贴暂存 / 历史文件字节）
+const boxNums = { pastebox_bytes: 0, data_bytes: 0, messages_bytes: 0 };
+
+/** 与 Rust 的 storage_stats 同口径：条数只算没 hidden 的那些（界面上报的得是用户看得到的） */
+function storageStats() {
+  let inboxBytes = 0;
+  for (const f of boxFiles.values()) inboxBytes += f.size;
+  return {
+    inbox_bytes: inboxBytes,
+    inbox_count: boxFiles.size,
+    pastebox_bytes: boxNums.pastebox_bytes,
+    data_bytes: boxNums.data_bytes,
+    messages_bytes: boxNums.messages_bytes,
+    messages_count: world.hist.filter((m) => !m.hidden).length,
+  };
+}
 /* 本机接收 + 在线探测那几项：桩里就一份内存 prefs，set_prefs 的局部更新语义照 Rust 抄
    （传来的字段覆盖，没传的保持原值；收件目录只认绝对路径与空串；
    心跳节拍只认白名单那四档） */
@@ -377,6 +413,33 @@ window.__TAURI__.core.invoke = async (cmd, args = {}) => {
       return { path: args.path, data_url: `data:image/jpeg;base64,${Buffer.from(args.path).length}` };
     case "sessions":
       return sessionsPayload();
+    case "search_messages": {
+      // 与 Rust 的 search_messages 同口径：只搜未 hidden 的（撤回仍露），
+      // 匹配面 = 正文 + 文件名 + 引用摘录，大小写不敏感，ts 降序封 200
+      const q = String(args.query || "").trim().toLowerCase();
+      if (!q) return [];
+      const k = args.kind || "all";
+      const hits = [];
+      for (const m of world.hist.filter((x) => !x.hidden)) {
+        if (k !== "all" && m.kind !== k) continue;
+        const raw = `${m.text || ""}\n${m.name || ""}\n${(m.quote && m.quote.text) || ""}`;
+        const hay = raw.toLowerCase();
+        if (!hay.includes(q)) continue;
+        hits.push({
+          id: m.id,
+          sid: sidOf(m),
+          peer: m.peer,
+          ts: m.ts,
+          kind: m.kind,
+          name: m.name || null,
+          dir: m.dir,
+          session: sessionRowOf(sidOf(m)).name,
+          snippet: findSnippet(raw, hay, q),
+        });
+      }
+      hits.sort((a, b) => b.ts - a.ts);
+      return hits.slice(0, 200);
+    }
     case "session_focus":
       focus(args.id);
       return sessionsPayload();
@@ -433,6 +496,18 @@ window.__TAURI__.core.invoke = async (cmd, args = {}) => {
       if (!world.hidden.includes(args.id)) world.hidden.push(args.id);
       if (world.active === args.id) world.active = "";
       return sessionsPayload();
+    case "session_clear": {
+      // 与 Rust 的 clear_session 同口径：只把这一格里未 hidden 的标上 hidden，
+      // 框、读指针、会话表都不动；返的是清掉的条数
+      let n = 0;
+      for (const m of world.hist) {
+        if (sidOf(m) === args.id && !m.hidden) {
+          m.hidden = true;
+          n += 1;
+        }
+      }
+      return { cleared: n };
+    }
     case "msg_history": {
       // 必须先按对话框筛、再定位游标切页：反过来会让每页凑不满、游标还会串框
       const list = args.session === undefined ? world.hist : world.hist.filter((m) => sidOf(m) === args.session);
@@ -476,6 +551,8 @@ window.__TAURI__.core.invoke = async (cmd, args = {}) => {
         dir: "out",
         kind: "text",
         text: args.text,
+        // 后端新字段原样存：引用卡片就是这么跟着 msg-updated 回到气泡上的
+        quote: args.quote || null,
         state: peer.online ? "sent" : "queued",
         ts: Date.now(),
         peer: sess ? sess.peer : to,
@@ -577,6 +654,26 @@ window.__TAURI__.core.invoke = async (cmd, args = {}) => {
     }
     case "inbox_dir":
       return { path: prefs.inbox || DEFAULT_INBOX, custom: !!prefs.inbox };
+    case "storage_stats":
+      return storageStats();
+    case "inbox_cleanup": {
+      // 与 Rust 的 inbox_cleanup 同口径：只动改于 beforeTs 之前、而且没被任何
+      // 还看得见的消息引用的收件文件（日期子目录那一级归并在 Rust 单测里）
+      if (world.cleanFails) throw new Error(world.cleanFails);
+      const before = Number(args.beforeTs) || 0;
+      const kept = new Set(world.hist.filter((m) => !m.hidden && m.path).map((m) => m.path));
+      let n = 0;
+      let b = 0;
+      for (const [p, f] of [...boxFiles]) {
+        if (f.mtime >= before || kept.has(p)) continue;
+        boxFiles.delete(p);
+        n += 1;
+        b += f.size;
+      }
+      // Rust 删完 emit 一次：抽屉开着就得靠那一句重画数字
+      emit("storage-changed", { stats: storageStats(), deleted_count: n, freed_bytes: b });
+      return { deleted_count: n, freed_bytes: b };
+    }
     case "pick_folder":
       return pickAnswer;
     case "play_notify_sound":
@@ -1805,8 +1902,10 @@ const rightClick = (node) => {
   });
   return blocked;
 };
-const fireWindow = (type, target) => {
-  for (const [t, fn] of winListeners) if (t === type) fn({ type, target });
+const fireWindow = (type, target, extra = {}) => {
+  // 默认带上 no-op 的 preventDefault：处理器里无条件调它的（⌘F）才不会顶异常
+  const ev = { type, target, preventDefault: () => {}, ...extra };
+  for (const [t, fn] of winListeners) if (t === type) fn(ev);
 };
 
 emit("sessions-changed", sessionsPayload());
@@ -1938,6 +2037,11 @@ rightClick(unmarkedRow);
 click(byId("ctx-chat-del"));
 await settle();
 check(
+  "未标记行也露「清空聊天记录」（它的 sid 就是那个空串筐），与删除并排",
+  byId("ctx-chat-clear").hidden === false && byId("ctx-chat-del").hidden === false,
+  `clear=${byId("ctx-chat-clear").hidden} del=${byId("ctx-chat-del").hidden}`
+);
+check(
   "未标记行第一下也只是臂上（文案变成「再点一次删除」，还没调命令）",
   byId("ctx-chat-del").textContent === "再点一次删除" && takeCalls("session_delete", sinceUnmarked).length === 0,
   byId("ctx-chat-del").textContent
@@ -1966,11 +2070,12 @@ const rustStore = readFileSync(join(here, "..", "src-tauri", "src", "store.rs"),
 // 只看菜单那一块：index.html 里的注释也写着「Reload / Inspect Element」为何被替掉，不能一刀切
 // （聊天气泡那份菜单的注释里也有这两个字，窗口开宽了会把那边一块扫进来）
 const menuAt = html.indexOf('id="chat-menu"');
-const menuHtml = menuAt < 0 ? "" : html.slice(menuAt, menuAt + 400);
+const menuHtml = menuAt < 0 ? "" : html.slice(menuAt, menuAt + 500);
 check(
-  "菜单三项都是中文（置顶 / 重命名 / 删除），菜单里没有 Reload / Inspect",
+  "菜单四项都是中文（置顶 / 重命名 / 清空 / 删除），菜单里没有 Reload / Inspect",
   /置顶该聊天/.test(menuHtml) &&
     /重命名/.test(menuHtml) &&
+    /清空聊天记录/.test(menuHtml) &&
     /删除聊天/.test(menuHtml) &&
     !/Reload|Inspect Element/.test(menuHtml),
   menuHtml.slice(0, 80)
@@ -2013,6 +2118,8 @@ const msgMenuEl = byId("chat-msg-menu");
 // 文本同步写桩：菜单项靠 textContent 认项，「这项叫什么」在测试里就得是个能看见的常量
 const MSG_ITEMS = [
   ["cb-copy-text", "复制正文"],
+  ["cb-quote", "引用回复"],
+  ["cb-forward", "转发到别的会话"],
   ["cb-copy-img", "复制图片"],
   ["cb-save", "另存为…"],
   ["cb-copy-path", "复制文件路径"],
@@ -2070,7 +2177,7 @@ check(
 check("弹的是自己的中文菜单", msgMenuEl.hidden === false, `hidden=${msgMenuEl.hidden}`);
 check(
   "图片这一项都不落：复制图片 / 另存为 / 复制路径 / 在文件夹中显示 / 在对比中打开，再加隔断与删除",
-  shownItems().join(",") === "复制图片,另存为…,复制文件路径,在文件夹中显示,在对比中打开,|,删除（只删本机）",
+  shownItems().join(",") === "引用回复,转发到别的会话,复制图片,另存为…,复制文件路径,在文件夹中显示,在对比中打开,|,删除（只删本机）",
   shownItems().join(",")
 );
 check(
@@ -2133,7 +2240,7 @@ const textBubble = textMsg ? textMsg.children.find((c) => c.classSet.has("bubble
 const itemsOfText = openBubbleMenu(textMsg);
 check(
   "文字气泡也换成中文菜单，只给「复制正文」+ 隔断 + 撤回/删除",
-  itemsOfText.join(",") === "复制正文,|,删除（只删本机）",
+  itemsOfText.join(",") === "复制正文,引用回复,转发到别的会话,|,删除（只删本机）",
   itemsOfText.join(",")
 );
 check(
@@ -2168,7 +2275,7 @@ await settle();
 const itemsOfDoc = openBubbleMenu(msgElOf("doc1"));
 check(
   "非图片文件也换成同一份中文菜单：给文件那几项，不给「复制图片」「在对比中打开」",
-  itemsOfDoc.join(",") === "另存为…,复制文件路径,在文件夹中显示,|,删除（只删本机）",
+  itemsOfDoc.join(",") === "引用回复,转发到别的会话,另存为…,复制文件路径,在文件夹中显示,|,删除（只删本机）",
   itemsOfDoc.join(",")
 );
 
@@ -2185,12 +2292,14 @@ check(
   ""
 );
 const msgMenuAt = html.indexOf('id="chat-msg-menu"');
-const msgMenuHtml = msgMenuAt < 0 ? "" : html.slice(msgMenuAt, msgMenuAt + 900);
+const msgMenuHtml = msgMenuAt < 0 ? "" : html.slice(msgMenuAt, msgMenuAt + 1100);
 check(
-  "菜单九枚都在一份菜单里（一份菜单管三种气泡，不再开两份）",
+  "菜单十一枚都在一份菜单里（一份菜单管三种气泡，不再开两份）",
   msgMenuAt >= 0 &&
     [
       "cb-copy-text",
+      "cb-quote",
+      "cb-forward",
       "cb-copy-img",
       "cb-save",
       "cb-copy-path",
@@ -2205,7 +2314,7 @@ check(
 );
 check(
   "菜单项全是中文，没有一条 WebView 原生菜单那套英文项",
-  ["复制正文", "复制图片", "另存为…", "复制文件路径", "在文件夹中显示", "在对比中打开", "撤回这一条", "删除（只删本机）"].every(
+  ["复制正文", "引用回复", "转发到别的会话", "复制图片", "另存为…", "复制文件路径", "在文件夹中显示", "在对比中打开", "撤回这一条", "删除（只删本机）"].every(
     (t) => msgMenuHtml.includes(t)
   ) &&
     !/Look Up|Translate|Search with|Copy Link|Share…|Speech|Inspect Element|Open Image|Download Image|Copy Subject/.test(
@@ -2213,6 +2322,631 @@ check(
     ),
   msgMenuHtml.slice(0, 120)
 );
+
+/* 20e) 放大层的右键菜单：以前在放大层里右键弹的还是「Copy Image / Save Image As… /
+      Inspect Element」那套英文系统菜单，现在换成自己画的中文五项，全走已有命令。
+      没有本机路径时干脆不拦——剪贴板纯位图那回，系统菜单里的「拷贝图像」是唯一有用的项 */
+const lbMenuEl = byId("lightbox-menu");
+for (const [id, label] of [
+  ["lbm-copy-img", "复制图片"],
+  ["lbm-save", "另存为…"],
+  ["lbm-copy-path", "复制文件路径"],
+  ["lbm-reveal", "在文件夹中显示"],
+  ["lbm-compare", "在对比中打开"],
+]) {
+  const n = byId(id);
+  n.textContent = label;
+  lbMenuEl.appendChild(n);
+}
+lbMenuEl.hidden = true;
+
+// 拿上一节那条 img1（有本机路径）开放大层
+const lbThumb1 = msgElOf("img1").querySelectorAll(".thumb-box")[0];
+click(lbThumb1);
+await settle();
+check("从图片气泡打开放大层（这一张有本机路径）", LB().hidden === false, String(LB().hidden));
+const lbBlocked = rightClick(LB());
+check(
+  "右键放大层先 preventDefault：不再弹 Copy Image / Save Image As… 那套英文的",
+  lbBlocked === true,
+  `blocked=${lbBlocked}`
+);
+check("弹出来的是自己画的中文菜单", lbMenuEl.hidden === false, `hidden=${lbMenuEl.hidden}`);
+check(
+  "五项全露：放大层里本来就是带路径的图，没有按类型显隐的必要",
+  lbMenuEl.children.filter((c) => !c.hidden).map((c) => c.text).join(",") ===
+    "复制图片,另存为…,复制文件路径,在文件夹中显示,在对比中打开",
+  lbMenuEl.children.map((c) => `${c.text}${c.hidden ? "(藏)" : ""}`).join(",")
+);
+check(
+  "菜单贴在鼠标处（与会话/气泡菜单共用 placeMenuAt）",
+  lbMenuEl.style.left === "120px" && lbMenuEl.style.top === "160px",
+  `${lbMenuEl.style.left},${lbMenuEl.style.top}`
+);
+
+const sinceLbCopy = calls.length;
+click(byId("lbm-copy-img"));
+await settle();
+check(
+  "「复制图片」走 copy_as_file：拷的是放大层正在看的那张，不是气泡那条",
+  takeCalls("copy_as_file", sinceLbCopy).some(([, a]) => a.paths?.[0] === "/收件箱/圣诞雪花树纹针织图案.png"),
+  JSON.stringify(takeCalls("copy_as_file", sinceLbCopy))
+);
+check("点完菜单自己收起", lbMenuEl.hidden === true, `hidden=${lbMenuEl.hidden}`);
+
+rightClick(LB());
+const sinceLbSave = calls.length;
+click(byId("lbm-save"));
+await settle();
+check(
+  "「另存为…」走 save_path_as，src 是放大层这一张",
+  takeCalls("save_path_as", sinceLbSave).some(([, a]) => a.src === "/收件箱/圣诞雪花树纹针织图案.png"),
+  JSON.stringify(takeCalls("save_path_as", sinceLbSave))
+);
+
+rightClick(LB());
+const sinceLbPath = calls.length;
+click(byId("lbm-copy-path"));
+await settle();
+check(
+  "「复制文件路径」走 copy_text 兜底（桩里 navigator/execCommand 都不通，正好看兜底那一路）",
+  takeCalls("copy_text", sinceLbPath).some(([, a]) => a.text === "/收件箱/圣诞雪花树纹针织图案.png"),
+  JSON.stringify(takeCalls("copy_text", sinceLbPath))
+);
+
+rightClick(LB());
+const sinceLbReveal = calls.length;
+click(byId("lbm-reveal"));
+await settle();
+check(
+  "「在文件夹中显示」走 reveal_in_folder",
+  takeCalls("reveal_in_folder", sinceLbReveal).some(([, a]) => a.path === "/收件箱/圣诞雪花树纹针织图案.png"),
+  JSON.stringify(takeCalls("reveal_in_folder", sinceLbReveal))
+);
+
+// 「在对比中打开」必须先把放大层关了再切视图：overlay 带着走会盖住对比视图
+rightClick(LB());
+click(byId("lbm-compare"));
+await settle();
+check(
+  "「在对比中打开」先关层再切对比视图（不会有一层黑幕盖在另一个视图上）",
+  LB().hidden === true && document.body.dataset.view === "compare",
+  `层=${LB().hidden} 视图=${document.body.dataset.view}`
+);
+api.setView("transfer");
+await settle();
+
+// 点空白收菜单不能顺手把整层关了：那一下 pointerdown 收菜单、紧随的 click 只吃标记不关层
+click(lbThumb1);
+await settle();
+rightClick(LB());
+fireWindow("pointerdown", LB());
+lbBgClick();
+check(
+  "菜单开着时点层内空白：先收菜单，这一下不连带关层",
+  lbMenuEl.hidden === true && LB().hidden === false && lbMenuEl.hidden === true,
+  `菜单=${lbMenuEl.hidden} 层=${LB().hidden}`
+);
+lbBgClick();
+check("再点一次背景才真的关层（旧手感没被吃掉）", LB().hidden === true, String(LB().hidden));
+
+// 没路径不拦：层关着 lightboxPath 就是 null，右键要让系统菜单照旧（留「拷贝图像」）
+check(
+  "没有本机路径时不拦右键：灰一排不如把系统里唯一有用的那项留着",
+  rightClick(LB()) === false && lbMenuEl.hidden === true,
+  `blocked 应为 false，菜单 hidden=${lbMenuEl.hidden}`
+);
+check(
+  "右键监听挂在整层上、路径判定在 openLbMenu 里（代码口径）",
+  /ui\.lightbox\.addEventListener\("contextmenu", openLbMenu\)/.test(xferJs) &&
+    /function openLbMenu\(ev\) \{\s*if \(!ui\.lbMenu \|\| !lightboxPath\) return;/.test(xferJs),
+  ""
+);
+
+/* 20f) 引用回复：气泡菜单点「引用回复」→ 输入框上方出预览条 →
+      Enter/点发送时把 quote 一起带走（那是一条新消息，不是改原文那条）；
+      发出去的气泡顶上挂 quote-card，点了滚到原文闪一下 */
+const quoteBar = byId("xfer-quote");
+const quoteTxt = () => String(byId("xfer-quote-text").textContent);
+quoteBar.hidden = true;
+
+check("引用预览条默认收着（与 index.html 上的 hidden 一致）", quoteBar.hidden === true, `hidden=${quoteBar.hidden}`);
+
+// 引一条文件：摘的是文件名，不要求本机路径以外的任何东西
+rightClick(msgElOf("img1"));
+click(itemBy("引用回复"));
+await settle();
+check(
+  "点「引用回复」出预览条：引的是对方 + 文件名摘录，菜单自己收起",
+  quoteBar.hidden === false && quoteTxt() === "引用 甲机：圣诞雪花树纹针织图案.png" && msgMenuEl.hidden === true,
+  `${quoteBar.hidden} "${quoteTxt()}"`
+);
+
+// × 只取消引用，不动已写的正文
+byId("xfer-input").value = "这个图样不错";
+click(byId("xfer-quote-x"));
+await settle();
+check(
+  "× 只取消引用：条收了、摘录文案清了，写好的正文原样留着",
+  quoteBar.hidden === true && quoteTxt() === "" && byId("xfer-input").value === "这个图样不错",
+  `hidden=${quoteBar.hidden} 正文="${byId("xfer-input").value}"`
+);
+
+// 重新挂上引用再发：quote 跟着 send_text 走，发出即清
+rightClick(msgElOf("img1"));
+click(itemBy("引用回复"));
+const qtSince = calls.length;
+click(byId("btn-xfer-send"));
+await settle();
+const qtCalls = takeCalls("send_text", qtSince);
+const qtArgs = qtCalls.length ? qtCalls[0][1] : null;
+check(
+  "send_text 把引用快照一起带上（id/from/摘录/类型/文件名都在）",
+  qtCalls.length === 1 &&
+    !!qtArgs.quote &&
+    qtArgs.quote.id === "img1" &&
+    qtArgs.quote.from === "甲机" &&
+    qtArgs.quote.kind === "file" &&
+    qtArgs.quote.name === "圣诞雪花树纹针织图案.png" &&
+    qtArgs.quote.text === "圣诞雪花树纹针织图案.png",
+  JSON.stringify(qtArgs && qtArgs.quote)
+);
+check(
+  "发出即清：预览条收了，正文也清了",
+  quoteBar.hidden === true && byId("xfer-input").value === "",
+  `hidden=${quoteBar.hidden} 正文="${byId("xfer-input").value}"`
+);
+
+// 后端落库后 msg-updated 推回来：新气泡顶上该有那张卡片
+const qtOut = world.hist.find((m) => m.text === "这个图样不错" && m.quote);
+const qtBub = qtOut && bubbles().find((b) => b.dataset.id === qtOut.id);
+const qtCard = qtBub && qtBub.querySelector(".quote-card");
+check(
+  "带引用的那条气泡顶上挂了 quote-card（浅底小字那一张，不是把原文拼进正文）",
+  !!qtCard && qtCard.textContent === "引用 甲机：圣诞雪花树纹针织图案.png",
+  qtCard ? qtCard.textContent : `bub=${!!qtBub}`
+);
+
+// 点卡片定位：img1 就在同一条流里，闪的是 .msg 外层
+if (qtCard) click(qtCard);
+await settle();
+check(
+  "点卡片：被引那条闪一下（is-flash 挂在 .msg 外层，闪的是整条气泡）",
+  msgElOf("img1").classSet.has("is-flash") && !!qtCard && !qtCard.classSet.has("is-flash"),
+  String(msgElOf("img1").className)
+);
+
+// 摘录超 120 字截断加省略号：按字符数，不把中文截半
+const longText = "雪".repeat(200);
+emit("msg-in", {
+  message: { id: "long1", dir: "in", kind: "text", text: longText, state: "sent", ts: at(0, 18), peer: "A", sid: "A" },
+});
+await settle();
+rightClick(msgElOf("long1"));
+click(itemBy("引用回复"));
+await settle();
+check(
+  "长正文的摘录超 120 字就截断加省略号（按字符数，不会截半个汉字）",
+  quoteTxt() === `引用 甲机：${"雪".repeat(120)}…`,
+  `长度=${quoteTxt().length}`
+);
+click(byId("xfer-quote-x"));
+
+// 原文不在已铺页面里：只提示一句，不硬拉历史
+emit("msg-in", {
+  message: {
+    id: "q-ghost",
+    dir: "in",
+    kind: "text",
+    text: "引了个更早的",
+    state: "sent",
+    ts: at(0, 19),
+    peer: "A",
+    sid: "A",
+    quote: { id: "ghost9", from: "甲机", text: "很早前的一条", kind: "text" },
+  },
+});
+await settle();
+const gCard = bubbles().find((b) => b.dataset.id === "q-ghost").querySelector(".quote-card");
+// 上面那次点卡片给 img1 挂的 is-flash 还红着（桩里的 1.2s 定时器不会走完），先擦干净再断言「没闪新的」
+msgElOf("img1").classList.remove("is-flash");
+const qLogBefore = statusLog.length;
+click(gCard);
+await settle();
+check(
+  "原文还没铺出来时只提示一句不报错，也不逐页去拉（那是全局搜索的活）",
+  statusLog.slice(qLogBefore).some((t) => String(t).includes("原文还没加载出来")) &&
+    !bubbles().some((b) => b.classSet.has("is-flash")),
+  statusLog.slice(qLogBefore).join(" | ")
+);
+
+// 切会话把引用预览条收干净：挂着 A 会话的引用去发 B 是串话
+rightClick(msgElOf("img1"));
+click(itemBy("引用回复"));
+await settle();
+click(rowOf("C"));
+await settle();
+check(
+  "切了会话引用预览条自动收：引用不能跟错对话框",
+  quoteBar.hidden === true,
+  `hidden=${quoteBar.hidden}`
+);
+
+/* 20g) 转发到别的会话：气泡菜单选人 → 会话选择浮层（排除这条所在会话），
+       点一条：文件走 send_paths（拿本机那份）、文字走 send_text（不带 quote，
+       是一条全新 id 的新消息）；零新后端命令 */
+const fwdPick = byId("xfer-fwd-pick");
+const fwdList = byId("xfer-fwd-list");
+fwdPick.hidden = true;
+click(rowOf("A"));
+await settle();
+rightClick(msgElOf("img1"));
+check("已经有路径的文件气泡，菜单里露「转发到别的会话」", shownItems().includes("转发到别的会话"), shownItems().join(","));
+click(itemBy("转发到别的会话"));
+await settle();
+check("点转发弹会话浮层（菜单同时收了）", fwdPick.hidden === false && msgMenuEl.hidden === true, `pick=${fwdPick.hidden} menu=${msgMenuEl.hidden}`);
+const fwdRows = fwdList.children.map((b) => String(b.textContent));
+check(
+  "浮层列的是其它会话：名字 · 最后一条时间，当前所在那台（甲机）被排除",
+  fwdRows.some((n) => n.startsWith("丙机")) && !fwdRows.some((n) => n.startsWith("甲机")),
+  fwdRows.join(" | ")
+);
+// 丙机有两个框（早前那步「对方新开的框」注册的 C-new），按名字找会撞上错的：
+// 照 renderFwdList 同口径（sessionList 排除当前）算出主框 C 的那一行下标
+const fwdOrder = sessionsPayload().sessions.filter((s) => s.id !== "A").map((s) => s.id);
+const fwdC = fwdOrder.indexOf("C");
+const fSince = calls.length;
+click(fwdList.children[fwdC]);
+await settle();
+const fCalls = takeCalls("send_paths", fSince);
+check(
+  "点丙机：走的是 send_paths，to 是丙机的会话 ID、paths 就是本机那一份（不另存副本）",
+  fCalls.length === 1 && fCalls[0][1].to === "C" && fCalls[0][1].paths.join(",") === "/收件箱/圣诞雪花树纹针织图案.png",
+  JSON.stringify(fCalls[0] || null)
+);
+check("选完浮层自己收起", fwdPick.hidden === true, String(fwdPick.hidden));
+
+// 转文字：那条自带引用的也不把 quote 跟上 —— 转发是一条全新 id 的新消息，
+// 原会话那条撤回/删除互不影响
+rightClick(msgElOf(qtOut.id));
+click(itemBy("转发到别的会话"));
+await settle();
+const tSince = calls.length;
+click(fwdList.children[fwdC]);
+await settle();
+const tCalls = takeCalls("send_text", tSince);
+check(
+  "转文字走 send_text：同一句原文、to 是丙机，且不把那条自己的 quote 带上",
+  tCalls.length === 1 &&
+    tCalls[0][1].text === "这个图样不错" &&
+    tCalls[0][1].to === "C" &&
+    tCalls[0][1].quote == null &&
+    takeCalls("send_paths", tSince).length === 0,
+  JSON.stringify(tCalls[0] || null)
+);
+
+// 取消与点外面：都只收浮层，一条都不发
+rightClick(msgElOf("img1"));
+click(itemBy("转发到别的会话"));
+await settle();
+const vSince = calls.length;
+click(byId("xfer-fwd-cancel"));
+await settle();
+check(
+  "点「取消」：浮层收了，一个发送命令都没调",
+  fwdPick.hidden === true && takeCalls("send_paths", vSince).length === 0 && takeCalls("send_text", vSince).length === 0,
+  JSON.stringify(calls.slice(vSince).map(([c]) => c))
+);
+rightClick(msgElOf("img1"));
+click(itemBy("转发到别的会话"));
+await settle();
+fireWindow("pointerdown", byId("xfer-stream"));
+check("点浮层外面也收（与菜单同一个手感）", fwdPick.hidden === true, String(fwdPick.hidden));
+
+// 臂上的超时退回：只臂上不点第二下，4 秒得自己退回原文案（这里直接验臂上态与文案，
+// 桩里的真定时器不会走完，退回去那一下靠收菜单那一笔）
+const CL_LABEL = "清空聊天记录";
+const clearItem = () => byId("ctx-chat-clear");
+const chatDelIt = () => byId("ctx-chat-del");
+rightClick(rowOf("A"));
+check("会话菜单里有「清空聊天记录」这一项", !clearItem().hidden, String(clearItem().hidden));
+click(clearItem());
+await settle();
+check(
+  "清空第一步：只臂上变文案，命令一条没调、会话表原样不动",
+  clearItem().textContent === "再点一次清空" &&
+    takeCalls("session_clear", calls.length - 1).length === 0 &&
+    !!rowOf("A") &&
+    chatDelIt().textContent === "删除聊天",
+  `文案="${clearItem().textContent}" 调用=${JSON.stringify(calls.slice(-1).map(([c]) => c))}`
+);
+// 臂上清空后去点删除：那是删除自己的第一步，不能被清空的臂误当成「第二次确认」
+click(chatDelIt());
+check(
+  "两枚臂互不干涉：臂上清空后点删除，只臂上删除、不产生任何后端调用",
+  chatDelIt().textContent === "再点一次删除" && takeCalls("session_delete", calls.length - 1).length === 0,
+  JSON.stringify(calls.slice(-1).map(([c]) => c))
+);
+fireWindow("pointerdown", byId("xfer-stream"));
+check(
+  "点菜单外面：两枚臂与文案一起退回",
+  clearItem().textContent === CL_LABEL && chatDelIt().textContent === "删除聊天",
+  `clear="${clearItem().textContent}" del="${chatDelIt().textContent}"`
+);
+
+/* 20h) 清空聊天记录：两步之后只补写 hidden —— 框还在、会话表不动、
+       别的会话一条不碰（口径与单条本机删除一致，只是入口一次点一批） */
+world.sessions.push({ id: "CLR", peer: "A", name: "待清空的框", created: NOW, read: NOW });
+for (const [cid, ctx] of [
+  ["cl1", "清前的第一条"],
+  ["cl2", "清前的第二条"],
+]) {
+  world.hist.push({ id: cid, dir: "in", kind: "text", text: ctx, state: "sent", ts: at(0, 20), peer: "A", sid: "CLR", recalled: false, hidden: false });
+}
+world.hist.push({
+  id: "cl3", dir: "in", kind: "text", text: "已经删过的", state: "sent", ts: at(0, 20), peer: "A", sid: "CLR", recalled: false, hidden: true,
+});
+emit("sessions-changed", sessionsPayload());
+await settle();
+click(rowOf("CLR"));
+await settle();
+check("清空前这个框里有两条", bubbles().length === 2, String(bubbles().length));
+const aCntBefore = world.hist.filter((m) => sidOf(m) === "A" && !m.hidden).length;
+const cCntBefore = world.hist.filter((m) => sidOf(m) === "C" && !m.hidden).length;
+const clSince = calls.length;
+rightClick(rowOf("CLR"));
+click(clearItem());
+await settle();
+click(clearItem());
+await settle();
+const clCalls = takeCalls("session_clear", clSince);
+check(
+  "第二下才真清：session_clear 的 id 就是右键的那个框，一次调用清一批",
+  clCalls.length === 1 && clCalls[0][1].id === "CLR",
+  JSON.stringify(clCalls)
+);
+check(
+  "清完流里重铺成空的：占位话说的是「已清空」而不是「还没有消息」（消息还在盘上）",
+  bubbles().length === 0 && String(stream().innerHTML).includes("已清空"),
+  `条数=${bubbles().length} 占位="${String(stream().innerHTML).slice(0, 80)}"`
+);
+check(
+  "只标 hidden 不抹行：三条都在盘上（本来就删过的仍标着）",
+  world.hist.filter((m) => sidOf(m) === "CLR").length === 3 &&
+    world.hist.filter((m) => sidOf(m) === "CLR").every((m) => m.hidden === true),
+  String(world.hist.filter((m) => sidOf(m) === "CLR").length)
+);
+check(
+  "保框：还留在会话栏里，也不碰会话表（没有 session_delete）与别的会话",
+  !!rowOf("CLR") &&
+    takeCalls("session_delete", clSince).length === 0 &&
+    world.sessions.some((s) => s.id === "CLR") &&
+    world.hist.filter((m) => sidOf(m) === "A" && !m.hidden).length === aCntBefore &&
+    world.hist.filter((m) => sidOf(m) === "C" && !m.hidden).length === cCntBefore,
+  `row=${!!rowOf("CLR")} A=${aCntBefore} C=${cCntBefore}`
+);
+emit("sessions-changed", sessionsPayload());
+await settle();
+check(
+  "会话栏那句摘要回到空会话口径（后端从可见消息重算，前端不新增特判）",
+  String(sessionRowOf("CLR").summary || "") === "",
+  JSON.stringify(sessionRowOf("CLR").summary)
+);
+// 还原：后面的用例还要用甲机的会话表
+world.sessions = world.sessions.filter((s) => s.id !== "CLR");
+world.hist = world.hist.filter((m) => sidOf(m) !== "CLR");
+click(rowOf("A"));
+await settle();
+
+/* 20i) 跨会话全局搜索（⌘F）：后端查整份历史（已挡 hidden），浮层列
+       「会话名 · 时间 · 摘录」，点一条切到会话、缺页逐页补、定位闪烁 */
+const findPickEl = byId("xfer-find");
+const findListEl = byId("xfer-find-list");
+const findQEl = byId("xfer-find-q");
+const findChipsEl = byId("xfer-find-chips");
+for (const id of ["xfer-find-x", "xfer-find-q", "xfer-find-list"]) findPickEl.appendChild(byId(id));
+findPickEl.appendChild(findChipsEl);
+// 桩不解析 HTML：五档 chip 按 index.html 那份顺序自己摆出来（档位就是后端的 kind）
+for (const [kind, label, on] of [
+  ["all", "全部", true],
+  ["text", "文字", false],
+  ["image", "图片", false],
+  ["file", "文件", false],
+  ["folder", "文件夹", false],
+]) {
+  const b = document.createElement("button");
+  b.className = on ? "chip is-on" : "chip";
+  b.textContent = label;
+  b.dataset.kind = kind;
+  // 桩里没有 closest，也不往上冒泡：自己认自己 + 手动把这一击转给父容器
+  b.closest = (sel) => (sel === ".chip" ? b : null);
+  b.addEventListener("click", (ev) => findChipsEl.dispatchEvent(ev));
+  findChipsEl.appendChild(b);
+}
+world.sessions.push({ id: "FRD", peer: "A", name: "待搜的框", created: NOW, read: NOW });
+// 12 条正文同词（PAGE=10，首屏只铺最近 10 条：frd1/frd2 落在页外，给「逐页补后定位」用）
+for (let i = 1; i <= 12; i++) {
+  world.hist.push({
+    id: `frd${i}`,
+    dir: "in",
+    kind: "text",
+    text: `周五约定第${i}次，DeepDive 探针`,
+    state: "sent",
+    ts: at(0, 21) + i * 1000,
+    peer: "A",
+    sid: "FRD",
+    recalled: false,
+    hidden: false,
+  });
+}
+world.hist.push({
+  id: "frd13", dir: "in", kind: "text", text: "周五约定被删的", state: "sent", ts: at(0, 21) + 13000, peer: "A", sid: "FRD", recalled: false, hidden: true,
+});
+world.hist.push({
+  id: "frdRec", dir: "in", kind: "text", text: "周五约定被撤的", state: "sent", ts: at(0, 21) + 14000, peer: "A", sid: "FRD", recalled: true, hidden: false,
+});
+world.hist.push({
+  id: "frdFile", dir: "in", kind: "file", name: "周五排班表.xlsx", size: 123, state: "sent", ts: at(0, 21) + 15000, peer: "A", sid: "FRD", recalled: false, hidden: false,
+});
+world.hist.push({
+  id: "frdQt", dir: "out", kind: "text", text: "顺带一提", state: "sent", ts: at(0, 21) + 16000, peer: "A", sid: "FRD", recalled: false, hidden: false,
+  quote: { id: "frd2", from: "待搜的框", text: "引一句周五约定", kind: "text" },
+});
+emit("sessions-changed", sessionsPayload());
+await settle();
+
+fireWindow("keydown", {}, { key: "f", metaKey: true });
+check(
+  "⌘F 开的是全局浮层：会话内那条框不再被抢（两套并存、语义不变）",
+  findPickEl.hidden === false && findListEl.children.length === 0,
+  `find=${findPickEl.hidden}`
+);
+click(byId("btn-xfer-find"));
+check("顶栏「搜全部会话」开同一扇门", findPickEl.hidden === false);
+findQEl.value = "DeepDive"; // 大小写混着输：折小写是后端的活
+const findSince = calls.length;
+findQEl.dispatchEvent({ type: "input" });
+await settle();
+check(
+  "只输不搜（轻防抖 250ms）：input 那一下不直接打后端",
+  takeCalls("search_messages", findSince).length === 0,
+  JSON.stringify(calls.slice(findSince).map(([c]) => c))
+);
+findQEl.dispatchEvent({ type: "keydown", key: "Enter" });
+await settle();
+const findCalls = takeCalls("search_messages", findSince);
+check(
+  "Enter 不等：query 原样带上去，kind 默认 all",
+  findCalls.length === 1 && findCalls[0][1].query === "DeepDive" && findCalls[0][1].kind === "all",
+  JSON.stringify(findCalls[0] || null)
+);
+const findRows = findListEl.children.filter((c) => c.classSet.has("find-row"));
+check(
+  "结果行三段：会话名 · 摘录都在，DeepDive 十二条全列",
+  findRows.length === 12 &&
+    String(findRows[0].innerHTML).includes("待搜的框") &&
+    String(findRows[0].innerHTML).includes("DeepDive"),
+  `行数=${findRows.length}`
+);
+check(
+  "删掉的那条不露（只搜未 hidden）",
+  findListEl.children.every((c) => !String(c.innerHTML).includes("被删的")),
+  String(findListEl.children.map((c) => c.innerHTML).join(" ")).slice(0, 120)
+);
+findQEl.value = "周五约定被";
+findQEl.dispatchEvent({ type: "keydown", key: "Enter" });
+await settle();
+const partRows = findListEl.children.filter((c) => c.classSet.has("find-row"));
+check(
+  "被撤的在、被删的不在（撤回仍露，与气泡那边同一出口口径）",
+  partRows.length === 1 &&
+    String(partRows[0].innerHTML).includes("被撤的") &&
+    !String(partRows[0].innerHTML).includes("被删的"),
+  partRows.map((r) => String(r.innerHTML).slice(0, 60)).join(" | ")
+);
+findQEl.value = "排班表";
+findQEl.dispatchEvent({ type: "keydown", key: "Enter" });
+await settle();
+check(
+  "命中可以在文件名里：frdFile 那条正文没这词也列出来",
+  findListEl.children.filter((c) => c.classSet.has("find-row")).length === 1,
+  String(findListEl.children[0]?.innerHTML || "").slice(0, 80)
+);
+findQEl.value = "引一句周五约定";
+findQEl.dispatchEvent({ type: "keydown", key: "Enter" });
+await settle();
+check(
+  "命中也可以在引用摘录里（quote.text 进匹配串）",
+  findListEl.children.filter((c) => c.classSet.has("find-row")).length === 1,
+  String(findListEl.children[0]?.innerHTML || "").slice(0, 80)
+);
+// 类型 chip：那份档位是后端 kind。换个两边都能命中的词（正文与文件名里都有“周五”），
+// 这样“只剩一条”才能证明是档位起作用了，不是词条本来就只有那一条
+findQEl.value = "周五";
+findQEl.dispatchEvent({ type: "keydown", key: "Enter" });
+await settle();
+const allChip = findChipsEl.children.find((c) => c.dataset.kind === "all");
+const fileChip = findChipsEl.children.find((c) => c.dataset.kind === "file");
+check(
+  "同一个词切档位之前：文字与文件混在一起列",
+  findListEl.children.filter((c) => c.classSet.has("find-row")).length === 15,
+  `行=${findListEl.children.filter((c) => c.classSet.has("find-row")).length}`
+);
+click(fileChip);
+await settle();
+check(
+  "chip 单选切档：点「文件」后 kind 跟着走，结果只剩文件那条",
+  findPickEl.dataset.kind === "file" &&
+    fileChip.classSet.has("is-on") &&
+    !allChip.classSet.has("is-on") &&
+    findListEl.children.filter((c) => c.classSet.has("find-row")).length === 1 &&
+    lastCall("search_messages").kind === "file",
+  `kind=${findPickEl.dataset.kind} 行=${findListEl.children.filter((c) => c.classSet.has("find-row")).length}`
+);
+click(allChip);
+await settle();
+check(
+  "点「全部」等于清掉类型条件，后端收到的是 all",
+  findPickEl.dataset.kind === "all" &&
+    lastCall("search_messages").kind === "all" &&
+    findListEl.children.filter((c) => c.classSet.has("find-row")).length === 15,
+  `${findPickEl.dataset.kind} 行=${findListEl.children.filter((c) => c.classSet.has("find-row")).length}`
+);
+// 查不到的词：一句大白话，不留白屏
+findQEl.value = "没得搜";
+findQEl.dispatchEvent({ type: "keydown", key: "Enter" });
+await settle();
+check(
+  "哪个会话都没有：说人话的一行空态",
+  findListEl.children.some((c) => c.classSet.has("find-empty") && String(c.textContent).includes("没得搜")),
+  findListEl.children.map((c) => c.textContent).join(" | ").slice(0, 80)
+);
+// 点一条跳转：先切到 FRD（当前还在甲机），目标 frd10 在首屏里
+findQEl.value = "第10次";
+findQEl.dispatchEvent({ type: "keydown", key: "Enter" });
+await settle();
+const row10 = findListEl.children.filter((c) => c.classSet.has("find-row"))[0];
+click(row10);
+await settle();
+check(
+  "点一条：浮层收掉、切到那个会话、目标闪一下",
+  findPickEl.hidden === true &&
+    world.active === "FRD" &&
+    msgElOf("frd10") !== null &&
+    msgElOf("frd10").classSet.has("is-flash"),
+  `find=${findPickEl.hidden} active=${world.active} 有=${msgElOf("frd10") !== null}`
+);
+// 目标不在已铺页面里（frd1 在首屏那 10 条之外）：逐页补到它出来再闪
+msgElOf("frd10").classList.remove("is-flash");
+fireWindow("keydown", {}, { key: "f", metaKey: true });
+await settle();
+check("重新弹出时旧词还在就重新给结果", findListEl.children.filter((c) => c.classSet.has("find-row")).length === 1);
+findQEl.value = "第1次";
+findQEl.dispatchEvent({ type: "keydown", key: "Enter" });
+await settle();
+const row1 = findListEl.children.filter((c) => c.classSet.has("find-row"))[0];
+click(row1);
+await settle(12);
+check(
+  "首屏没铺出来的那条：逐页 loadOlder 直到出现，再定位闪烁",
+  msgElOf("frd1") !== null && msgElOf("frd1").classSet.has("is-flash"),
+  `frd1=${msgElOf("frd1") !== null}`
+);
+// 点外面与 × 都收层；Esc 走 closeAllMenus 那条路
+fireWindow("keydown", {}, { key: "f", metaKey: true });
+fireWindow("pointerdown", byId("xfer-stream"));
+check("点浮层外面也收", findPickEl.hidden === true, String(findPickEl.hidden));
+fireWindow("keydown", {}, { key: "f", metaKey: true });
+click(byId("xfer-find-x"));
+check("点 × 收层", findPickEl.hidden === true, String(findPickEl.hidden));
+fireWindow("keydown", {}, { key: "f", metaKey: true });
+fireWindow("keydown", {}, { key: "Escape" });
+check("Esc 也收（挂进 closeAllMenus 那一排）", findPickEl.hidden === true, String(findPickEl.hidden));
+// 还原：后面的用例不背这个框
+world.sessions = world.sessions.filter((s) => s.id !== "FRD");
+world.hist = world.hist.filter((m) => sidOf(m) !== "FRD");
+click(rowOf("A"));
+await settle();
 
 /* 21) 本机接收：提示音开关与收件目录（都存 prefs.json，与对比视图那份共用） */
 const notifyChk = () => byId("chk-notify-sound");
@@ -2404,6 +3138,148 @@ check(
   `checked=${notifyChk().checked} 文案="${notifyTxt().text}" 节拍="${hbSel().value}"`
 );
 
+/* 21b) 存储：抽屉里那几个数字，与收件目录那两步清理
+       （只删改得够早、而且没被任何还看得见的记录引用的收件文件） */
+const stRows = () => [...byId("storage-rows").children];
+const stVal = (label) => {
+  const r = stRows().find((x) => x.children[0]?.text === label);
+  return r ? r.children[1].textContent : null;
+};
+const stCount = () => calls.filter(([c]) => c === "storage_stats").length;
+const cleanCount = () => calls.filter(([c]) => c === "inbox_cleanup").length;
+const BOX = "/Volumes/外接盘/收件";
+const DAY = 86400000;
+boxFiles.set(`${BOX}/老照片.jpg`, { size: 1024, mtime: Date.now() - 200 * DAY });
+boxFiles.set(`${BOX}/老视频.mp4`, { size: 2048, mtime: Date.now() - 400 * DAY });
+// 这一条被聊天记录指着：清到它头上必须跳过（与「撤回不删文件」同一口径）
+boxFiles.set(`${BOX}/留着.txt`, { size: 512, mtime: Date.now() - 400 * DAY });
+world.hist.push({
+  id: "boxKeep",
+  dir: "in",
+  kind: "file",
+  name: "留着.txt",
+  path: `${BOX}/留着.txt`,
+  size: 512,
+  state: "sent",
+  ts: at(0, 9),
+  peer: "A",
+  sid: "A",
+  recalled: false,
+  hidden: false,
+});
+boxNums.pastebox_bytes = 4096;
+boxNums.data_bytes = 8192;
+boxNums.messages_bytes = 2048;
+// 本机删过的那一条在盘上还在，但不能算进界面上那个条数
+world.hist.push({
+  id: "boxHidden",
+  dir: "in",
+  kind: "text",
+  text: "本机删过的一条不该算进条数",
+  state: "sent",
+  ts: at(0, 9),
+  peer: "A",
+  sid: "A",
+  recalled: false,
+  hidden: true,
+});
+check(
+  "抽屉一打开自己就读一次数字，四行都摆出来了（不用先点那颗刷新）",
+  stRows().length === 4 && stCount() >= 1,
+  `行数=${stRows().length} 读了 ${stCount()} 次`
+);
+const st0 = stCount();
+click(byId("btn-storage-refresh"));
+await settle();
+const visibleNow = world.hist.filter((m) => !m.hidden).length;
+check(
+  "点一次刷新只多读一次：四行数字全是 fmtSize 那个格式",
+  stCount() === st0 + 1 &&
+    stVal("收件目录") === `${api.fmtSize(3584)} · 3 个文件` &&
+    stVal("粘贴暂存") === api.fmtSize(4096) &&
+    stVal("聊天历史") === `${api.fmtSize(2048)} · ${visibleNow} 条` &&
+    stVal("数据目录合计") === api.fmtSize(8192),
+  `收件="${stVal("收件目录")}" 历史="${stVal("聊天历史")}"`
+);
+check(
+  "历史那一行报的条数只算没被本机删掉的（盘上那些 hidden 行不算进界面）",
+  world.hist.some((m) => m.hidden) &&
+    visibleNow < world.hist.length &&
+    stVal("聊天历史") === `${api.fmtSize(2048)} · ${visibleNow} 条`,
+  `可见 ${visibleNow} 条 / 盘上 ${world.hist.length} 条`
+);
+// 两步确认：第一下只把话换掉
+click(byId("btn-inbox-clean"));
+await settle();
+check(
+  "清理第一下只臂上文案，一条命令都不调、收件目录一个文件都不动",
+  byId("btn-inbox-clean").textContent === "再点一次确认清理" &&
+    cleanCount() === 0 &&
+    boxFiles.size === 3,
+  `文案="${byId("btn-inbox-clean").textContent}" 文件=${boxFiles.size}`
+);
+// 第二下才真清，档位读在第二下这一刻
+click(byId("btn-inbox-clean"));
+await settle();
+const cleanArgs = lastCall("inbox_cleanup") || {};
+check(
+  "第二下才真调：传的是当前那一档（默认 3 个月，一个月按 30 天算）换算出的时间戳",
+  cleanCount() === 1 && Math.abs(Date.now() - Number(cleanArgs.beforeTs) - 90 * DAY) < 5000,
+  JSON.stringify(cleanArgs)
+);
+check(
+  "删的是那两个没人引的，聊天里指着的那个原样留着",
+  !boxFiles.has(`${BOX}/老照片.jpg`) &&
+    !boxFiles.has(`${BOX}/老视频.mp4`) &&
+    boxFiles.has(`${BOX}/留着.txt`),
+  [...boxFiles.keys()].join(",")
+);
+check(
+  "话说的是删了几个文件、释放多少（个数按文件计，字节走 fmtSize）",
+  String(statusText()).includes("删了 2 个文件") &&
+    String(statusText()).includes(api.fmtSize(3072)),
+  statusText()
+);
+check(
+  "数字当场重画：不用用户再点一次刷新（后端也 emit 了一次）",
+  stVal("收件目录") === `${api.fmtSize(512)} · 1 个文件` && stCount() === st0 + 2,
+  `收件="${stVal("收件目录")}" 读了 ${stCount()} 次`
+);
+// 换档：读的是当下那一档，不是臂上那一刻
+byId("inp-inbox-clean").value = "12";
+click(byId("btn-inbox-clean"));
+await settle();
+click(byId("btn-inbox-clean"));
+await settle();
+check(
+  "换成 1 年那一档：门槛跟着走 360 天，剩下的那个被引用所以一个都没删",
+  Math.abs(Date.now() - Number(lastCall("inbox_cleanup").beforeTs) - 360 * DAY) < 5000 &&
+    String(statusText()).includes("一个都没删") &&
+    boxFiles.size === 1,
+  statusText()
+);
+// 后端拒了：原因上屏，数字照样重算（不能停在删之前的那几个数字上）
+world.cleanFails = "收件目录读不了";
+click(byId("btn-inbox-clean"));
+await settle();
+click(byId("btn-inbox-clean"));
+await settle();
+check(
+  "清理被后端拒时原因上屏、而且仍重读一次数字（界面不能留着一份已经不准的账）",
+  String(statusText()).includes("收件目录读不了") && stCount() === st0 + 4,
+  `提示="${statusText()}" 读了 ${stCount()} 次`
+);
+world.cleanFails = null;
+check(
+  "「打开收件目录」打开的就是抽屉里显示的那个目录（与上面那枚收件目录按钮同一个地方）",
+  revealed[revealed.length - 1] === inboxVal().textContent,
+  `${revealed.slice(-1)[0]} vs ${inboxVal().textContent}`
+);
+// 还原：这一段灌进去的历史与文件不留给后面的用例
+world.hist = world.hist.filter((m) => m.id !== "boxKeep" && m.id !== "boxHidden");
+boxFiles.clear();
+await settle();
+
 /* 12) 对比视图右键「发送到聊天」：先摆进待发送区，选哪个框就发给哪个，点发送才真发 */
 const activeRow = () => rows().find((r) => r.classSet.has("is-active")) || null;
 const attachChips = () => [...byId("xfer-attach-row").children].map((c) => c.dataset.path);
@@ -2571,7 +3447,7 @@ const rbMsg = world.hist.find((m) => m.text === "这句要撤回");
 const rbBub = bubbles().find((b) => b.dataset.id === rbMsg?.id);
 check(
   "自己发出去的那条，右键菜单里「撤回」与「删除」两项都摊开（入口搬进右键菜单了）",
-  openBubbleMenu(rbBub).join(",") === "复制正文,|,撤回这一条,删除（只删本机）",
+  openBubbleMenu(rbBub).join(",") === "复制正文,引用回复,转发到别的会话,|,撤回这一条,删除（只删本机）",
   shownItems().join(",")
 );
 
@@ -2583,7 +3459,7 @@ await settle();
 const oldBub = bubbles().find((b) => b.dataset.id === "old-out");
 check(
   "过了一分钟的那条只剩「删除」，撤回入口自己收掉",
-  openBubbleMenu(oldBub).join(",") === "复制正文,|,删除（只删本机）",
+  openBubbleMenu(oldBub).join(",") === "复制正文,引用回复,转发到别的会话,|,删除（只删本机）",
   shownItems().join(",")
 );
 
@@ -2608,14 +3484,30 @@ check(
 );
 // 菜单里重新摊开这一条：刚才那一下撤回点下去之后，入口应该已经收了
 check(
-  "撤过的不再给撤回入口（已经是撤过的那一条了）",
-  !openBubbleMenu(rbBub).includes("撤回这一条"),
+  "撤过的不再给撤回入口，也不再给引用与转发入口（原文都不显示了，引它转它做什么）",
+  (() => {
+    const items = openBubbleMenu(rbBub);
+    return !items.includes("撤回这一条") && !items.includes("引用回复") && !items.includes("转发到别的会话");
+  })(),
   shownItems().join(",")
 );
 check(
   "会话栏那句摘要也换成「撤回了一条消息」（桩不解析 HTML，看 innerHTML 字符串）",
   String(rowOf(rbSid)?.html).includes("撤回了一条消息"),
   String(rowOf(rbSid)?.html).slice(0, 160)
+);
+
+// 接收中的占位气泡还没路径：引用能给（摘文件名），转发给了也是空的，不露。
+// 摆在摘要用例之后：它要是排在最后一条，会把上面那句摘要断言盖掉
+emit("msg-in", {
+  message: { id: "noPath", dir: "in", kind: "file", name: "还在收.bin", size: 10, state: "sending", ts: at(0, 20), peer: "A", sid: rbSid },
+});
+await settle();
+const itemsNoPath = openBubbleMenu(msgElOf("noPath"));
+check(
+  "接收中还没路径的文件：「引用回复」给（摘的是文件名）、「转发」不给（转过去是个空的）",
+  itemsNoPath.includes("引用回复") && !itemsNoPath.includes("转发到别的会话"),
+  itemsNoPath.join(",")
 );
 
 // 对方发来的那条：只能删自己这边的，不能撤别人的
@@ -2626,7 +3518,7 @@ await settle();
 const inBub = bubbles().find((b) => b.dataset.id === "in-1");
 check(
   "对方发来的那条只给「删除」（撤回只能撤自己发的）",
-  openBubbleMenu(inBub).join(",") === "复制正文,|,删除（只删本机）",
+  openBubbleMenu(inBub).join(",") === "复制正文,引用回复,转发到别的会话,|,删除（只删本机）",
   shownItems().join(",")
 );
 

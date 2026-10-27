@@ -714,8 +714,15 @@ impl Hub {
         self.flushing.lock().expect("flushing 锁中毒").remove(sid);
     }
 
-    /// 把一条文字存成待发。不报错、当场就返给前端（气泡要立刻铺出来）
-    pub fn queue_text(&self, sess: &Session, peer: &Peer, text: &str) -> Result<Message, String> {
+    /// 把一条文字存成待发。不报错、当场就返给前端（气泡要立刻铺出来）。
+    /// 引用卡片跟着消息一起落盘，补发时从盘上那份带上 wire（try_send_text 读 msg.quote）
+    pub fn queue_text(
+        &self,
+        sess: &Session,
+        peer: &Peer,
+        text: &str,
+        quote: Option<store::Quote>,
+    ) -> Result<Message, String> {
         let msg = Message {
             id: uuid::Uuid::new_v4().simple().to_string(),
             dir: "out".into(),
@@ -725,6 +732,7 @@ impl Hub {
             ts: store::now_ms(),
             peer: peer.id.clone(),
             sid: sess.id.clone(),
+            quote,
             ..Default::default()
         };
         self.enqueue(&msg)
@@ -1278,12 +1286,14 @@ pub fn net_status(hub: State<'_, Arc<Hub>>) -> Value {
 
 /// 发一条文字：同步等对端 2xx 才算「已送达」，所以放 blocking 线程里跑。
 /// `to` 是目标**会话 ID**，不传就发给当前会话。
+/// `quote` 是引用回复的小卡片（发送那一刻的快照），老对端收不收到都无所谓。
 /// 对端离线不再当场报错：存成待发返给前端，它上线后由心跳那一拍自动补发
 #[tauri::command]
 pub async fn send_text(
     hub: State<'_, Arc<Hub>>,
     text: String,
     to: Option<String>,
+    quote: Option<store::Quote>,
 ) -> Result<Message, String> {
     let hub = hub.inner().clone();
     if text.trim().is_empty() {
@@ -1294,12 +1304,14 @@ pub async fn send_text(
     }
     match target_of(&hub, to.as_deref())? {
         Target::Ready(sess, peer) => {
-            tauri::async_runtime::spawn_blocking(move || client::send_text(&hub, &peer, &sess, text))
-                .await
-                .map_err(|e| format!("发送任务被中断: {e}"))?
+            tauri::async_runtime::spawn_blocking(move || {
+                client::send_text(&hub, &peer, &sess, text, quote)
+            })
+            .await
+            .map_err(|e| format!("发送任务被中断: {e}"))?
         }
         Target::Queued(sess, peer) => {
-            let msg = hub.queue_text(&sess, &peer, &text)?;
+            let msg = hub.queue_text(&sess, &peer, &text, quote)?;
             // 对方其实在线（只是 last_seen 还陈着）时这一拍就得投出去，
             // 不能等下一次心跳 —— 用户看到的是「秒发」而不是「排队」
             hub.clone().spawn_flush(&sess, vec![msg.id.clone()]);
@@ -1386,6 +1398,114 @@ fn page_messages(
 #[tauri::command]
 pub fn sessions(hub: State<'_, Arc<Hub>>) -> Value {
     hub.sessions_json()
+}
+
+/// 跨会话全局搜索（⌘F 浮层）：大小写不敏感的子串匹配，匹配面是正文、文件名
+/// 与引用摘录 —— 撤回与本机删除的从 `read_messages` 出口就挡掉了，天然不露。
+/// 一份 JSONL 重解一遍的代价与「拉齐 60 页再筛」同量级，几百条历史毫秒级
+#[tauri::command]
+pub fn search_messages(hub: State<'_, Arc<Hub>>, query: String, kind: Option<String>) -> Vec<Value> {
+    // 名字口径与会话栏完全一致：会话名 > 对端显示名（备注优先）> 露一截设备 ID / 未标记
+    // 空词不在这里特判：那一道与大小写一起放在 search_rows 里，只有一份口径
+    let sf = hub.sessions.lock().expect("sessions 锁中毒").clone();
+    let peers = hub.peers.lock().expect("peers 锁中毒").clone();
+    let named: HashMap<&str, (&str, &str)> = sf
+        .sessions
+        .iter()
+        .map(|s| (s.id.as_str(), (s.peer.as_str(), s.name.as_str())))
+        .collect();
+    search_rows(
+        hub.store.read_messages(usize::MAX).into_iter().rev(),
+        &query,
+        &kind.unwrap_or_else(|| "all".into()),
+        &named,
+        &peers,
+    )
+}
+
+/// 搜索的后半段：拿一份历史（调用方给的已是去重、挡过 hidden 的那些）算出结果行。
+/// 与命令本体分开是因为这一段（大小写 / 匹配档 / 匹配面 / 摘录 / 排序封顶）全都能
+/// 凭空构造历史来测，而命令那一层要 tauri 的 State 才跑得动
+fn search_rows(
+    msgs: impl Iterator<Item = Message>,
+    query: &str,
+    k: &str,
+    named: &HashMap<&str, (&str, &str)>,
+    peers: &HashMap<String, Peer>,
+) -> Vec<Value> {
+    // 查询与匹配面都在这段里折小写（合起来才是不区分大小写）；整串空白等同于
+    // 什么都没填，不能把全库列一遍当成搜索结果
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return Vec::new();
+    }
+    let mut hits: Vec<Value> = Vec::new();
+    for m in msgs {
+        if k != "all" && m.kind != k {
+            continue;
+        }
+        // 匹配面：正文 + 文件名 + 引用摘录（老对端那边引的就是正文，混在一串里检不丢）
+        let raw = format!(
+            "{}\n{}\n{}",
+            m.text.clone().unwrap_or_default(),
+            m.name.clone().unwrap_or_default(),
+            m.quote.as_ref().map(|q| q.text.clone()).unwrap_or_default()
+        );
+        let hay = raw.to_lowercase();
+        if !hay.contains(&q) {
+            continue;
+        }
+        let sid = m.sid_of().to_string();
+        let (peer, stored) = named.get(sid.as_str()).copied().unwrap_or(("", ""));
+        let p = peers.get(peer);
+        hits.push(json!({
+            "id": m.id,
+            "sid": sid,
+            "peer": m.peer,
+            "ts": m.ts,
+            "kind": m.kind,
+            "name": m.name,
+            "dir": m.dir,
+            "session": session_name(&sid, peer, stored, p.map(|x| x.display_name()).as_deref()),
+            "snippet": search_snippet(&raw, &hay, &q),
+        }));
+    }
+    // ts 降序：read_messages 是首次出现序（大体旧→新），反推一遍就是新→旧
+    hits.sort_by(|a, b| b["ts"].as_i64().cmp(&a["ts"].as_i64()));
+    hits.truncate(SEARCH_LIMIT);
+    hits
+}
+
+/// 摘要封顶条数：再多也先拦在浮层外面（与前端「拉齐 60 页再筛」的封顶同量级）
+const SEARCH_LIMIT: usize = 200;
+/// 命中处前后各留这几个字符
+const SEARCH_WINDOW: usize = 24;
+
+/// 命中处前后各取一窗。得拿两份串：`hay` 已折小写只用来定位，`raw` 负责取窗 ——
+/// 摘录得保留用户原本的大小写。两边只折大小写不丢字符，下标才能直接回原串上用
+fn search_snippet(raw: &str, hay: &str, q: &str) -> String {
+    let cs: Vec<char> = raw.chars().collect();
+    let hs: Vec<char> = hay.chars().collect();
+    let qs: Vec<char> = q.chars().collect();
+    let at = hs.windows(qs.len()).position(|w| w == qs);
+    let (s, e) = match at {
+        Some(i) => (
+            i.saturating_sub(SEARCH_WINDOW),
+            (i + qs.len() + SEARCH_WINDOW).min(cs.len()),
+        ),
+        // 定位不到（调用方先 `contains` 过就不会走到这里）：从头截一段，
+        // 但得钳在原串长度内，否则短句子会让下面的切片直接 panic
+        None => (0, (SEARCH_WINDOW * 2).min(cs.len())),
+    };
+    let mut out = String::new();
+    if s > 0 {
+        out.push('…');
+    }
+    out.extend(&cs[s..e]);
+    if e < cs.len() {
+        out.push('…');
+    }
+    out
 }
 
 /// 撤回自己一分钟以内发出去的那一条（两边都不再显示正文）。
@@ -1485,6 +1605,18 @@ pub fn session_pin(hub: State<'_, Arc<Hub>>, id: String, pinned: bool) -> Result
     Ok(hub.sessions_json())
 }
 
+/// 清空一个对话框的聊天记录：这一台不再显示它。与「删会话」是两回事：
+/// 框还在、设备还在、对端那份与收件箱里的文件都不动（口径与逐条本机删除
+/// 一致，只是入口一次点一批）。「未标记」那格也走得通：老消息 sid_of() 回退
+/// 到 peer，空串 sid 就把这些没归属的筐一次清掉
+#[tauri::command]
+pub fn session_clear(hub: State<'_, Arc<Hub>>, id: String) -> Result<Value, String> {
+    let cleared = hub.store.clear_session(&id)?;
+    // 整格都没了：会话栏那句摘要与未读都得重算
+    hub.emit_sessions();
+    Ok(json!({ "cleared": cleared.len() }))
+}
+
 /// 当前生效的收件目录。`custom` = 用户改过没有，前端据此置灰「恢复默认」；
 /// `layout` = 根目录内部怎么摆（day / month / flat），抽屉里的下拉靠它回填。
 ///
@@ -1502,6 +1634,27 @@ pub fn inbox_dir(store: State<'_, Arc<Store>>) -> Value {
         "custom": !prefs.inbox.is_empty(),
         "layout": prefs.inbox_layout,
     })
+}
+
+/// 设置抽屉「存储」那一节：收件目录 / 粘贴暂存 / 数据目录 / 聊天历史各占多少。
+/// 只在抽屉打开与点「刷新」时读一次，不进任何轮询（递归走一遍目录树不便宜）
+#[tauri::command]
+pub fn storage_stats(hub: State<'_, Arc<Hub>>) -> store::StorageStats {
+    hub.store.storage_stats()
+}
+
+/// 清收件目录里改于 `before_ts` 之前、而且没被任何还看得见的消息引用的文件与日期子目录。
+/// 被聊天引用的不删（与「撤回不删文件」同一口径），聊天记录本身与 pastebox 也不动。
+/// 返完顺手 emit 一次，抽屉里那几个数字跟着重画
+#[tauri::command]
+pub fn inbox_cleanup(hub: State<'_, Arc<Hub>>, before_ts: i64) -> Result<Value, String> {
+    let (deleted_count, freed_bytes) = hub.store.inbox_cleanup(before_ts)?;
+    let stats = hub.store.storage_stats();
+    hub.emit(
+        "storage-changed",
+        json!({ "stats": stats, "deleted_count": deleted_count, "freed_bytes": freed_bytes }),
+    );
+    Ok(json!({ "deleted_count": deleted_count, "freed_bytes": freed_bytes }))
 }
 
 /// 「试听」：无视开关直接响一声，也不参与去重（点一次就该响一次）。
@@ -2276,5 +2429,160 @@ mod tests {
         assert!(back.pending_messages().is_empty(), "停手的消息必须从队列里下来");
         assert_eq!(back.read_messages(100).iter().find(|m| m.id == "m").unwrap().state, "failed");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /* ---- 跨会话全局搜索 ---- */
+
+    /// 搜索用的正文消息（名字口径不测的时候给两张空表就够了）
+    fn 搜正文(id: &str, 正文: &str, ts: i64) -> Message {
+        Message {
+            id: id.into(),
+            dir: "in".into(),
+            kind: "text".into(),
+            text: Some(正文.into()),
+            state: "sent".into(),
+            ts,
+            peer: "a".into(),
+            sid: "a".into(),
+            ..Default::default()
+        }
+    }
+
+    /// 搜索用的文件消息：文件名才算 `name`，正文那一段空的
+    fn 搜文件(id: &str, 文件名: &str, ts: i64) -> Message {
+        Message {
+            kind: "file".into(),
+            name: Some(文件名.into()),
+            ..搜正文(id, "", ts)
+        }
+    }
+
+    /// 拿一份现成的历史跑搜索的后半段。hidden 那道闸门不在这段里（在
+    /// `read_messages` 出口，store.rs 那边已经测过），这里测的是匹配面与排序封顶
+    fn 搜(历史: Vec<Message>, q: &str, k: &str) -> Vec<Value> {
+        let 无名: HashMap<&str, (&str, &str)> = HashMap::new();
+        let 无台: HashMap<String, Peer> = HashMap::new();
+        search_rows(历史.into_iter(), q, k, &无名, &无台)
+    }
+
+    fn 命中(行: &[Value]) -> Vec<&str> {
+        行.iter().map(|x| x["id"].as_str().unwrap()).collect()
+    }
+
+    #[test]
+    fn 全局搜索命中正文文件名与引用摘录() {
+        let 历史 = vec![
+            搜正文("甲", "周五一起打印", 100),
+            搜文件("乙", "Weekly Plan.pdf", 200),
+            Message {
+                quote: Some(store::Quote {
+                    id: "甲".into(),
+                    from: "甲机".into(),
+                    text: "周五约定".into(),
+                    kind: "text".into(),
+                    name: None,
+                }),
+                ..搜正文("丙", "就这么定", 300)
+            },
+            搜正文("丁", "FRIDAY 见", 400),
+        ];
+        assert_eq!(
+            命中(&搜(历史.clone(), "周五", "all")),
+            vec!["丙", "甲"],
+            "引用摘录也算命中，而且按 ts 从新到旧排"
+        );
+        assert_eq!(命中(&搜(历史.clone(), "weekly plan", "all")), vec!["乙"], "文件名那一段也在匹配面里");
+        assert_eq!(命中(&搜(历史.clone(), "friday", "all")), vec!["丁"], "大小写不敏感：查询小写也命中大写");
+        assert_eq!(命中(&搜(历史.clone(), "FRIDAY", "all")), vec!["丁"], "反过来也一样");
+        assert!(搜(历史.clone(), "没有这个词", "all").is_empty(), "没命中就是空列表，不拿整份历史充数");
+        assert!(搜(历史.clone(), "   ", "all").is_empty(), "整串空白等同于没填：不能把全库列一遍");
+        // 分档只筛类型，不改变匹配面
+        assert_eq!(命中(&搜(历史.clone(), "周五", "text")), vec!["丙", "甲"]);
+        assert!(搜(历史.clone(), "周五", "file").is_empty(), "文字与引用不能混进文件那一档");
+        assert_eq!(命中(&搜(历史.clone(), "weekly", "file")), vec!["乙"]);
+        assert_eq!(命中(&搜(历史, "weekly", "text")), Vec::<&str>::new(), "反过来也一样：文件不在文字那一档");
+    }
+
+    #[test]
+    fn 搜索结果行的会话名与会话栏同源() {
+        let 历史 = vec![搜正文("甲", "周五", 100)];
+        let 空名: HashMap<&str, (&str, &str)> = HashMap::new();
+        let 无台: HashMap<String, Peer> = HashMap::new();
+        // 存过名字的框：直接用那个名字，不跟着备注与设备名跑
+        let 存过: HashMap<&str, (&str, &str)> = [("a", ("a", "打印问题"))].into_iter().collect();
+        let 行 = search_rows(历史.clone().into_iter(), "周五", "all", &存过, &无台);
+        assert_eq!(行[0]["session"], "打印问题");
+        // 没存过名字的基础对话：跟着对端的显示名走（备注优先在那一边已经算好了）
+        let 没存: HashMap<&str, (&str, &str)> = [("a", ("a", ""))].into_iter().collect();
+        let 一台: HashMap<String, Peer> = [("a".to_string(), 对端("a", "Mac"))].into_iter().collect();
+        assert_eq!(search_rows(历史.clone().into_iter(), "周五", "all", &没存, &一台)[0]["session"], "Mac");
+        // 会话表里根本没这一行（未标记与补漏）：不能出现空名字，否则浮层那一列看不出跳到哪
+        let 裸 = search_rows(历史.clone().into_iter(), "周五", "all", &空名, &无台);
+        assert_eq!(裸[0]["session"], "会话 a", "只知会话 ID 时露一截 ID");
+        let 未标 = search_rows(
+            vec![Message {
+                id: "x".into(),
+                text: Some("周五".into()),
+                peer: String::new(),
+                sid: String::new(),
+                ..Default::default()
+            }]
+            .into_iter(),
+            "周五",
+            "all",
+            &空名,
+            &无台,
+        );
+        assert_eq!(未标[0]["session"], "未标记");
+        // 结果行带齐跳转与重画要用的那几个键（前端靠 sid 开框、靠 id 定位那一枚气泡）
+        assert_eq!(
+            (
+                裸[0]["sid"].as_str(),
+                裸[0]["peer"].as_str(),
+                裸[0]["kind"].as_str(),
+                裸[0]["ts"].as_i64()
+            ),
+            (Some("a"), Some("a"), Some("text"), Some(100)),
+            "前端拼一行靠的是这几个键，少一个就是静悄悄地少一条结果"
+        );
+    }
+
+    #[test]
+    fn 搜索摘录在命中处前后各留一窗() {
+        let 长 = format!("{}重要的一段{}", "a".repeat(30), "b".repeat(30));
+        let 行 = 搜(vec![搜正文("x", &长, 1)], "重要", "all");
+        let 摘 = 行[0]["snippet"].as_str().unwrap();
+        assert!(摘.starts_with('…') && 摘.ends_with('…'), "两头都截了：{摘}");
+        assert!(摘.contains("重要的一段"), "命中那一句必须在窗口里：{摘}");
+        assert_eq!(
+            摘.chars().count(),
+            1 + SEARCH_WINDOW + 2 + SEARCH_WINDOW + 1,
+            "前后各 {SEARCH_WINDOW} 个字符，加上命中那两个本身，不多不少"
+        );
+        // 开头就命中：前面没有东西可省，不该多一个省略号
+        let 头 = 搜(vec![搜正文("y", "从头就是周五后面一堆字", 1)], "从头", "all");
+        assert!(!头[0]["snippet"].as_str().unwrap().starts_with('…'));
+        // 摘录得留着用户原本打的字，不能跟着查询一起折成小写
+        let 大写 = 搜(vec![搜正文("g", "FRIDAY 见", 1)], "friday", "all");
+        assert!(大写[0]["snippet"].as_str().unwrap().contains("FRIDAY"));
+        // 中文与 emoji 按字符而不是按字节取窗（按字节切会在多字节字符中间 panic）
+        let 中文 = 搜(vec![搜正文("h", &("字".repeat(40) + "命中🐧尾巴"), 1)], "命中", "all");
+        assert!(中文[0]["snippet"].as_str().unwrap().contains("命中🐧"), "按字节切会在多字节字符中间 panic，按字符切才能把整只企鹅带进窗口");
+        // 定位不到（只有先 `contains` 过才会进来，这一句是防调用方改乱的兜底分支）
+        assert_eq!(search_snippet("abc", "abc", "查不到"), "abc", "没定位到就从头截一段，不添省略号也不 panic");
+    }
+
+    #[test]
+    fn 历史再长搜索也封顶两百条() {
+        let 长历史: Vec<Message> = (0..250)
+            .map(|i| 搜正文(&format!("m{i}"), "很多", i))
+            .collect();
+        let 行 = 搜(长历史.clone(), "很多", "all");
+        assert_eq!(行.len(), SEARCH_LIMIT);
+        assert_eq!(SEARCH_LIMIT, 200, "前端那句「先列最近这 200 条」跟着这个常量走");
+        assert_eq!(行[0]["ts"].as_i64(), Some(249), "留下的是最新的那两百条");
+        assert_eq!(行[SEARCH_LIMIT - 1]["ts"].as_i64(), Some(50));
+        // 没到封顶就全给：这一句能挡住「忘了 truncate」与「封顶值算错」
+        assert_eq!(搜(长历史.iter().take(60).cloned().collect(), "很多", "all").len(), 60);
     }
 }

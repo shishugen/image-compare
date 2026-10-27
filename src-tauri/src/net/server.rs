@@ -266,6 +266,10 @@ fn handle_text(hub: &Arc<Hub>, body: &[u8], from: &Sender) -> Result<Message, St
         msg_id: String,
         ts: i64,
         text: String,
+        /// 引用卡片：老对端不发这个字段，缺失就是 None；收到了就原样落库，
+        /// 内容可信度与正文同级（都是对端自填的显示内容，本机只渲染不回显命令）
+        #[serde(default)]
+        quote: Option<store::Quote>,
     }
     let parsed: InMsg =
         serde_json::from_slice(body).map_err(|e| format!("消息体不是合法 JSON: {e}"))?;
@@ -283,6 +287,7 @@ fn handle_text(hub: &Arc<Hub>, body: &[u8], from: &Sender) -> Result<Message, St
         ts: parsed.ts,
         peer: from.dev_id.clone(),
         sid,
+        quote: parsed.quote,
         ..Default::default()
     };
     hub.store

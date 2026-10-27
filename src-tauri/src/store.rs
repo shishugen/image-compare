@@ -6,9 +6,11 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
+use std::time::SystemTime;
 
 pub const MAX_BODY_BYTES: u64 = 1024 * 1024; // /msg 上限 1MB
 pub const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024 * 1024; // /file 上限 8GB
@@ -308,6 +310,32 @@ pub struct Message {
     /// 而**对端那份完全不动**（这也是它和「撤回」的区别）
     #[serde(default)]
     pub hidden: bool,
+    /// 引用回复：这条消息引用了另一条（发送那一刻的快照，见 `Quote`）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quote: Option<Quote>,
+}
+
+/// 引用回复挂在气泡顶部的那张小卡片。存的是**被引那一刻的快照**（摘录 / 显示名 /
+/// 类型与文件名）而不是只存个 id：原文可能后来被撤回、被本机删掉、甚至还在
+/// 没铺出来的历史页里，快照让卡片渲染永远不用二次查盘。
+/// 老对端/老文件没这个字段：serde 默认忽略未知字段、缺失字段兜底成 None，
+/// 引用在老对端上会降级成普通文字（不报错），所以不需要协议版本号闸门
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Quote {
+    /// 被引那条的 id：点卡片滚过去定位用它
+    pub id: String,
+    /// 被引人的显示名（发送当时算好的，不是 id：改名后老卡片不该跟着变）
+    #[serde(default)]
+    pub from: String,
+    /// 原文摘录（超 120 字符发送时就截断加省略号；引文件时存的是文件名）
+    #[serde(default)]
+    pub text: String,
+    /// 被引消息的类型：text / file / folder
+    #[serde(default)]
+    pub kind: String,
+    /// 被引文件的文件名（kind != file/folder 时没有）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// 新增字段全靠这里兜底：构造点写 `..Default::default()`，
@@ -330,6 +358,7 @@ impl Default for Message {
             reason: None,
             recalled: false,
             hidden: false,
+            quote: None,
         }
     }
 }
@@ -619,6 +648,74 @@ impl HistoryFile {
 }
 
 /* --------------------------------------------------------------------------
+ * 存储统计的公共脚手架
+ *
+ * 递归统计一律用 symlink_metadata（logical size）：既不跟随符号链接（收件目录
+ * 被人软链到另一块盘时不会把那一盘的东西也算进来），也不会把 iCloud / OneDrive
+ * 的占位文件唤下来 —— 为了报一个数字而触发一次真下载，比数字不准严重得多
+ * ------------------------------------------------------------------------ */
+
+/// 一处目录递归下去的（总字节, 文件个数）。目录不存在就是 (0, 0)
+fn walk_sizes(root: &Path) -> (u64, u64) {
+    let mut bytes = 0u64;
+    let mut files = 0u64;
+    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let rd = match fs::read_dir(&dir) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            let md = match fs::symlink_metadata(&p) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if md.is_dir() {
+                stack.push(p);
+            } else {
+                bytes += md.len();
+                files += 1;
+            }
+        }
+    }
+    (bytes, files)
+}
+
+/// 这个目录里（递归）是不是藏着一个还被聊天记录指着的路径
+fn dir_has_kept(root: &Path, kept: &HashSet<PathBuf>) -> bool {
+    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let rd = match fs::read_dir(&dir) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if kept.contains(&p) {
+                return true;
+            }
+            if p.is_dir() {
+                stack.push(p);
+            }
+        }
+    }
+    false
+}
+
+/// 设置抽屉「存储」一节那几个数字。键名就是前端读的那些（下划线，
+/// 与 `get_prefs` 同一口径：只有调用参数才走 Tauri 的 camelCase）
+#[derive(Debug, Clone, Serialize)]
+pub struct StorageStats {
+    pub inbox_bytes: u64,
+    pub inbox_count: u64,
+    pub pastebox_bytes: u64,
+    pub data_bytes: u64,
+    pub messages_bytes: u64,
+    pub messages_count: usize,
+}
+
+/* --------------------------------------------------------------------------
  * Store：所有本地读写走这里
  * ------------------------------------------------------------------------ */
 
@@ -829,6 +926,123 @@ impl Store {
         patch(&mut done);
         self.append_message(&done)?;
         Ok(done)
+    }
+
+    /// 清空一个对话框的聊天记录：把这一格里还没 hidden 的消息逐条补写 hidden=true。
+    /// 与「删会话」（remove_session：框从列表里没了、消息一条不动）是两回事：
+    /// 这里框还在、设备还在、对端那份与收件箱里的文件都不动，只是这一台不再显示。
+    /// 口径与逐条删除一致（同走 hidden），只是入口一次点一批。
+    ///
+    /// 一次全量读、一次整体重写：逐条 patch_flags 要为每一条都重读一遍整个文件，
+    /// 几百条历史就是几百遍全量读，IO 放大得离谱。重写落在去重后的最新状态上（与内存里
+    /// 本来就看得到的那份完全一致，只多了 hidden 标记），读侧仍按「同 id 最后
+    /// 一行赢」，语义不变。返回标成隐藏的那几条，调用方据此推事件。
+    pub fn clear_session(&self, sid: &str) -> Result<Vec<Message>, String> {
+        let path = self.file("messages.jsonl");
+        let txt = fs::read_to_string(&path).unwrap_or_default();
+        let mut merged = dedup_lines(&txt);
+        let mut cleared: Vec<Message> = Vec::new();
+        for m in merged.iter_mut() {
+            if m.sid_of() == sid && !m.hidden {
+                m.hidden = true;
+                cleared.push(m.clone());
+            }
+        }
+        if cleared.is_empty() {
+            return Ok(cleared);
+        }
+        // 与 append 同样的序列化：每行一条，行尾换行
+        let mut buf = String::new();
+        for m in &merged {
+            let line = serde_json::to_string(m).map_err(|e| format!("序列化消息失败: {e}"))?;
+            buf.push_str(&line);
+            buf.push('\n');
+        }
+        atomic_write(&path, buf.as_bytes())?;
+        Ok(cleared)
+    }
+
+    /* ---- 存储：占用统计与收件目录清理 ---- */
+
+    /// 各处的占用。只在设置抽屉打开与点「刷新」时算一次：递归走一遍目录树
+    /// 不便宜，绝不能放进任何轮询里。目录不存在就是 0，不顺手建目录（统计不该有副作用）
+    pub fn storage_stats(&self) -> StorageStats {
+        let (inbox_bytes, inbox_count) = walk_sizes(&self.inbox_dir());
+        let (pastebox_bytes, _) = walk_sizes(&self.pastebox_dir());
+        let (data_bytes, _) = walk_sizes(&self.dir);
+        let messages_bytes = fs::symlink_metadata(self.file("messages.jsonl"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        // 条数走 read_messages 那道闸门：界面上报的得是用户看得到的那些
+        let messages_count = self.read_messages(usize::MAX).len();
+        StorageStats {
+            inbox_bytes,
+            inbox_count,
+            pastebox_bytes,
+            data_bytes,
+            messages_bytes,
+            messages_count,
+        }
+    }
+
+    /// 清收件目录里那些「改于 `before_ts` 之前、而且没被任何还看得见的消息引用」的
+    /// 东西。返回（删掉的个数, 释放的字节），个数按文件计（删一个日期子目录就算
+    /// 删了 N 个文件）。
+    ///
+    /// 被引用的一个都不删 —— 与「撤回不删文件」同一口径：宁可留着占地方，
+    /// 也不能让哪条历史气泡的预览、另存为忽然失效。对端那份、聊天记录本身、
+    /// 粘贴暂存区（`pastebox`）都不在这一步的范围内
+    pub fn inbox_cleanup(&self, before_ts: i64) -> Result<(u64, u64), String> {
+        let root = self.inbox_dir();
+        if !root.is_dir() {
+            return Ok((0, 0));
+        }
+        // 聊天记录里还指着的哪些绝对路径（read_messages 已挡 hidden：
+        // 本机删过的那条在界面上已经没入口，它指的文件因此可以清）
+        let kept: HashSet<PathBuf> = self
+            .read_messages(usize::MAX)
+            .into_iter()
+            .filter_map(|m| m.path)
+            .map(PathBuf::from)
+            .collect();
+        let rd = fs::read_dir(&root).map_err(|e| format!("读收件目录失败: {e}"))?;
+        let mut deleted = 0u64;
+        let mut freed = 0u64;
+        for e in rd.flatten() {
+            let p = e.path();
+            let md = match fs::symlink_metadata(&p) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let mtime = md
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            if mtime >= before_ts {
+                continue;
+            }
+            let is_dir = md.is_dir();
+            // 日期/月份那一级的子目录：里面但凡有一条还被引着，整个目录就原样留着
+            if kept.contains(&p) || (is_dir && dir_has_kept(&p, &kept)) {
+                continue;
+            }
+            let (bytes, files) = if is_dir {
+                walk_sizes(&p)
+            } else {
+                (md.len(), 1)
+            };
+            let rm = if is_dir {
+                fs::remove_dir_all(&p)
+            } else {
+                fs::remove_file(&p)
+            };
+            rm.map_err(|err| format!("删除 {} 失败: {err}", p.display()))?;
+            deleted += files;
+            freed += bytes;
+        }
+        Ok((deleted, freed))
     }
 
     /// 待发（离线排队）的、本机发出去的消息，按首次出现的顺序
@@ -1723,5 +1937,362 @@ mod tests {
         );
         // 提示文案里那个数字必须跟着常量走，不然改了窗口界面上还在说一分钟
         assert_eq!(RECALL_WINDOW_MS, 60_000);
+    }
+
+    /* ---- 引用 / 清空 / 存储：这批都只碰盘上那几个新字段与新命令 ---- */
+
+    /// 一条最普通的文字消息（存储那几个用例只关心它在不在读取口径里）
+    fn 文字条(id: &str) -> Message {
+        Message {
+            id: id.into(),
+            dir: "out".into(),
+            kind: "text".into(),
+            text: Some("一句".into()),
+            state: "sent".into(),
+            ts: 1,
+            peer: "a".into(),
+            sid: "a".into(),
+            ..Default::default()
+        }
+    }
+
+    /// 一条收到的文件消息：`path` 指向收件目录里那一份
+    fn 文件条(id: &str, path: String) -> Message {
+        Message {
+            id: id.into(),
+            dir: "in".into(),
+            kind: "file".into(),
+            name: Some(
+                Path::new(&path)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string(),
+            ),
+            size: Some(5),
+            path: Some(path),
+            state: "sent".into(),
+            ts: 1,
+            peer: "a".into(),
+            sid: "a".into(),
+            ..Default::default()
+        }
+    }
+
+    /// 把文件的修改时间按下到指定时刻：清理的「够老」判据只看 mtime，
+    /// 用例不能靠睡三个月来造一份旧文件
+    fn 按下改动时间(p: &Path, ms: u64) {
+        let f = fs::OpenOptions::new().write(true).open(p).unwrap();
+        f.set_modified(SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(ms))
+            .unwrap();
+    }
+
+    #[test]
+    fn 引用卡片跟着消息落盘且没引用时不占字段() {
+        let s = 临时存储("quote-roundtrip");
+        let 那格 = |id: &str, q: Option<Quote>| Message {
+            id: id.into(),
+            quote: q,
+            ..文字条(id)
+        };
+        s.append_message(&那格("甲1", Some(Quote {
+            id: "原文".into(),
+            from: "办公室那台".into(),
+            text: "周五一起打印".into(),
+            kind: "text".into(),
+            name: None,
+        })))
+        .unwrap();
+        s.append_message(&那格("甲2", None)).unwrap();
+
+        let 读回 = s.read_messages(100);
+        assert_eq!(
+            读回.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["甲1", "甲2"],
+            "两条都得读回来：同一个 id 写两次就会互相盖掉"
+        );
+        let 卡片 = 读回[0].quote.as_ref().expect("引用卡片必须原样读回来");
+        assert_eq!(
+            (
+                卡片.id.as_str(),
+                卡片.from.as_str(),
+                卡片.text.as_str(),
+                卡片.kind.as_str(),
+                卡片.name.as_deref()
+            ),
+            ("原文", "办公室那台", "周五一起打印", "text", None),
+            "存的是被引那一刻的快照：之后改名、撤回都不该动它"
+        );
+        assert_eq!(读回[0].text.as_deref(), Some("一句"), "引用不能顶掉正文");
+        assert!(读回[1].quote.is_none());
+        // 没引用的那些行不许多出这个键：同一份文件老版本也在读，形状不能变
+        let 全文 = fs::read_to_string(s.file("messages.jsonl")).unwrap();
+        assert_eq!(
+            全文.lines().filter(|l| l.contains("甲2") && l.contains("\"quote\"")).count(),
+            0,
+            "skip_serializing_if 失效就会给每一条都塞一张空卡片"
+        );
+        assert_eq!(
+            全文.lines().filter(|l| l.contains("甲1") && l.contains("\"quote\"")).count(),
+            1,
+            "带卡片的那一条确实落了盘"
+        );
+        let _ = fs::remove_dir_all(&s.dir);
+    }
+
+    #[test]
+    fn 老行缺引用与看不懂的字段都读得开() {
+        let s = 临时存储("quote-legacy");
+        fs::create_dir_all(&s.dir).unwrap();
+        // 三行一起写：上一版的老行、未来版本多了不认识字段的行、写到一半断掉的坏行。
+        // 「不认识就当整份读不出来」这一种才会毁掉用户全部历史，所以这一条最要紧
+        fs::write(
+            s.file("messages.jsonl"),
+            concat!(
+                "{\"id\":\"老1\",\"dir\":\"in\",\"kind\":\"text\",\"text\":\"以前写的\",\"state\":\"sent\",\"ts\":1,\"peer\":\"a\"}\n",
+                "{\"id\":\"新1\",\"dir\":\"in\",\"kind\":\"text\",\"text\":\"x\",\"state\":\"sent\",\"ts\":2,\"peer\":\"a\",\"quote\":{\"id\":\"老1\"},\"将来的字段\":7}\n",
+                "{\"id\":\"坏\n",
+            ),
+        )
+        .unwrap();
+        let 全部 = s.read_messages(100);
+        assert_eq!(
+            全部.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["老1", "新1"],
+            "坏的那一行丢掉，前后都得照常读出来"
+        );
+        assert!(全部[0].quote.is_none(), "老行没这个字段就是没引用");
+        let 卡片 = 全部[1].quote.as_ref().unwrap();
+        assert_eq!((卡片.id.as_str(), 卡片.text.as_str()), ("老1", ""), "卡片只写了 id：其它字段兜底成空而不是整行作废");
+        assert!(卡片.name.is_none());
+        let _ = fs::remove_dir_all(&s.dir);
+    }
+
+    #[test]
+    fn 清空聊天只把那一格标成不显示() {
+        let s = 临时存储("clear-visible");
+        for m in [
+            文字条("甲1"),
+            文字条("甲2"),
+            // 已经逐条删过的：本来就看不见，不该再算进这次清空
+            Message {
+                id: "甲3".into(),
+                hidden: true,
+                ..文字条("甲3")
+            },
+            // 另一格与未标记那一筐：一个字都不碰
+            Message {
+                id: "乙1".into(),
+                peer: "b".into(),
+                sid: "b".into(),
+                ..文字条("乙1")
+            },
+            Message {
+                id: "没标1".into(),
+                peer: String::new(),
+                sid: String::new(),
+                ..文字条("没标1")
+            },
+        ] {
+            s.append_message(&m).unwrap();
+        }
+
+        let 标了 = s.clear_session("a").unwrap();
+        assert_eq!(
+            标了.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["甲1", "甲2"],
+            "只标这一格里还看得见的，别把另一格与未标记一起带走"
+        );
+        assert_eq!(
+            s.read_messages(100)
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["乙1", "没标1"],
+            "界面上这一格空了，而别的格一条不少"
+        );
+        assert!(s.raw_message("甲1").unwrap().hidden, "只是不显示：盘上那一行还在");
+        assert_eq!(s.flags_of("甲3"), (false, true), "本来就删过的那条不能被重复标一遍");
+
+        let 行数 = fs::read_to_string(s.file("messages.jsonl")).unwrap().lines().count();
+        assert!(s.clear_session("a").unwrap().is_empty(), "再清一次已经没有可标的");
+        assert_eq!(
+            fs::read_to_string(s.file("messages.jsonl")).unwrap().lines().count(),
+            行数,
+            "没东西可标时不该把文件重写一遍（只追加、不重写的口径）"
+        );
+        assert!(s.clear_session("没有这一格").unwrap().is_empty(), "不存在的格子不是错误");
+        // 未标记那一筐的 sid 就是空串，照旧给单独清
+        assert_eq!(s.clear_session("").unwrap().len(), 1);
+        assert_eq!(
+            s.read_messages(100)
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["乙1"],
+            "乙机那格到最后还看得见"
+        );
+        let _ = fs::remove_dir_all(&s.dir);
+    }
+
+    #[test]
+    fn 清空聊天保住会话行也保住收进来的文件() {
+        let s = 临时存储("clear-keeps-box");
+        s.save_sessions(&SessionsFile {
+            sessions: vec![Session {
+                id: "a".into(),
+                peer: "a".into(),
+                name: "甲机".into(),
+                created: 1,
+                read: 2,
+                pinned: true,
+            }],
+            active: "a".into(),
+            hidden: vec![],
+        })
+        .unwrap();
+        let 文件 = s.inbox_dir().join("收进来的.png");
+        fs::create_dir_all(文件.parent().unwrap()).unwrap();
+        fs::write(&文件, "12345").unwrap();
+        s.append_message(&文件条("甲1", 文件.to_string_lossy().to_string()))
+            .unwrap();
+        // 撤回过的那条也住在这格里：清空把它一并标掉
+        s.append_message(&Message {
+            id: "甲2".into(),
+            recalled: true,
+            ..文字条("甲2")
+        })
+        .unwrap();
+
+        assert_eq!(s.clear_session("a").unwrap().len(), 2, "撤回过的那条也该被标上");
+        assert!(fs::metadata(&文件).is_ok(), "清空只动显示，收件文件必须还在（对端那份更不会被碰）");
+        let 表 = s.load_sessions();
+        assert_eq!(表.sessions[0].id, "a", "框还在：清空不是删会话");
+        assert_eq!(表.sessions[0].name, "甲机", "用户给这格起的名字不动");
+        assert_eq!(表.active, "a", "焦点也不动：清完还停在这格");
+        assert!(表.sessions[0].pinned, "置顶状态更没理由被清掉");
+        assert!(s.read_messages(100).is_empty());
+        assert!(s.raw_message("甲1").is_some() && s.raw_message("甲2").is_some(), "历史行一条没丢");
+        let _ = fs::remove_dir_all(&s.dir);
+    }
+
+    #[test]
+    fn 存储统计算得出收件粘贴暂存与聊天历史() {
+        let s = 临时存储("stats");
+        let 天 = s.inbox_dir().join("2026-05-01");
+        fs::create_dir_all(&天).unwrap();
+        fs::write(天.join("一张.png"), "12345").unwrap();
+        fs::write(天.join("二张.png"), "123").unwrap();
+        fs::write(s.inbox_dir().join("散装.png"), "1").unwrap();
+        fs::create_dir_all(s.pastebox_dir()).unwrap();
+        fs::write(s.pastebox_dir().join("剪贴板.png"), "1234567").unwrap();
+        s.append_message(&文字条("m1")).unwrap();
+        s.append_message(&文字条("m2")).unwrap();
+        s.patch_flags("m2", |m| m.hidden = true).unwrap();
+
+        let 数 = s.storage_stats();
+        assert_eq!(
+            (数.inbox_bytes, 数.inbox_count),
+            (5 + 3 + 1, 3),
+            "递归到底：日期子目录里那两张也要算进来，个数按文件不按目录"
+        );
+        assert_eq!(数.pastebox_bytes, 7);
+        assert_eq!(数.messages_count, 1, "条数只算界面上看得见的（hidden 那道闸门在 read_messages 出口）");
+        assert!(数.messages_bytes > 0, "聊天记录那个文件本身的大小");
+        assert!(
+            数.data_bytes >= 数.inbox_bytes + 数.pastebox_bytes + 数.messages_bytes,
+            "数据目录是整棵树，不会比几个分项还小"
+        );
+        let _ = fs::remove_dir_all(&s.dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn 统计算的是逻辑大小不跟着软链去把文件唤下来() {
+        let s = 临时存储("stats-symlink");
+        fs::create_dir_all(s.inbox_dir()).unwrap();
+        // 收件目录外放一个大文件，目录里只留一个指向它的软链：
+        // 跟着链接算就会把同一坨计两遍，而 iCloud 占位文件更会被顺手唤下来一次
+        let 大 = s.dir.join("外面那张.bin");
+        fs::write(&大, vec![7u8; 4096]).unwrap();
+        std::os::unix::fs::symlink(&大, s.inbox_dir().join("链过去.bin")).unwrap();
+
+        let 数 = s.storage_stats();
+        assert!(
+            数.inbox_bytes < 4096,
+            "不能跟着软链去算目标那一份的大小：{}",
+            数.inbox_bytes
+        );
+        assert_eq!(数.inbox_count, 1, "软链自己也是一个条目，个数要算上它");
+        let _ = fs::remove_dir_all(&s.dir);
+    }
+
+    #[test]
+    fn 收件清理不动被聊天记录引着的那一层() {
+        let s = 临时存储("clean-kept");
+        let 有天 = s.inbox_dir().join("2020-01-01");
+        let 别的天 = s.inbox_dir().join("2020-02-02");
+        fs::create_dir_all(&有天).unwrap();
+        fs::create_dir_all(&别的天).unwrap();
+        let 引着 = 有天.join("合同扫描.png");
+        let 同层 = 有天.join("顺手收的.png");
+        let 删过 = 别的天.join("界面上已经删了.png");
+        let 散装 = s.inbox_dir().join("散了一张.png");
+        for p in [&引着, &同层, &删过, &散装] {
+            fs::write(p, "12345").unwrap();
+        }
+        s.append_message(&文件条("甲1", 引着.to_string_lossy().to_string()))
+            .unwrap();
+        s.append_message(&文件条("乙1", 删过.to_string_lossy().to_string()))
+            .unwrap();
+        // 本机删过的那条在界面上已经没有入口，它指的文件因此可以清 —— 只有还看得见的才算被引着
+        s.patch_flags("乙1", |m| m.hidden = true).unwrap();
+
+        // 时间闸门放到很久以后：这几张都算「够老」，于是只看有没有被引着
+        let (个数, 字节) = s.inbox_cleanup(now_ms() + 86_400_000 * 365 * 20).unwrap();
+        assert_eq!((个数, 字节), (2, 10), "散的那一张 + 整个 2020-02-02 目录里那一张");
+        assert!(
+            fs::metadata(&引着).is_ok() && fs::metadata(&同层).is_ok(),
+            "同一天的目录里但凡有一张还引着，整个目录就原样留着（用户自己也是按天翻这个目录的）"
+        );
+        assert!(fs::metadata(&删过).is_err(), "只被本机删掉的记录指着 = 界面上没入口，可以清");
+        assert!(fs::metadata(&散装).is_err());
+        assert_eq!(s.read_messages(100).len(), 1, "聊天记录本身一条不动");
+        assert_eq!(
+            s.storage_stats().inbox_count,
+            2,
+            "同层那张 + 还引着的那张：数字当场就能重画"
+        );
+        let _ = fs::remove_dir_all(&s.dir);
+    }
+
+    #[test]
+    fn 收件清理只删够老的且不碰粘贴暂存也没目录时回零() {
+        let s = 临时存储("clean-time");
+        // 收件目录还没建过：统计与清理都该安静回零，不许顺手把目录建出来
+        assert_eq!(s.inbox_cleanup(now_ms()).unwrap(), (0, 0));
+        assert!(!s.inbox_dir().exists(), "清理不该有副作用：把目录建出来会让「收件目录在哪」那行字忽然变了");
+        let 数 = s.storage_stats();
+        assert_eq!((数.inbox_bytes, 数.inbox_count, 数.pastebox_bytes), (0, 0, 0));
+
+        let 旧 = s.inbox_dir().join("旧的一张.png");
+        let 新 = s.inbox_dir().join("新的一张.png");
+        let 暂存 = s.pastebox_dir().join("剪贴板.png");
+        fs::create_dir_all(s.inbox_dir()).unwrap();
+        fs::create_dir_all(s.pastebox_dir()).unwrap();
+        for p in [&旧, &新, &暂存] {
+            fs::write(p, "12345").unwrap();
+        }
+        // 2020 年元旦改的时间，按「清三个月前」的档位它才够老
+        按下改动时间(&旧, 1_577_836_800_000);
+
+        let (个数, 字节) = s.inbox_cleanup(now_ms() - 86_400_000 * 90).unwrap();
+        assert_eq!((个数, 字节), (1, 5), "只有那一张够老的被删：{个数}/{字节}");
+        assert!(fs::metadata(&新).is_ok(), "刚收进来的不能碰：用户可能就是想找它");
+        assert!(
+            fs::metadata(&暂存).is_ok(),
+            "粘贴暂存不在这一步的范围里（那些图本来没有原文件，历史气泡还指着它们）"
+        );
+        let _ = fs::remove_dir_all(&s.dir);
     }
 }

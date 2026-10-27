@@ -1236,6 +1236,113 @@ textarea.input {
   border-color: var(--border);
 }
 
+/* 转发浮层：屏幕中间浮的一小片，选与会话同组件（pick-title/pick-list 直接复用）；
+   压在放大层(900)之上、右键菜单(950)之下：从菜单里点开它，菜单不能反过来盖住它 */
+.fwd-pick {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 940;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 320px;
+  padding: 10px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+}
+
+.fwd-pick[hidden] {
+  display: none;
+}
+
+/* 跨会话全局搜索的浮层：同样居中，但压在右键菜单(950)之上 ——
+   它不是一击即走的小菜单，里面能输词、筛类型、列几十行，不该被菜单盖住 */
+.find-pick {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 960;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 460px;
+  max-height: 70vh;
+  padding: 12px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+}
+
+.find-pick[hidden] {
+  display: none;
+}
+
+.find-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.find-list {
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-height: 40px;
+}
+
+/* 一行三段：会话名钉住一栏、时间靠右、摘录吃剩下的并截断 */
+.find-row {
+  display: grid;
+  grid-template-columns: 96px 56px 1fr;
+  gap: 8px;
+  align-items: baseline;
+  text-align: left;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: var(--fg);
+  cursor: pointer;
+}
+
+.find-row:hover {
+  background: var(--bg-hover);
+}
+
+.find-sess {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-weight: 600;
+}
+
+.find-time {
+  color: var(--fg-dim);
+  font-size: 12px;
+  text-align: right;
+}
+
+.find-snip {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--fg-dim);
+  font-size: 12px;
+}
+
+.find-empty {
+  padding: 10px 8px;
+  color: var(--fg-dim);
+  font-size: 13px;
+}
+
 /* 日期分隔线：居中一枚小药丸，与气泡同宽约束，不参与左右分栏 */
 .day-divider {
   align-self: center;
@@ -1311,6 +1418,30 @@ textarea.input {
   font-size: 12px;
   color: var(--text-dim);
   word-break: break-all;
+}
+
+/* 抽屉「存储」那一节的四行数字：左标签右数值。数字用等宽数位，
+   刷新一次从 999 KB 跳到 1 MB 时整行宽度不会跟着抖 */
+.storage-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.storage-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.storage-row b {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 /* 收件摆放那一行「新收到的文件落在 …」里的样本路径：嵌在 11px 的 hint 里，
@@ -1729,6 +1860,68 @@ textarea,
   padding: 0;
   background: transparent;
   border-color: transparent;
+}
+
+/* 引用回复：气泡顶部的小卡片 + 输入框上方的预览条（与待发送区同一套版式） */
+.quote-card {
+  font-size: 12px;
+  color: var(--text-dim);
+  background: rgba(0, 0, 0, 0.18);
+  border-left: 3px solid var(--accent);
+  border-radius: 4px;
+  padding: 4px 8px;
+  margin-bottom: 6px;
+  max-width: 420px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+/* 蓝色气泡里黑底压不出层次，换白底浅叠一层 */
+.msg-out .quote-card {
+  background: rgba(255, 255, 255, 0.10);
+}
+
+/* 点卡片跳过去的定位反馈：底色亮一下就好，不搞常亮（闪的是整条气泡，一眼就能找到） */
+@keyframes msg-flash {
+  0%, 70% {
+    box-shadow: 0 0 0 2px var(--accent);
+  }
+  100% {
+    box-shadow: none;
+  }
+}
+
+.msg.is-flash .bubble {
+  animation: msg-flash 1.2s ease;
+}
+
+.quote-bar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 8px 16px 0;
+  padding: 6px 10px;
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius);
+  background: var(--bg-panel);
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.quote-bar[hidden] {
+  display: none;
+}
+
+/* 摘录一行看完就好：长了裁字不把 × 挤出去（与会话摘要同一套手法） */
+.quote-bar #xfer-quote-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .cand-box {

@@ -62,6 +62,12 @@ const ui = {
   btnInboxReveal: el("btn-inbox-reveal"),
   inboxLayout: el("inp-inbox-layout"),
   inboxSample: el("inbox-layout-sample"),
+  // 存储（占用统计与收件目录清理）
+  storageRows: el("storage-rows"),
+  btnStorageRefresh: el("btn-storage-refresh"),
+  btnStorageReveal: el("btn-storage-reveal"),
+  inboxCleanSel: el("inp-inbox-clean"),
+  btnInboxClean: el("btn-inbox-clean"),
   // 在线探测（心跳节拍）
   heartbeatSel: el("inp-heartbeat"),
   dropHint: el("xfer-drop-hint"),
@@ -82,6 +88,7 @@ const ui = {
   chatPin: el("ctx-chat-pin"),
   chatRename: el("ctx-chat-rename"),
   chatSep: el("ctx-chat-sep"),
+  chatClear: el("ctx-chat-clear"),
   chatDel: el("ctx-chat-del"),
   // 聊天气泡的右键菜单（文字 / 文件 / 图片共用一份，中文）：撤回与本机删除的入口也在这里
   msgMenu: el("chat-msg-menu"),
@@ -94,6 +101,28 @@ const ui = {
   msgSep: el("ctx-msg-sep"),
   msgRecall: el("ctx-msg-recall"),
   msgDel: el("ctx-msg-del"),
+  msgQuote: el("cb-quote"),
+  msgForward: el("cb-forward"),
+  quoteBar: el("xfer-quote"),
+  quoteBarText: el("xfer-quote-text"),
+  quoteClear: el("xfer-quote-x"),
+  fwdPick: el("xfer-fwd-pick"),
+  fwdList: el("xfer-fwd-list"),
+  fwdCancel: el("xfer-fwd-cancel"),
+  // 跨会话全局搜索的浮层（⌘F / 顶栏按钮）
+  findBtn: el("btn-xfer-find"),
+  findPick: el("xfer-find"),
+  findX: el("xfer-find-x"),
+  findQ: el("xfer-find-q"),
+  findChips: el("xfer-find-chips"),
+  findList: el("xfer-find-list"),
+  // 放大层的右键菜单（中文五项）：至此对比视图、聊天气泡、放大层三处右键都是自己的菜单了
+  lbMenu: el("lightbox-menu"),
+  lbCopyImg: el("lbm-copy-img"),
+  lbSave: el("lbm-save"),
+  lbCopyPath: el("lbm-copy-path"),
+  lbReveal: el("lbm-reveal"),
+  lbCompare: el("lbm-compare"),
   navBadge: el("nav-badge-xfer"),
   btnNewChat: el("btn-session-new"),
   chatPick: el("xfer-chat-pick"),
@@ -127,6 +156,10 @@ const state = {
    *  以前给这一批记一个归属（attachSid）并在切走后拦下，结果是粘一张图、切个框就卡在那
    *  发不出去也删不掉的黄字上（用户报过），那层锁多余 */
   attach: [],
+  /** 引用回复：待发送的那张小卡片（没发出去前住在预览条里），跟着下一条文字走 */
+  quote: null,
+  /** 转发中的那条快照：浮层选人之前拿着它等点击 */
+  fwd: null,
   /** 当前搜索条件：kind 为 all/text/image/folder/archive/other，q 为关键词 */
   filter: { kind: "all", q: "" },
   /** 当前生效的收件目录，只给「打开目录」用（抽屉打开时读一次） */
@@ -441,6 +474,8 @@ async function openSession(id) {
   if (state.cur === id) return;
   hidePick();
   state.cur = id;
+  // 引用指着的是某个具体会话里的某一条：换了框还挂着会把 A 会话的原文引到 B 里去发
+  clearQuote();
   renderSessionRail();
   renderPeerHead();
   try {
@@ -488,9 +523,13 @@ let railSig = "";
  * 置顶的口径跟微信一样：置顶的永远排在最上面（不按最后一条消息时间），底色深一档；
  * 取消置顶就回到按时间的位置。存在 sessions.json 里，重启还在。
  * ------------------------------------------------------------------------ */
-const railMenu = { row: null, s: null, armed: false };
+const railMenu = { row: null, s: null, armed: false, clearArmed: false };
 /** 「删除聊天」臂上之后没人点，几秒得自己退回去 */
 let railArmTimer = 0;
+/** 「清空聊天记录」自己的一枚臂与计时器：同一个菜单里两项破坏性入口，
+ *  臂不能互咬（臂上清空后去点删除，不该被当成「第二次确认」） */
+let railClearTimer = 0;
+const CHAT_CLEAR_LABEL = "清空聊天记录";
 
 /** 「删除」这一项在两种行上的文案：「未标记」删的是一格筐里的老消息，不是一台设备 */
 function delLabel(s) {
@@ -503,8 +542,11 @@ function closeChatMenu() {
   railMenu.row = null;
   railMenu.s = null;
   railMenu.armed = false;
+  railMenu.clearArmed = false;
   clearTimeout(railArmTimer);
+  clearTimeout(railClearTimer);
   if (ui.chatDel) ui.chatDel.textContent = "删除聊天";
+  if (ui.chatClear) ui.chatClear.textContent = CHAT_CLEAR_LABEL;
 }
 
 /** 菜单在鼠标处摊开：先显示再量尺寸，贴到窗口右/下边时翻到另一边。
@@ -535,7 +577,9 @@ function openChatMenu(ev, s, row) {
   railMenu.row = row;
   railMenu.s = s;
   railMenu.armed = false;
-  // 「未标记」不是一台真设备：置顶与改名都没有落点，这两项连同隔断一起藏起来，只留删除。
+  railMenu.clearArmed = false;
+  if (ui.chatClear) ui.chatClear.textContent = CHAT_CLEAR_LABEL;
+  // 「未标记」不是一台真设备：置顶与改名都没有落点，这两项连同隔断一起藏起来，只留清空与删除。
   // 以前这一行右键只弹一句「只能查看」——用户看到的就是「删也删不了」
   const unmarked = s.peer === UNMARKED;
   if (ui.chatPin) {
@@ -601,6 +645,10 @@ function openMsgMenu(ev, rec) {
     if (node) node.hidden = !on;
   };
   show(ui.msgCopyText, t.isText);
+  // 引用回复：正文非空且没被撤回才露。文字引正文、文件引文件名，都不要求本机路径
+  show(ui.msgQuote, !t.m.recalled && !!((t.isText ? t.m.text : t.name) || "").trim());
+  // 转发：有正文或有本机路径才露（接收中的占位气泡还没拿到路径，转了也是空的）
+  show(ui.msgForward, !t.m.recalled && ((t.isText && !!(t.m.text || "").trim()) || t.hasFile));
   show(ui.msgCopyImg, t.isImage);
   show(ui.msgSave, t.hasFile);
   show(ui.msgCopyPath, t.hasFile);
@@ -621,6 +669,16 @@ async function runMsgMenu(act) {
   closeMsgMenu();
   const p = t.path;
   const name = t.name || p;
+  // 引用只要正文或文件名就算得出来，不要求本机路径（接收中的文件也能引）
+  if (act === "quote") {
+    setQuote(t.m);
+    return;
+  }
+  // 转发弹的是会话选择浮层，发送等点完那条再做（也先于「必须有路径」那道闸门）
+  if (act === "forward") {
+    openFwdPick(t);
+    return;
+  }
   // 除了「复制正文」，其余每一项都要本机路径；路径还没到手（接收中）就什么都不做
   if (act !== "copy-text" && !p) return;
   try {
@@ -648,6 +706,8 @@ async function runMsgMenu(act) {
 
 for (const [node, act] of [
   [ui.msgCopyText, "copy-text"],
+  [ui.msgQuote, "quote"],
+  [ui.msgForward, "forward"],
   [ui.msgCopyImg, "copy-img"],
   [ui.msgSave, "save"],
   [ui.msgCopyPath, "copy-path"],
@@ -684,6 +744,342 @@ if (ui.msgDel) {
   });
 }
 
+/* --------------------------------------------------------------------------
+ * 引用回复
+ *
+ * 存的是被引那一刻的快照（后端 store::Quote）：原文后来被撤回、被删、
+ * 还在没铺出来的历史页里，卡片都能照渲染。发出后就是一条带 quote 的新消息，
+ * 老对端不认这个字段也只当普通文字显示（降级不报错）。
+ * ------------------------------------------------------------------------ */
+/** 摘录超这几字符就截断加省略号（与后端 Quote.text 的注释同一口径） */
+const QUOTE_MAX = 120;
+
+/** 按字符截不按字节：中文一个字在 .length 里占两个，按字节切会拦腰掉字 */
+function quoteSnippet(s) {
+  const chars = Array.from(String(s || ""));
+  return chars.length > QUOTE_MAX ? chars.slice(0, QUOTE_MAX).join("") + "…" : chars.join("");
+}
+
+/** 从一条消息算出引用快照：引文字摘正文，引文件摘文件名。
+ *  被引人名字当场算好存死（改名不回头改旧卡片），不是 id */
+function makeQuote(m) {
+  if (!m || !m.id) return null;
+  const isText = m.kind === "text";
+  const raw = String((isText ? m.text : m.name) || "");
+  if (!raw.trim()) return null;
+  return {
+    id: m.id,
+    from: m.dir === "out" ? "我" : sessName(state.cur, m.peer),
+    text: quoteSnippet(raw),
+    kind: m.kind,
+    name: isText ? null : m.name || null,
+  };
+}
+
+/** 把引用挂到预览条上：输入框上方那一条，Enter/点发送时跟着正文一起走 */
+function setQuote(m) {
+  const q = makeQuote(m);
+  if (!q) {
+    toast("这一条是空的，引用不了", "error");
+    return;
+  }
+  state.quote = q;
+  if (ui.quoteBar) ui.quoteBar.hidden = false;
+  if (ui.quoteBarText) ui.quoteBarText.textContent = `引用 ${q.from}：${q.text}`;
+}
+
+function clearQuote() {
+  state.quote = null;
+  if (ui.quoteBar) ui.quoteBar.hidden = true;
+  if (ui.quoteBarText) ui.quoteBarText.textContent = "";
+}
+
+if (ui.quoteClear) ui.quoteClear.addEventListener("click", clearQuote);
+
+/** 跳到被引那一条：滚到中间闪一下。不在已铺页面里只提示不硬拉 ——
+ *  为了点一下卡片把几十页历史全加载出来不值得（全局搜索那边才有逐页找的逻辑） */
+function jumpToQuoted(id) {
+  if (!id) return;
+  let el = null;
+  for (const c of ui.stream.children) {
+    if (c.dataset && c.dataset.id === id) {
+      el = c;
+      break;
+    }
+  }
+  if (!el) {
+    toast("原文还没加载出来");
+    return;
+  }
+  if (el.scrollIntoView) el.scrollIntoView({ block: "center" });
+  flashNode(el);
+}
+
+/** 闪一下：挂 is-flash 让 CSS 动画跑完再撤掉（引用定位与全局搜索共用这一套） */
+function flashNode(node) {
+  node.classList.add("is-flash");
+  setTimeout(() => node.classList.remove("is-flash"), 1200);
+}
+
+/** 气泡顶部那张小卡片：浅底小一号字，点了滚回原文 */
+function quoteCard(q) {
+  const card = document.createElement("div");
+  card.className = "quote-card";
+  card.textContent = `引用 ${q.from || ""}：${q.text || q.name || ""}`;
+  card.title = "点击跳到被引用的那一条";
+  card.addEventListener("click", (ev) => {
+    // 卡片在气泡里，不能让这一击再冒泡去干别的（文字气泡将来可能挂双击复制）
+    if (ev.stopPropagation) ev.stopPropagation();
+    jumpToQuoted(q.id);
+  });
+  return card;
+}
+
+/* --------------------------------------------------------------------------
+ * 转发到别的会话
+ *
+ * 零新后端命令：文字走 send_text（不带 quote —— 转发的是一条全新 id 的新消息，
+ * 原会话那条撤回/删除互不影响），文件走 send_paths 拿的就是本机那份。
+ * 离线对端照旧自动入队，不用先切会话再发。
+ * ------------------------------------------------------------------------ */
+function openFwdPick(t) {
+  state.fwd = t;
+  renderFwdList();
+  if (ui.fwdPick) ui.fwdPick.hidden = false;
+}
+
+function closeFwdPick() {
+  if (ui.fwdPick) ui.fwdPick.hidden = true;
+  state.fwd = null;
+  if (ui.fwdList) ui.fwdList.textContent = "";
+}
+
+/** 列其它所有会话（排除这一条所在的那个 —— 转发给自己没有意义），
+ *  一行就报「名字 · 最后一条时间」，与会话栏那一行同样的信息量 */
+function renderFwdList() {
+  if (!ui.fwdList) return;
+  ui.fwdList.textContent = "";
+  for (const s of state.sessionList) {
+    if (s.id === state.cur) continue;
+    const b = document.createElement("button");
+    b.textContent = `${s.name || peerName(s.peer)} · ${railTime(s.last) || "还没有消息"}`;
+    b.addEventListener("click", () => doForward(s));
+    ui.fwdList.appendChild(b);
+  }
+  if (!ui.fwdList.children.length) {
+    const b = document.createElement("button");
+    b.disabled = true;
+    b.textContent = "还没有别的会话：先从顶上「＋ 新聊天」开一个";
+    ui.fwdList.appendChild(b);
+  }
+}
+
+async function doForward(s) {
+  const t = state.fwd;
+  closeFwdPick();
+  if (!t) return;
+  try {
+    let res;
+    if (t.hasFile && t.path) {
+      res = await invoke("send_paths", { paths: [t.path], to: s.id });
+    } else {
+      res = await invoke("send_text", { text: String(t.m.text || ""), to: s.id });
+    }
+    const queued = (Array.isArray(res) ? res : [res]).some((x) => x && x.state === "queued");
+    const label = s.name || peerName(s.peer);
+    toast(queued ? `已转发到「${label}」：对方离线，排队等上线补发` : `已转发到「${label}」`);
+  } catch (err) {
+    console.error("[xfer] 转发失败:", err);
+    toast(errText(err) || "转发失败", "error");
+  }
+}
+
+if (ui.fwdCancel) ui.fwdCancel.addEventListener("click", closeFwdPick);
+
+/* --------------------------------------------------------------------------
+ * 跨会话全局搜索（⌘F）
+ *
+ * 与会话内那条小搜索框并存、语义不变：那一边只筛已铺出来的气泡，这一边
+ * 走后端 search_messages 查整份历史（已挡 hidden，撤回/删掉的天然不露）。
+ * 点一条：openSession 切过去，目标没铺出来就逐页 loadOlder 直到出现
+ *（封顶 60 页与会话内拉齐同口径），再滚到中间闪一下。
+ * ------------------------------------------------------------------------ */
+function openFind() {
+  if (!ui.findPick) return;
+  closeFwdPick();
+  ui.findPick.hidden = false;
+  if (ui.findQ) {
+    ui.findQ.focus();
+    if (ui.findQ.value) runFind(); // 上回搜过的词还在：重新弹出来就该重新给结果
+  }
+}
+
+function closeFind() {
+  if (ui.findPick) ui.findPick.hidden = true;
+}
+
+/** 逐字符全量重读一份 JSONL 不便宜，轻防抖一下；Enter 不等 */
+let findTimer = 0;
+
+async function runFind() {
+  if (!ui.findList) return;
+  const q = String(ui.findQ?.value || "").trim();
+  if (!q) {
+    ui.findList.textContent = "";
+    return;
+  }
+  const kind = ui.findPick.dataset.kind || "all";
+  let list = [];
+  try {
+    list = (await invoke("search_messages", { query: q, kind })) || [];
+  } catch (err) {
+    console.error("[xfer] 全局搜索失败:", err);
+    ui.findList.textContent = "";
+    const b = document.createElement("div");
+    b.className = "find-empty";
+    b.textContent = "搜不了：" + (errText(err) || "后端没应答");
+    ui.findList.appendChild(b);
+    return;
+  }
+  // 重画前用户又改了词：这一份已经过时，丢给下一次 debounce 的调用
+  if (String(ui.findQ?.value || "").trim() !== q) return;
+  renderFindHits(list, q);
+}
+
+/** 一行：会话名 · 时间 · 摘录；命中够不到两千条才补一句封顶提示 */
+function renderFindHits(list, q) {
+  const box = ui.findList;
+  if (!box) return;
+  box.textContent = "";
+  if (!list.length) {
+    const b = document.createElement("div");
+    b.className = "find-empty";
+    b.textContent = "哪个会话里都没找到「" + q + "」";
+    box.appendChild(b);
+    return;
+  }
+  for (const h of list) {
+    const b = document.createElement("button");
+    b.className = "find-row";
+    b.innerHTML =
+      `<span class="find-sess">${escapeHtml(h.session || "未标记")}</span>` +
+      `<span class="find-time">${railTime(h.ts)}</span>` +
+      `<span class="find-snip">${escapeHtml(h.snippet || h.name || "")}</span>`;
+    b.title = "跳到这个会话并定位到那一条";
+    b.addEventListener("click", () => gotoHit(h));
+    box.appendChild(b);
+  }
+  if (list.length >= 200) {
+    const b = document.createElement("div");
+    b.className = "find-empty";
+    b.textContent = "先列最近这 200 条：关键词再具体一点";
+    box.appendChild(b);
+  }
+}
+
+/** 点一条：切过去 → 没铺出来就逐页补 → 滚到中间闪一下 */
+async function gotoHit(h) {
+  closeFind();
+  if (!h || !h.id) return;
+  await openSession(h.sid);
+  const s = cur();
+  let guard = 0;
+  while (!s.bubbles.has(h.id) && s.hasMore && guard++ < 60) await loadOlder();
+  const node = s.bubbles.get(h.id) && s.bubbles.get(h.id).el;
+  if (!node) {
+    // 只剩「封顶翻完还没见到」这一种：说人话，不静悄悄
+    toast("原文还没加载出来");
+    return;
+  }
+  if (node.scrollIntoView) node.scrollIntoView({ block: "center" });
+  flashNode(node);
+}
+
+if (ui.findBtn) ui.findBtn.addEventListener("click", openFind);
+if (ui.findX) ui.findX.addEventListener("click", closeFind);
+if (ui.findQ) {
+  ui.findQ.addEventListener("input", () => {
+    clearTimeout(findTimer);
+    findTimer = setTimeout(runFind, 250);
+  });
+  ui.findQ.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") {
+      clearTimeout(findTimer);
+      runFind();
+    }
+  });
+}
+// 类型 chip 单选：这份的档位是后端 kind（text/image/file/folder），
+// 与会话内那组（前端按名字归类）不共用数据源，各自各的
+if (ui.findChips) {
+  ui.findChips.addEventListener("click", (ev) => {
+    const btn = ev.target.closest(".chip");
+    if (!btn || !ui.findChips.contains(btn)) return;
+    ui.findPick.dataset.kind = btn.dataset.kind || "all";
+    for (const b of ui.findChips.querySelectorAll(".chip")) b.classList.toggle("is-on", b === btn);
+    runFind();
+  });
+}
+
+/* --------------------------------------------------------------------------
+ * 放大层的右键菜单
+ *
+ * 五项全走已有命令，有本机路径就全露（放大层里本来就是图，没有按类型显隐的必要）。
+ * 没路径不拦：剪贴板粘进来的纯位图没有文件可存可拷，系统的「拷贝图像」比一排灰项有用。
+ * ------------------------------------------------------------------------ */
+/** 收菜单的那一下 click 会落到背景上，不能连带把整层关了：这个标记只吃一次 */
+let lbKeepLayerOnce = false;
+
+function closeLbMenu(fromOutside = false) {
+  if (!ui.lbMenu || ui.lbMenu.hidden) return;
+  ui.lbMenu.hidden = true;
+  if (fromOutside) lbKeepLayerOnce = true;
+}
+
+function openLbMenu(ev) {
+  if (!ui.lbMenu || !lightboxPath) return;
+  if (ev.preventDefault) ev.preventDefault();
+  if (ev.stopPropagation) ev.stopPropagation();
+  if (!ui.lbMenu.hidden) closeLbMenu();
+  placeMenuAt(ui.lbMenu, ev);
+}
+
+async function runLbMenu(act) {
+  const p = lightboxPath;
+  closeLbMenu();
+  if (!p) return;
+  try {
+    if (act === "copy-img") {
+      await copyPathAsFile([p]);
+    } else if (act === "save") {
+      const saved = await invoke("save_path_as", { src: p });
+      // null = 选文件框里按了取消：这不是失败，不用弹提示
+      if (saved) toast(`已保存到 ${saved}`);
+    } else if (act === "copy-path") {
+      await copyText(p);
+    } else if (act === "reveal") {
+      await invoke("reveal_in_folder", { path: p });
+    } else if (act === "compare") {
+      // 带着这一层切去对比视图会把 overlay 盖在另一个视图上：先关层
+      closeLightbox();
+      openInCompare([p]);
+    }
+  } catch (err) {
+    console.error("[xfer] 放大层菜单操作失败:", act, err);
+    toast(errText(err) || "操作失败", "error");
+  }
+}
+
+for (const [node, act] of [
+  [ui.lbCopyImg, "copy-img"],
+  [ui.lbSave, "save"],
+  [ui.lbCopyPath, "copy-path"],
+  [ui.lbReveal, "reveal"],
+  [ui.lbCompare, "compare"],
+]) {
+  if (node) node.addEventListener("click", () => runLbMenu(act));
+}
+
 /** 置顶 / 取消置顶：后端只改标记 + 存盘，顺序与底色都靠返回的那份 payload 重画 */
 async function pinSession(s) {
   const pinned = !s.pinned;
@@ -709,6 +1105,25 @@ if (ui.chatRename) {
     closeChatMenu();
     // 行还挂在 DOM 上才能就地换成输入框（列表刚重画过就不硬塞了）
     if (s && row && row.isConnected) startRename(s, row);
+  });
+}
+if (ui.chatClear) {
+  ui.chatClear.addEventListener("click", () => {
+    const s = railMenu.s;
+    if (!s) return;
+    // 与「删除聊天」同款两步：右键一下手滑不该把一整格记录抹掉
+    if (!railMenu.clearArmed) {
+      railMenu.clearArmed = true;
+      ui.chatClear.textContent = "再点一次清空";
+      clearTimeout(railClearTimer);
+      railClearTimer = setTimeout(() => {
+        railMenu.clearArmed = false;
+        if (ui.chatClear) ui.chatClear.textContent = CHAT_CLEAR_LABEL;
+      }, 4000);
+      return;
+    }
+    closeChatMenu();
+    clearSession(s);
   });
 }
 if (ui.chatDel) {
@@ -743,16 +1158,29 @@ window.addEventListener("pointerdown", (ev) => {
   if (ui.msgMenu && !ui.msgMenu.hidden && !(t && ui.msgMenu.contains && ui.msgMenu.contains(t))) {
     closeMsgMenu();
   }
+  if (ui.lbMenu && !ui.lbMenu.hidden && !(t && ui.lbMenu.contains && ui.lbMenu.contains(t))) {
+    closeLbMenu(true);
+  }
+  if (ui.fwdPick && !ui.fwdPick.hidden && !(t && ui.fwdPick.contains && ui.fwdPick.contains(t))) {
+    closeFwdPick();
+  }
+  // 搜索浮层里点外面也收（输入框里持着焦点时 Esc 那条不会走，得给这一击兼着）
+  if (ui.findPick && !ui.findPick.hidden && !(t && ui.findPick.contains && ui.findPick.contains(t))) {
+    closeFind();
+  }
 });
-const closeBothMenus = () => {
+const closeAllMenus = () => {
   closeChatMenu();
   closeMsgMenu();
+  closeLbMenu();
+  closeFwdPick();
+  closeFind();
 };
-window.addEventListener("wheel", closeBothMenus, { passive: true });
-window.addEventListener("resize", closeBothMenus);
-window.addEventListener("blur", closeBothMenus);
+window.addEventListener("wheel", closeAllMenus, { passive: true });
+window.addEventListener("resize", closeAllMenus);
+window.addEventListener("blur", closeAllMenus);
 window.addEventListener("keydown", (ev) => {
-  if (ev.key === "Escape") closeBothMenus();
+  if (ev.key === "Escape") closeAllMenus();
 });
 
 function renderSessionRail() {
@@ -973,6 +1401,34 @@ async function removeOne(s) {
 }
 
 /* --------------------------------------------------------------------------
+ * 清空聊天记录（会话菜单那枚两步确认的落点）
+ *
+ * 与「删除聊天」的区别：框还在、设备还在、对端那份与收件箱里的文件都不动，
+ * 只是这一台不再显示（后端逐条补写 hidden，口径与单条本机删除一致）。
+ * 会话栏的摘要与未读靠后端 emit_sessions 推回来，这里只管重铺当前这一格。
+ * ------------------------------------------------------------------------ */
+async function clearSession(s) {
+  try {
+    const res = await invoke("session_clear", { id: s.id });
+    const n = Number(res?.cleared) || 0;
+    toast(n ? `已清空 ${n} 条聊天记录：对方那份与收到的文件都没动` : "这个会话本来就没有消息");
+  } catch (err) {
+    console.error("[xfer] 清空失败:", err);
+    toast(errText(err) || "清空失败", "error");
+    return;
+  }
+  if (s.id === state.cur) {
+    // 重铺：msg_history 已挡 hidden，拉回来的是空的
+    await loadHistory();
+    // loadHistory 给全新会话写的是「还没有消息」；清空过的说准一点 ——
+    // 消息还在盘上，只是这一台不再显示（与 toast 同一口径）
+    if (!cur().bubbles.size && !s.hasMore) {
+      ui.stream.innerHTML = `<div class="stream-empty">聊天记录已清空：对方那份与收到的文件都还在。</div>`;
+    }
+  }
+}
+
+/* --------------------------------------------------------------------------
  * 「＋ 新聊天」弹层
  * ------------------------------------------------------------------------ */
 function hidePick() {
@@ -1075,6 +1531,10 @@ function buildBubble(m) {
   const bubble = document.createElement("div");
   bubble.className = "bubble";
   wrap.appendChild(bubble);
+
+  // 引用卡片住在正文上面（文字/文件气泡都一样）；被撤回的那条随后会被
+  // paintRecalled 连卡片一起拆掉，这里不用特判
+  if (m.quote && m.quote.id) bubble.appendChild(quoteCard(m.quote));
 
   const rec = {
     el: wrap,
@@ -1285,6 +1745,8 @@ function openLightbox(dataUrl, name, p) {
 
 function closeLightbox() {
   lightboxPath = null;
+  // 层都关了，菜单不能留在屏上指着空气
+  closeLbMenu();
   if (ui.lightbox.hidden) return;
   ui.lightbox.hidden = true;
   // 去掉 src 让 webview 立刻释放解码后的大图内存
@@ -2148,7 +2610,8 @@ async function sendComposer() {
       sentPaths = true;
     }
     if (text) {
-      out.push(await invoke("send_text", { text, to: state.cur }));
+      // 引用跟着这一条文字走（发出即清）；没引用时 quote 是 null，后端当没这字段
+      out.push(await invoke("send_text", { text, to: state.cur, quote: state.quote }));
       sentText = true;
     }
     queued = out.some((m) => m && m.state === "queued");
@@ -2160,6 +2623,7 @@ async function sendComposer() {
   if (sentText) {
     ui.input.value = "";
     ui.input.style.height = "";
+    clearQuote();
   }
   if (ok) toast(queued ? "对方离线，已排队，上线自动发出" : "已送达");
 }
@@ -2371,6 +2835,97 @@ async function chooseInboxLayout(ev) {
 }
 
 /* --------------------------------------------------------------------------
+ * 存储：那几个数字与收件目录清理
+ *
+ * 只在抽屉打开与点「刷新」时读一次：storage_stats 在 Rust 侧是递归走一遍目录树，
+ * 把它放进任何轮询里都划不来。「清理」沿用两步确认那套手感（与删会话、逐条删除
+ * 一样：第一下只是把话换成「再点一次」，没人点就自己退回去）。
+ * 删什么、留什么的口径全在后端：只动「改得够早，而且没被任何还看得见的消息引用」
+ * 的收件文件，这里只负责把数字摆出来、把两步确认按住。
+ * ------------------------------------------------------------------------ */
+
+/** 一行一个数字：标签怎么叫、后端那几个键怎么拼成这一句 */
+const STORAGE_ROWS = [
+  ["收件目录", (s) => `${fmtSize(s.inbox_bytes)} · ${s.inbox_count} 个文件`],
+  ["粘贴暂存", (s) => fmtSize(s.pastebox_bytes)],
+  ["聊天历史", (s) => `${fmtSize(s.messages_bytes)} · ${s.messages_count} 条`],
+  ["数据目录合计", (s) => fmtSize(s.data_bytes)],
+];
+
+/** 一行一行摊出来，而不是拼一大段 innerHTML：这几行是数字表，将来要按行加个
+ *  「点开看目录」的入口，节点先留着比到时候再拆字符串省事 */
+function renderStorage(st) {
+  if (!ui.storageRows) return;
+  ui.storageRows.textContent = "";
+  for (const [label, fn] of STORAGE_ROWS) {
+    const row = document.createElement("div");
+    row.className = "storage-row";
+    const k = document.createElement("span");
+    k.textContent = label;
+    const v = document.createElement("b");
+    v.textContent = st ? fn(st) : "读取失败";
+    row.appendChild(k);
+    row.appendChild(v);
+    ui.storageRows.appendChild(row);
+  }
+}
+
+/** 命令整个没回也只把这一节写成「读取失败」，不额外弹 toast：抽屉一打开就被
+ *  一句报错抢掉视线，比数字没刷出来更烦人 */
+async function refreshStorage() {
+  let st = null;
+  try {
+    st = await invoke("storage_stats");
+  } catch (_) {
+    st = null;
+  }
+  renderStorage(st);
+}
+
+/** 「清理」第一下之后的文案，四秒没人点就退回这两个字 */
+const CLEAN_LABEL = "清理";
+let cleanArmed = false;
+let cleanTimer = 0;
+
+function disarmClean() {
+  cleanArmed = false;
+  clearTimeout(cleanTimer);
+  if (ui.btnInboxClean) ui.btnInboxClean.textContent = CLEAN_LABEL;
+}
+
+async function cleanInbox() {
+  if (!ui.btnInboxClean) return;
+  if (!cleanArmed) {
+    cleanArmed = true;
+    ui.btnInboxClean.textContent = "再点一次确认清理";
+    cleanTimer = setTimeout(disarmClean, 4000);
+    return;
+  }
+  // 真要用的是当前那一档，所以档位读在第二下这一刻，不是读在臂上的时候
+  disarmClean();
+  const months = Number(ui.inboxCleanSel?.value) || 3;
+  // 一个月按 30 天算：这是个粗清理的门槛，不是日历账
+  const beforeTs = Date.now() - months * 30 * 24 * 60 * 60 * 1000;
+  let res = null;
+  try {
+    res = await invoke("inbox_cleanup", { beforeTs });
+  } catch (err) {
+    toast(errText(err) || "清理失败", "error");
+    await refreshStorage();
+    return;
+  }
+  const n = Number(res?.deleted_count) || 0;
+  const b = Number(res?.freed_bytes) || 0;
+  toast(
+    n
+      ? `删了 ${n} 个文件，释放 ${fmtSize(b)}：聊天里引着的一个都没动`
+      : "这一档之前的收件文件都被聊天记录引着，一个都没删"
+  );
+  // 数字得跟着重算：后端删完也 emit 了一次，这里再拉一遍是为了「没开抽屉也能点刷新看到」
+  await refreshStorage();
+}
+
+/* --------------------------------------------------------------------------
  * 在线探测：心跳节拍
  *
  * 节拍是 Rust 那边心跳线程每拍从 prefs.json 读的（不缓存），所以这里存下去
@@ -2517,7 +3072,14 @@ registerDropHoverHandler("transfer", (phase) => {
 // 放大层：点背景/关闭按钮/Esc 都能退出，图本身可以缩放与平移，只在有该 DOM 时绑定
 if (ui.lightbox && ui.lightboxClose) {
   ui.lightboxClose.addEventListener("click", closeLightbox);
+  // 整层都拦右键：这是最后一处还会弹系统英文菜单的地方（没路径时 openLbMenu 自己不拦）
+  ui.lightbox.addEventListener("contextmenu", openLbMenu);
   ui.lightbox.addEventListener("click", (ev) => {
+    // 刚被这一下 pointerdown 收掉的菜单：落点也在背景上，这一次只收菜单，不关层
+    if (lbKeepLayerOnce) {
+      lbKeepLayerOnce = false;
+      return;
+    }
     // 拖完图那一下松手也会发 click（落在背景上就会被当成「关层」），
     // 所以这一只整体吃掉，不挑 target——否则背着一张图拖完还得再点一次才关得上
     if (lb.moved) {
@@ -2668,7 +3230,10 @@ ui.stream.addEventListener("pointerdown", hidePick);
 ui.btnSettings.addEventListener("click", () => {
   ui.settings.classList.toggle("is-open");
   // 打开时读一次最新值：收起时没人看这几项，不值得时刻维护
-  if (ui.settings.classList.contains("is-open")) refreshRecvPrefs();
+  if (ui.settings.classList.contains("is-open")) {
+    refreshRecvPrefs();
+    refreshStorage();
+  }
 });
 
 /* 本机接收那一段：开关即时存，失败就退回磁盘上那份 */
@@ -2689,6 +3254,10 @@ if (ui.btnInboxChoose) ui.btnInboxChoose.addEventListener("click", chooseInboxDi
 if (ui.btnInboxReset) ui.btnInboxReset.addEventListener("click", resetInboxDir);
 if (ui.btnInboxReveal) ui.btnInboxReveal.addEventListener("click", revealInboxDir);
 if (ui.inboxLayout) ui.inboxLayout.addEventListener("change", chooseInboxLayout);
+// 存储：「打开收件目录」与上面那一枚走同一个函数（同一个目录，不另算一份路径）
+if (ui.btnStorageRefresh) ui.btnStorageRefresh.addEventListener("click", refreshStorage);
+if (ui.btnStorageReveal) ui.btnStorageReveal.addEventListener("click", revealInboxDir);
+if (ui.btnInboxClean) ui.btnInboxClean.addEventListener("click", cleanInbox);
 if (ui.heartbeatSel) ui.heartbeatSel.addEventListener("change", chooseHeartbeat);
 
 /* 搜索：输入就筛。不加防抖——纯内存遍历几百个气泡，比等防抖窗口更快出结果 */
@@ -2710,13 +3279,13 @@ if (ui.chips) {
   });
 }
 
-// ⌘F/Ctrl+F 直跳搜索框；Esc 在搜索框里是清空并交还焦点，不抢其它地方的 Esc（比如关掉放大层）
+// ⌘F/Ctrl+F 开的是跨会话的全局搜索浮层（会话内那条框改用手点）；
+// Esc 在搜索框里是清空并交还焦点，不抢其它地方的 Esc（比如关掉放大层）
 window.addEventListener("keydown", (ev) => {
-  if (currentView() !== "transfer" || !ui.search) return;
+  if (currentView() !== "transfer") return;
   if ((ev.metaKey || ev.ctrlKey) && !ev.altKey && ev.key.toLowerCase() === "f") {
     ev.preventDefault();
-    ui.search.focus();
-    ui.search.select();
+    openFind();
     return;
   }
   if (ev.key === "Escape" && document.activeElement === ui.search) {
@@ -2745,6 +3314,10 @@ onViewChange((name) => {
 });
 // 会话的新建与删除都从这里走：陌生设备的第一条消息就是在这里把行放进会话栏的
 listen("sessions-changed", applySessions);
+// 清理完后端推一句：抽屉开着就重画那几个数字（没开着也没关系，下次打开自己会读）
+listen("storage-changed", (payload) => {
+  if (payload && payload.stats) renderStorage(payload.stats);
+});
 listen("msg-in", (payload) => {
   if (routeMessage(payload?.message, "msg-in")) scrollBottom();
 });
