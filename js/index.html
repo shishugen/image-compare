@@ -523,10 +523,13 @@
     <!-- 会话列表右键菜单：同样替掉 WebView 那套英文原生菜单（与图片右键同一套做法）。
          置顶是主项，跟微信一样：置顶后永远排在最上面、底色深一档，再右键一次就能取消。
          删除跟行内那枚一样要两步（先变成「再点一次删除」），免得右键一下手滑就没了 -->
+    <!-- 会话行的右键菜单。三项对「未标记」那一行不适用（置顶/改名都要有落点），
+         打开时把前两项与那根隔断一起赋 hidden，只剩删除 —— 自定义项是 display:block，
+         光给 hidden 属性不管用，样式里另有一条 .ctx-menu > [hidden] -->
     <div class="ctx-menu" id="chat-menu" role="menu" aria-label="会话操作" hidden>
       <button class="ctx-item" id="ctx-chat-pin" role="menuitem">置顶该聊天</button>
       <button class="ctx-item" id="ctx-chat-rename" role="menuitem">重命名</button>
-      <div class="ctx-sep"></div>
+      <div class="ctx-sep" id="ctx-chat-sep"></div>
       <button class="ctx-item" id="ctx-chat-del" role="menuitem">删除聊天</button>
     </div>
 

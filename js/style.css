@@ -2218,3 +2218,9 @@ textarea,
   margin: 4px 6px;
   background: var(--border);
 }
+
+/* 自定义项是 display:block，光给 hidden 属性不管用：UA 那条 display:none 会被它盖掉。
+   「未标记」那一行只有删除项，置顶/重命名与隔断都得真消失而不是留白 */
+.ctx-menu > [hidden] {
+  display: none;
+}

@@ -524,14 +524,31 @@ impl Hub {
     /// 对方下次在那个框里再发一条过来还会自动重建（历史本来就还在）。
     /// 顺手记进 hidden：这个框的历史还在磁盘上，不记的话列表会把它
     /// 从历史里补回来，「删除」点了等于没点
+    ///
+    /// 「未标记」（空 ID）与只从历史里露出来的补漏行**本来就不在会话表里**：
+    /// 以前这里直接报「没有这个会话」，那两行因此永远删不掉（Win 那台报的就是这条）。
+    /// 它们同样只靠 hidden 遮 —— 名单里一记，会话栏就不再把它补出来
     pub fn remove_session(&self, id: &str) -> Result<(), String> {
+        // 删除前先确认这一行真的在列表里：会话表里有它，或历史里还有它的消息。
+        // 会话表与会话栏是两码事（后者还会从历史补漏），只查前者就会把后一种当成错
+        let known = self
+            .sessions
+            .lock()
+            .expect("sessions 锁中毒")
+            .sessions
+            .iter()
+            .any(|s| s.id == id)
+            || self
+                .store
+                .read_messages(usize::MAX)
+                .iter()
+                .any(|m| m.sid_of() == id);
+        if !known {
+            return Err("没有这个会话".into());
+        }
         let f = {
             let mut g = self.sessions.lock().expect("sessions 锁中毒");
-            let before = g.sessions.len();
             g.sessions.retain(|s| s.id != id);
-            if before == g.sessions.len() {
-                return Err("没有这个会话".into());
-            }
             if !g.hidden.iter().any(|p| p == id) {
                 g.hidden.push(id.to_string());
             }
@@ -2037,6 +2054,24 @@ mod tests {
         assert_eq!(again, vec!["", "ub"]);
         // 补出来的那一行得知道它属于哪台（前端据此判在线与能不能回）
         assert_eq!(stats["ub"].peer, "b");
+    }
+
+    #[test]
+    fn 未标记那一行也能删掉() {
+        // 「未标记」不在会话表里，删除只能靠 hidden 里记一个空串。
+        // 以前 remove_session 一见会话表里没有就直接报「没有这个会话」，
+        // Win 那台因此右键也删不掉（用户报过）
+        let msgs = vec![消息("一", "a", "in", 1), 消息("二", "", "in", 2)];
+        let stats = session_stats(&msgs, &HashMap::new());
+        let mut f = SessionsFile {
+            sessions: vec![Session { id: "a".into(), peer: "a".into(), name: "甲".into(), created: 1, read: 0, pinned: false }],
+            active: "a".into(),
+            hidden: Vec::new(),
+        };
+        assert_eq!(orphan_sessions(&stats, &f), vec![""]);
+        // 记进 hidden 之后，这一行就不再从历史里补出来
+        f.hidden.push(String::new());
+        assert!(orphan_sessions(&stats, &f).is_empty());
     }
 
     #[test]

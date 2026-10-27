@@ -678,7 +678,20 @@ check(
 check("首屏历史按当前会话筛", lastCall("msg_history")?.session === "A", JSON.stringify(lastCall("msg_history")));
 check("会话栏三行（甲、丙、未标记）", rows().length === 3, rows().map((r) => r.dataset.peer).join(","));
 check("当前会话那行高亮", rowOf("A")?.classSet.has("is-active") && !rowOf("C")?.classSet.has("is-active"));
-check("未标记行不给删除按钮", rowOf("") && !rowOf("").children.some((c) => c.classSet.has("s-acts")));
+const actsOf = (id) => {
+  const r = rowOf(id);
+  return r ? r.children.find((c) => c.classSet.has("s-acts")) || null : null;
+};
+check(
+  "未标记行只给「删除」、不给「改名」（它没有名字可改）",
+  !!actsOf("") && actsOf("").children.length === 1 && actsOf("").children[0].textContent === "删除",
+  actsOf("") ? actsOf("").children.map((b) => b.textContent).join(",") : "没有操作区"
+);
+check(
+  "普通行还是「改名 + 删除」两枚",
+  !!actsOf("A") && actsOf("A").children.map((b) => b.textContent).join(",") === "改名,删除",
+  actsOf("A") ? actsOf("A").children.map((b) => b.textContent).join(",") : "没有操作区"
+);
 
 /* 2) 日期线第一处：首屏按相邻消息插线（前天那页还没进来，所以只有昨天与今天） */
 check("首屏铺了十条气泡", bubbles().length === 10, String(bubbles().length));
@@ -1726,7 +1739,7 @@ check("那一段跑完会话栏还原回桩后端的真列表", rows().length ==
       再右键一次就能取消，重启还在（存 sessions.json） */
 const chatMenuEl = byId("chat-menu");
 // index.html 里这三枚是菜单的子节点；桩不解析 HTML，这里照实挂上（contains 才判得了「点在菜单里」）
-for (const id of ["ctx-chat-pin", "ctx-chat-rename", "ctx-chat-del"]) chatMenuEl.appendChild(byId(id));
+for (const id of ["ctx-chat-pin", "ctx-chat-rename", "ctx-chat-sep", "ctx-chat-del"]) chatMenuEl.appendChild(byId(id));
 // index.html 上带 hidden，桩不读属性，用例自己先盖上
 chatMenuEl.hidden = true;
 
@@ -1847,14 +1860,55 @@ check(
 );
 world.hidden = world.hidden.filter((x) => x !== "TMP");
 
-// 「未标记」那行不是一台真设备：菜单没有着落，只把系统菜单挡掉
+// 「未标记」那行不是一台真设备，但那一行确实得能删：它装的全是没记对端的老消息，
+// 用户要的是「这一筐不看了」。以前右键只弹一句「只能查看」、行内也没按钮，删也删不掉
+// （Win 那台报的就是这条：一个对话显示未标记，删除也删除不了）
 const unmarkedRow = rows().find((r) => r.dataset.id === "");
 const blockedUnmarked = rightClick(unmarkedRow);
 check(
-  "未标记行右键：挡住系统菜单、不弹置顶菜单，只说明这一行只能看",
-  blockedUnmarked === true && chatMenuEl.hidden === true && /只能查看/.test(byId("st-msg").textContent),
-  `blocked=${blockedUnmarked} hidden=${chatMenuEl.hidden} st="${byId("st-msg").textContent}"`
+  "未标记行右键也会弹菜单，只是只剩删除一项（置顶/改名/隔断都藏起来）",
+  blockedUnmarked === true &&
+    chatMenuEl.hidden === false &&
+    byId("ctx-chat-pin").hidden === true &&
+    byId("ctx-chat-rename").hidden === true &&
+    byId("ctx-chat-sep").hidden === true &&
+    byId("ctx-chat-del").textContent === "删除这些消息",
+  `blocked=${blockedUnmarked} hidden=${chatMenuEl.hidden} pin=${byId("ctx-chat-pin").hidden} rename=${byId("ctx-chat-rename").hidden} sep=${byId("ctx-chat-sep").hidden} del="${byId("ctx-chat-del").textContent}"`
 );
+// 那三项是每次打开时重算的，不是一次性状态：普通行再右键要全部回来
+rightClick(rowOf("A"));
+check(
+  "普通行再右键：置顶/改名/隔断都回来，删除文案也回「删除聊天」",
+  !byId("ctx-chat-pin").hidden &&
+    !byId("ctx-chat-rename").hidden &&
+    !byId("ctx-chat-sep").hidden &&
+    byId("ctx-chat-del").textContent === "删除聊天",
+  `pin=${byId("ctx-chat-pin").hidden} rename=${byId("ctx-chat-rename").hidden} sep=${byId("ctx-chat-sep").hidden} del="${byId("ctx-chat-del").textContent}"`
+);
+const sinceUnmarked = calls.length;
+rightClick(unmarkedRow);
+click(byId("ctx-chat-del"));
+await settle();
+check(
+  "未标记行第一下也只是臂上（文案变成「再点一次删除」，还没调命令）",
+  byId("ctx-chat-del").textContent === "再点一次删除" && takeCalls("session_delete", sinceUnmarked).length === 0,
+  byId("ctx-chat-del").textContent
+);
+click(byId("ctx-chat-del"));
+await settle();
+check(
+  "第二下真删：session_delete 的 id 是空串（后端记进 hidden 里的那个值）",
+  takeCalls("session_delete", sinceUnmarked).some(([, a]) => a.id === ""),
+  JSON.stringify(takeCalls("session_delete", sinceUnmarked))
+);
+check(
+  "删完这一行从会话栏消失，焦点自己落到还剩的那个框上",
+  !rows().some((r) => r.dataset.id === "") && rows().some((r) => r.classSet.has("is-active")) &&
+    lastCall("msg_history")?.session !== "",
+  `${rows().map((r) => r.dataset.id).join(",")} | ${lastCall("msg_history")?.session}`
+);
+// 还原：后面的用例还要用「未标记」那一行
+world.hidden = world.hidden.filter((x) => x !== "");
 
 // 静态合约：菜单三项是中文、没有英文原生项；前后端各自的入口都在
 const html = readFileSync(join(here, "..", "js", "index.html"), "utf8");
@@ -1875,6 +1929,17 @@ check(
 check(
   "右键入口挂在会话行上，不是全局 contextmenu",
   /row\.addEventListener\("contextmenu"[\s\S]{0,400}?openChatMenu\(ev, s, row\)/.test(xferJs),
+  ""
+);
+const css = readFileSync(join(here, "..", "js", "style.css"), "utf8");
+check(
+  "未标记行删得掉（后端）：remove_session 先看历史里有没有这个 sid，不再拿会话表当唯一依据",
+  /pub fn remove_session[\s\S]{0,1400}?m\.sid_of\(\) == id/.test(rustNet) &&
+    !/let before = g\.sessions\.len\(\)/.test(rustNet)
+);
+check(
+  "菜单项给了 hidden 也得真消失：自定义 display:block 会盖掉 UA 那条",
+  /\.ctx-menu > \[hidden\]\s*\{\s*display:\s*none;/.test(css),
   ""
 );
 check(

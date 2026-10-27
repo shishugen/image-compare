@@ -79,6 +79,7 @@ const ui = {
   chatMenu: el("chat-menu"),
   chatPin: el("ctx-chat-pin"),
   chatRename: el("ctx-chat-rename"),
+  chatSep: el("ctx-chat-sep"),
   chatDel: el("ctx-chat-del"),
   // 聊天气泡里图片的右键菜单（与对比视图同批命令，中文）
   chatImgMenu: el("chat-img-menu"),
@@ -470,6 +471,11 @@ const railMenu = { row: null, s: null, armed: false };
 /** 「删除聊天」臂上之后没人点，几秒得自己退回去 */
 let railArmTimer = 0;
 
+/** 「删除」这一项在两种行上的文案：「未标记」删的是一格筐里的老消息，不是一台设备 */
+function delLabel(s) {
+  return s && s.peer === UNMARKED ? "删除这些消息" : "删除聊天";
+}
+
 function closeChatMenu() {
   if (!ui.chatMenu || ui.chatMenu.hidden) return;
   ui.chatMenu.hidden = true;
@@ -508,9 +514,17 @@ function openChatMenu(ev, s, row) {
   railMenu.row = row;
   railMenu.s = s;
   railMenu.armed = false;
-  // 文案跟当前状态走：已经置顶过的，第一项就是「取消置顶」
-  if (ui.chatPin) ui.chatPin.textContent = s.pinned ? "取消置顶" : "置顶该聊天";
-  if (ui.chatDel) ui.chatDel.textContent = "删除聊天";
+  // 「未标记」不是一台真设备：置顶与改名都没有落点，这两项连同隔断一起藏起来，只留删除。
+  // 以前这一行右键只弹一句「只能查看」——用户看到的就是「删也删不了」
+  const unmarked = s.peer === UNMARKED;
+  if (ui.chatPin) {
+    ui.chatPin.hidden = unmarked;
+    // 文案跟当前状态走：已经置顶过的，第一项就是「取消置顶」
+    ui.chatPin.textContent = s.pinned ? "取消置顶" : "置顶该聊天";
+  }
+  if (ui.chatRename) ui.chatRename.hidden = unmarked;
+  if (ui.chatSep) ui.chatSep.hidden = unmarked;
+  if (ui.chatDel) ui.chatDel.textContent = delLabel(s);
   placeMenuAt(ui.chatMenu, ev);
 }
 
@@ -615,9 +629,11 @@ if (ui.chatDel) {
       railMenu.armed = true;
       ui.chatDel.textContent = "再点一次删除";
       clearTimeout(railArmTimer);
+      // 超时退回时得退回「这一行自己的文案」：未标记那一行本来就不叫「删除聊天」
+      const back = delLabel(s);
       railArmTimer = setTimeout(() => {
         railMenu.armed = false;
-        if (ui.chatDel) ui.chatDel.textContent = "删除聊天";
+        if (ui.chatDel) ui.chatDel.textContent = back;
       }, 4000);
       return;
     }
@@ -685,7 +701,7 @@ function sessionNode(s) {
   row.dataset.id = s.id;
   row.dataset.peer = s.peer;
   row.title = unmarked
-    ? "老历史里没记对端的那些消息，只用来查看"
+    ? "老历史里没记对端的那些消息，只用来查看；右键或行内那枚都能把这一行删掉"
     : s.bound
       ? `${s.host}:${s.port}`
       : "这台还没添加，只能查看历史";
@@ -703,27 +719,30 @@ function sessionNode(s) {
     b.textContent = s.unread > 99 ? "99+" : String(s.unread);
     row.appendChild(b);
   }
+  // 行上只放「改名」与「删除」两个：会话栏只有 214px，按钮一多名字就被挤没；
+  // 再开一个框走「＋ 新聊天」里点那台，解绑走「配对设置」的「解绑当前对端」。
+  // 「未标记」没有名字可改（它就是一个筐），但删除必须给 —— 以前这一行一个按钮都不给，
+  // 用户看到的就是「删也删不了」（Win 那台报的就是这条）
+  const acts = document.createElement("div");
+  acts.className = "s-acts";
   if (!unmarked) {
-    // 「未标记」不是一台真设备：既没有读指针可删，也没有行上操作可给。
-    // 这一行只放「改名」与「删除」两个：会话栏只有 214px，按钮一多名字就被挤没；
-    // 再开一个框走「＋ 新聊天」里点那台，解绑走「配对设置」的「解绑当前对端」
-    const acts = document.createElement("div");
-    acts.className = "s-acts";
     acts.appendChild(railBtn("改名", () => startRename(s, row), true, "只改本机看到的这个名字，不会传给对端"));
-    acts.appendChild(railBtn("删除", (btn) => armRailDelete(btn, s), true, "只删这个对话框（要点两下确认），聊天历史与收件箱文件都不动"));
-    row.appendChild(acts);
   }
+  acts.appendChild(
+    railBtn(
+      "删除",
+      (btn) => armRailDelete(btn, s),
+      true,
+      unmarked
+        ? "把这些没记对端的老消息从列表里拿掉（要点两下确认），消息文件本身不动"
+        : "只删这个对话框（要点两下确认），聊天历史与收件箱文件都不动"
+    )
+  );
+  row.appendChild(acts);
   row.addEventListener("click", () => openSession(s.id));
   // 右键换成自己的中文菜单（系统那套是 Reload / Inspect Element）。
-  // 「未标记」不是一台真设备：改名/置顶/删除都没有着落，只把系统菜单挡掉
-  row.addEventListener("contextmenu", (ev) => {
-    if (unmarked) {
-      if (ev.preventDefault) ev.preventDefault();
-      toast("这一行是老历史里没记对端的消息，只能查看");
-      return;
-    }
-    openChatMenu(ev, s, row);
-  });
+  // 「未标记」也能删：菜单里只留删除一项，置顶与改名对它没有意义
+  row.addEventListener("contextmenu", (ev) => openChatMenu(ev, s, row));
   return row;
 }
 
@@ -844,9 +863,15 @@ function armRailDelete(btn, s) {
 
 async function removeOne(s) {
   const wasCur = s.id === state.cur;
+  // 「未标记」不在会话表里，后端记进 hidden 就够：消息文件本身一行不动
+  const unmarked = s.peer === UNMARKED;
   try {
     applySessions(await invoke("session_delete", { id: s.id }));
-    toast("已删除会话，聊天记录与收到的文件都还在");
+    toast(
+      unmarked
+        ? "已删掉「未标记」这一行：消息文件还在，只是不再显示"
+        : "已删除会话，聊天记录与收到的文件都还在"
+    );
   } catch (err) {
     toast(errText(err), "error");
     return;
