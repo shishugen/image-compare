@@ -63,6 +63,26 @@ async fn pick_images(app: tauri::AppHandle) -> Result<Vec<String>, String> {
     Ok(paths)
 }
 
+/// 把主窗钉在所有应用之上（对比时一边看本机的图、一边看别处发来的东西）。
+///
+/// 为什么走 Rust 而不让前端直调 `getCurrentWindow().setAlwaysOnTop()`：那条得往
+/// capabilities 里补一条 `core:window:allow-set-always-on-top`（实测 `core:window:default`
+/// 那 28 条**全是只读 getter**，一个动作都不带），漏掉的表现是按钮亮着而窗没置顶；
+/// 而这个项目里前端本来就只调自己的命令，注册成命令既不加权限，node 桩里也才断得到。
+///
+/// 不持久化：每次启动都是普通窗。置顶是挡人的状态，「上次忘了关」如果跨重启还在，
+/// 比当场关掉难查得多 —— 没人会想到去设置里找一枚按钮是不是亮着。
+///
+/// 返回值就是落地后的状态：前端照它设按钮高亮，不自己先翻再指望命令一定成功。
+#[tauri::command]
+fn set_always_on_top(app: tauri::AppHandle, on: bool) -> Result<bool, String> {
+    let w = app
+        .get_webview_window("main")
+        .ok_or_else(|| "主窗口已经不在了".to_string())?;
+    w.set_always_on_top(on).map_err(|e| e.to_string())?;
+    Ok(on)
+}
+
 /// 读图片字节（拖拽进窗口的原生路径与对话框选中的路径都走这里），返回 base64 data URL + 元信息
 #[tauri::command]
 async fn read_image(path: String) -> Result<ImagePayload, String> {
@@ -308,6 +328,7 @@ pub fn run() {
             list_folder_images,
             take_pending_paths,
             copy_text,
+            set_always_on_top,
             clip::paste_paths,
             clip::copy_as_file,
             net::net_status,

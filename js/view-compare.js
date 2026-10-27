@@ -43,6 +43,8 @@ const ui = {
   stage: el("stage"),
   // 田字查看（把这一张图原样铺成 2×2，看十字处的接缝）
   btnTile: el("btn-tile"),
+  // 窗口置顶（只这一次运行有效，不存盘）
+  btnTopmost: el("btn-topmost"),
   tvRoot: el("cmp-tileview"),
   tvCanvas: el("tv-canvas"),
   tvZoom: el("tv-zoom"),
@@ -1964,6 +1966,33 @@ el("btn-clear").addEventListener("click", () => {
 document.querySelectorAll(".tag-close").forEach((btn) => {
   btn.addEventListener("click", () => panes[btn.dataset.close].clear());
 });
+
+/* ------------------------------- 窗口置顶 ------------------------------- */
+// 置顶是窗口级属性，跟看哪张图、哪个布局都没关系，所以这里一份状态就够；
+// 也不写 prefs.json —— 每次启动都从普通窗开始。置顶是挡人的状态，
+// 「上次忘了关」如果跨重启还留着，比当场发现更难查（没人会去设置里找一枚按钮亮没亮）。
+//
+// 高亮以命令回来的值为准，不以「点之前的值取反」为准：Rust 那边拿不到窗、
+// 或者 set_always_on_top 报错时，按钮绝不能亮着而窗其实没置顶。
+let pinned = false;
+
+function applyPinned(on) {
+  pinned = !!on;
+  ui.btnTopmost?.classList.toggle("is-active", pinned);
+}
+
+if (ui.btnTopmost) {
+  ui.btnTopmost.addEventListener("click", async () => {
+    try {
+      // 非 Tauri 环境（直接在浏览器里打开 js/index.html 调试）下 invoke 会抛，
+      // 落到下面那句提示里 —— 那里没有可钉的窗，说一声比默默亮着诚实
+      applyPinned(await invoke("set_always_on_top", { on: !pinned }));
+    } catch (err) {
+      console.error("[pin] 置顶没生效:", err);
+      setStatus("置顶没生效: " + errText(err));
+    }
+  });
+}
 
 /* ------------------------------- 分隔条拖动 ------------------------------- */
 (() => {

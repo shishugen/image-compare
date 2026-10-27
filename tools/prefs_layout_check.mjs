@@ -342,6 +342,11 @@ const extOf = (name) => {
 const isImageExt = (name) => IMAGE_EXTS.includes(extOf(name));
 const enc = (p) => "data:image/png;base64," + Buffer.from(p).toString("base64");
 
+// 窗口置顶的桩态：把「窗到底置顶了没」也存一份，断言才能查「按钮亮的是命令回来的值」
+// 而不是「点之前的取反」；stubPinThrows 一置就照实报错，验失败那一面。
+let stubWinPinned = false;
+let stubPinThrows = false;
+
 async function invokeStub(cmd, args) {
   // 右键菜单要验「点哪一项就走哪条命令、带的是哪张图」，所以每条都留一份
   calls.cmd.push({ cmd, args: args || {} });
@@ -369,6 +374,12 @@ async function invokeStub(cmd, args) {
     // 右键菜单的「另存为」：桩里直接回一个落点，验的是「点了就走这条路、提示里带上落点」
     case "save_path_as":
       return "/tmp/另存为/" + String(args.src || "").split("/").pop();
+    // 置顶：与 Rust 同构 —— 先改窗状态再把落地后的值回给前端（报错时什么都不改）
+    case "set_always_on_top": {
+      if (stubPinThrows) throw new Error("主窗口已经不在了（桩里造的）");
+      stubWinPinned = !!args?.on;
+      return stubWinPinned;
+    }
     // 侧栏现在默认列「最近看过」：这三条得能应，不然 invoke 就抛「命令不存在」。
     // 这里固定回一份空历史：本文件验的是布局/同步/分隔条，不是历史源那条路（那在
     // tools/folder_browse_check.mjs 第 18 节），下面进门就先切到目录源
@@ -697,6 +708,55 @@ check("点抽屉里的「收起」：抽屉关上、高亮一起灭", !isOpen() 
 click(byId("btn-cmp-settings"));
 key("escape");
 check("Esc 收抽屉走同一个入口（高亮一起灭）", !isOpen() && !isBtnActive());
+
+/* ===================== 8.6) 窗口置顶：高亮只认命令回来的值，而且一个字不写盘 ===================== */
+const pinBtn = () => byId("btn-topmost");
+const pinCalls = () => calls.cmd.filter((c) => c.cmd === "set_always_on_top");
+const setPrefsCount = () => calls.cmd.filter((c) => c.cmd === "set_prefs").length;
+const pinOn = () => pinBtn().classSet.has("is-active");
+check(
+  "出厂不亮：窗是普通窗，按钮也是（一启动就亮着等于骗人）",
+  !pinOn() && !stubWinPinned
+);
+const setPrefs0 = setPrefsCount();
+click(pinBtn());
+await settle(2);
+check(
+  "点一下：走 set_always_on_top 且参数 on:true（只调一次）",
+  pinCalls().length === 1 && pinCalls()[0].args.on === true,
+  JSON.stringify(pinCalls())
+);
+check("桩里的窗真置顶了，按钮才亮", stubWinPinned && pinOn());
+click(pinBtn());
+await settle(2);
+check(
+  "再点取消：on:false、窗灭了、按钮也跟着灭（两个方向都查）",
+  pinCalls().length === 2 && pinCalls()[1].args.on === false && !stubWinPinned && !pinOn()
+);
+// 失败那一面：Rust 那边拿不到窗时，按钮绝不能先亮起来
+stubPinThrows = true;
+click(pinBtn());
+await settle(2);
+check(
+  "命令报错时按钮不亮：不做乐观翻转（亮着而窗没置顶是最难查的不一致）",
+  !stubWinPinned && !pinOn()
+);
+check(
+  "报错要说在状态栏里（置顶没生效 + 原因），不能只进 console",
+  /置顶没生效/.test(statusText()),
+  statusText()
+);
+stubPinThrows = false;
+click(pinBtn());
+await settle(2);
+check("恢复后还能再开（报错那次没把状态锁住）", stubWinPinned && pinOn());
+click(pinBtn());
+await settle(2);
+check(
+  "置顶这一路不写 prefs.json：整个来回 set_prefs 一次也没调过（重启回普通窗是存心的）",
+  setPrefsCount() === setPrefs0,
+  `多写了 ${setPrefsCount() - setPrefs0} 次`
+);
 
 /* ===================== 9) CSS / HTML 合约：三态显隐写得对不对 ===================== */
 const css = readFileSync(join(here, "..", "js", "style.css"), "utf8");
@@ -2385,6 +2445,47 @@ check(
     !drawerToggleBody.includes("refreshStorage();") &&
     !/setInterval\([\s\S]{0,120}?refreshStorage/.test(xferJs) &&
     /if \(ui\.btnStorageRefresh\) ui\.btnStorageRefresh\.addEventListener\("click", refreshStorage\)/.test(xferJs)
+);
+
+/* ================= 窗口置顶那几处「只在真运行时爆」的合约 ================= */
+// 挑这几条的理由：置顶不读盘、不写盘、没任何中间产物，验证不了只能靠合约前移。
+const capJson = JSON.parse(
+  readFileSync(join(here, "..", "src-tauri", "capabilities", "default.json"), "utf8")
+);
+const handlerBlock = (libRs.match(/generate_handler!\[([\s\S]*?)\]/) || [, ""])[1];
+check(
+  "置顶三段都在：命令层 fn set_always_on_top → generate_handler 注册 → 前端 invoke（漏注册只会在真运行时炸「command not found」，桩里全绿）",
+  /fn set_always_on_top\(app: tauri::AppHandle, on: bool\)/.test(libRs) &&
+    handlerBlock.includes("set_always_on_top,") &&
+    cmpJs.includes('invoke("set_always_on_top"')
+);
+// 前端直调窗 API 与那条 ACL 权限必须同生同死：只有两种合法组合。
+// 单判「现在没直调」会把后来改用直调那一步默放，到真机上才看出按钮亮着窗没动。
+const jsDirectPin = /setAlwaysOnTop\(/.test(cmpJs);
+const aclPin = capJson.permissions.includes("core:window:allow-set-always-on-top");
+check(
+  "置顶只有两种组合：走自己的命令（不需权限，现状），或前端直调且 capabilities 补上 core:window:allow-set-always-on-top",
+  jsDirectPin === aclPin,
+  `直调=${jsDirectPin} 权限=${aclPin}`
+);
+check(
+  "置顶按钮 id 全局只出现一次、JS 那头取到了它，而且出厂不带 is-active（HTML 里就亮着 = 一启动就骗人）",
+  (html.match(/id="btn-topmost"/g) || []).length === 1 &&
+    cmpJs.includes('el("btn-topmost")') &&
+    !/id="btn-topmost"[^>]*is-active/.test(html)
+);
+check(
+  "高亮走全站那套 is-active（.btn-toggle.is-active 在 style.css 里），不另发明 is-on",
+  /ui\.btnTopmost\?\.classList\.toggle\("is-active", pinned\)/.test(cmpJs) &&
+    css.includes(".btn-toggle.is-active")
+);
+// 存盘与启动应用必须同时存在：只写盘不改窗，就是「磁盘说置顶、窗是普通窗」那套不一致
+const persistedPin = /pub (pin|topmost|always_on_top)\s*:\s*bool/.test(storeRs + prefsRs);
+const pinCallSites = (libRs.match(/\.set_always_on_top\(/g) || []).length;
+check(
+  "置顶要么根本不存盘（现状：每次启动普通窗），要么存了就得有两处应用点（命令层 + 启动读盘）",
+  !persistedPin || pinCallSites >= 2,
+  `存盘=${persistedPin} 应用点=${pinCallSites}`
 );
 
 console.log(`\n合计 PASS=${passed} FAIL=${failed}`);
