@@ -92,6 +92,33 @@ fn answer(
         .map_err(|e| format!("回复 {status} 失败: {e}"))
 }
 
+/// 限量读完 body：/msg 与 /recall 都是「先把 JSON 收完才能算签名」。
+/// 返回 (内容, 是否超限) —— 超限那一条也得把后面的字节吃干，否则残体会
+/// 当成下一个请求的开头读，把这条连接上的后续请求串坏
+fn read_bounded(req: &mut tiny_http::Request) -> Result<(Vec<u8>, bool), String> {
+    let mut body: Vec<u8> = Vec::new();
+    let mut oversize = false;
+    let mut buf = [0u8; 16 * 1024];
+    let reader = req.as_reader();
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .map_err(|e| format!("读取消息体失败: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        if oversize {
+            continue; // 已超限，只负责把后面的字节吃干
+        }
+        if body.len() as u64 + n as u64 > MAX_BODY_BYTES {
+            oversize = true;
+            continue;
+        }
+        body.extend_from_slice(&buf[..n]);
+    }
+    Ok((body, oversize))
+}
+
 fn handle(hub: Arc<Hub>, mut req: tiny_http::Request) -> Result<(), String> {
     let path = req.url().split('?').next().unwrap_or("/").to_string();
     let method = req.method().as_str().to_string();
@@ -147,31 +174,8 @@ fn handle(hub: Arc<Hub>, mut req: tiny_http::Request) -> Result<(), String> {
             answer(req, 200, &body)
         }
         ("POST", "/msg") => {
-            // as_reader 返回 &mut dyn Read（没有 by_ref/take），所以手动限量读；
-            // 这个块只负责把 body 收完，借用结束后才能把 req 交给 answer
-            let mut body: Vec<u8> = Vec::new();
-            let mut oversize = false;
-            {
-                let mut buf = [0u8; 16 * 1024];
-                let reader = req.as_reader();
-                loop {
-                    let n = reader
-                        .read(&mut buf)
-                        .map_err(|e| format!("读取消息体失败: {e}"))?;
-                    if n == 0 {
-                        break;
-                    }
-                    if oversize {
-                        continue; // 已超限，只负责把后面的字节吃干
-                    }
-                    if body.len() as u64 + n as u64 > MAX_BODY_BYTES {
-                        oversize = true;
-                        continue;
-                    }
-                    body.extend_from_slice(&buf[..n]);
-                }
-            }
             // 签名基于请求体，必须在读完后才算
+            let (body, oversize) = read_bounded(&mut req)?;
             let digest = store::sha256_hex(&body);
             if !store::verify_sig(&device.passphrase, &from.dev_id, ts, &digest, &sig) {
                 return answer(
@@ -199,6 +203,30 @@ fn handle(hub: Arc<Hub>, mut req: tiny_http::Request) -> Result<(), String> {
             }
         }
         ("PUT", "/file") => handle_file(hub, req, &device, &hs, &from, ts, &sig),
+        // 对方要撤回它发过来的那一条。靠的仍是请求体签名 + X-Device，
+        // 只有这条的发送者本人能撤（发起方设备 ID 在签名里，伪造过不了 verify_sig）
+        ("POST", "/recall") => {
+            let (body, oversize) = read_bounded(&mut req)?;
+            let digest = store::sha256_hex(&body);
+            if !store::verify_sig(&device.passphrase, &from.dev_id, ts, &digest, &sig) {
+                return answer(
+                    req,
+                    403,
+                    &serde_json::json!({ "ok": false, "error": "签名校验失败" }),
+                );
+            }
+            if oversize {
+                return answer(
+                    req,
+                    413,
+                    &serde_json::json!({ "ok": false, "error": "撤回请求超过 1MB 上限" }),
+                );
+            }
+            match handle_recall(&hub, &body, &from) {
+                Ok(()) => answer(req, 200, &serde_json::json!({ "ok": true })),
+                Err(e) => answer(req, 403, &serde_json::json!({ "ok": false, "error": e })),
+            }
+        }
         _ => answer(
             req,
             404,
@@ -261,6 +289,40 @@ fn handle_text(hub: &Arc<Hub>, body: &[u8], from: &Sender) -> Result<Message, St
         .append_message(&msg)
         .map_err(|e| format!("落库失败: {e}"))?;
     Ok(msg)
+}
+
+/// 撤回落到本机这一份：只改「这一条怎么显示」，收件箱里那个文件一动不动
+///（文件可能早就被人打开过，删它风险远大于收益）
+fn handle_recall(hub: &Arc<Hub>, body: &[u8], from: &Sender) -> Result<(), String> {
+    #[derive(serde::Deserialize)]
+    struct InRecall {
+        msg_id: String,
+    }
+    let parsed: InRecall =
+        serde_json::from_slice(body).map_err(|e| format!("撤回请求体不是合法 JSON: {e}"))?;
+    // 找不到就当它已经不在了：本机删过那一条、或那条本来就不是发给本机的。
+    // 撤回的目的就是让对方不再显示它，而这里已经不显示 —— 回失败反倒让发起方
+    // 以为撤不掉（它的原文还挂着气泡）
+    let Some(m) = hub.store.raw_message(&parsed.msg_id) else {
+        eprintln!("[net] 撤回请求找不到消息 {}", parsed.msg_id);
+        return Ok(());
+    };
+    if m.hidden {
+        return Ok(()); // 本机已经把它删了，不必再追一行、更不该把它画回来
+    }
+    if m.dir != "in" {
+        return Err("这条不是发给本机的，撤不了".into());
+    }
+    // 谁发的才能撤谁的那一条：拿签名里的设备 ID 比，不看请求体（body 里没有身份字段）
+    if m.peer != from.dev_id {
+        return Err("撤回请求的发起方不是这条的发送者".into());
+    }
+    if m.recalled {
+        return Ok(()); // 幂等：重推不该把同一行历史越写越长
+    }
+    let done = hub.store.patch_flags(&parsed.msg_id, |x| x.recalled = true)?;
+    hub.emit("msg-updated", serde_json::json!({ "message": done }));
+    Ok(())
 }
 
 fn handle_file(

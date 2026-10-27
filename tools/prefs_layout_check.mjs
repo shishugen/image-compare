@@ -1507,6 +1507,41 @@ check(
       xferJs,
     )
 );
+
+/* ---------------------------- 在线探测：心跳节拍 ----------------------------
+   这一项跳不过假 DOM：真正吃它的只有心跳那个后台线程，而它不在页面里。不盖到的那些
+   （改完下一拍就生效、白名单外的脏值不致于把线程变成空转）由 store.rs 的
+   「心跳节拍往返与白名单外的值退回出厂档」单测盖；这里只钉四个文件之间的接线 */
+const clientRs = readFileSync(join(here, "..", "src-tauri", "src", "net", "client.rs"), "utf8");
+check(
+  "心跳节拍的白名单只有一份：store.rs 定义 + normalize 退出厂 + set_prefs 硬拒（交给 normalize 静默改，下拉会停在一个没生效的档位上）",
+  /pub const HEARTBEAT_OPTIONS: \[u64; 4\] = \[1000, 2000, 5000, 10000\];/.test(storeRs) &&
+    /if !HEARTBEAT_OPTIONS\.contains\(&self\.heartbeat_ms\) \{\s*self\.heartbeat_ms = HEARTBEAT_DEFAULT;/.test(storeRs) &&
+    /if !HEARTBEAT_OPTIONS\.contains\(&h\) \{\s*return Err/.test(prefsRs)
+);
+check(
+  "心跳线程真的每拍从磁盘重读节拍（不重启就生效），且那份写死的常量已经拆掉：两处 sleep 都用 beat，口令为空那条早退分支不能除外",
+  /let beat = hub\.store\.load_prefs\(\)\.heartbeat_ms;/.test(clientRs) &&
+    !/const HEARTBEAT_MS/.test(clientRs) &&
+    (clientRs.match(/Duration::from_millis\(beat\)/g) || []).length === 2 &&
+    !/Duration::from_millis\(HEARTBEAT_MS\)/.test(clientRs)
+);
+check(
+  "下拉那四档与 Rust 白名单同口径（多一档就会存一个被硬拒的值），读的键是 heartbeat_ms、传的键是 heartbeatMs：两边写反一个就永远对不上",
+  ["1000", "2000", "5000", "10000"].every((v) => html.includes(`<option value="${v}">`)) &&
+    html.includes('id="inp-heartbeat"') &&
+    /const HEARTBEAT_NAME = \{\s*1000: "1 秒",\s*2000: "2 秒",\s*5000: "5 秒",\s*10000: "10 秒",\s*\};/.test(xferJs) &&
+    /typeof p\.heartbeat_ms === "number"\) paintHeartbeat\(p\.heartbeat_ms\)/.test(xferJs) &&
+    /saveRecvPrefs\(\s*\{ heartbeatMs: next \}/.test(xferJs) &&
+    !/invoke\("set_prefs"[\s\S]{0,80}?heartbeat_ms/.test(xferJs)
+);
+check(
+  "存不上就把下拉退回原那一档，且提示里算得出「判离线要几秒」（3 拍那个口径只在 Rust 里，前端得跟着 OFFLINE_THRESHOLD 同名常量走）",
+  /if \(ok\) paintHeartbeat\(next\);\s*else paintHeartbeat\(prev\);/.test(xferJs) &&
+    /const OFFLINE_BEATS = 3;/.test(xferJs) &&
+    /const OFFLINE_THRESHOLD: u32 = 3;/.test(clientRs) &&
+    /next \* OFFLINE_BEATS/.test(xferJs)
+);
 check(
   "抽屉里那条「新收到的文件落在 …」是本地日期拼出来的真路径（day/month 两档与 Rust 同一口径），不是写死的示例；路径长了能折行，不能把抽屉撑宽",
   /function localDateStamp\(layout\) \{[\s\S]{0,400}?if \(layout === "month"\) return ym;[\s\S]{0,200}?if \(layout === "day"\) return/.test(
@@ -1844,8 +1879,8 @@ check(
     /id="ctx-copy-img"[^>]*>复制图片</.test(html) &&
     /id="ctx-copy-path"[^>]*>复制文件路径</.test(html) &&
     /id="ctx-reveal"[^>]*>在文件夹中显示</.test(html) &&
-    // 只看菜单本体（html）：js 的注释里写明了原生那套叫什么，那不是文案
-    !/Open Image|Copy Image|Copy Subject|Look Up|Inspect Element/.test(html)
+    // 只看菜单本体（html）：js 与 html 注释里都写明了原生那套叫什么，那不是文案
+    !/Open Image|Copy Image|Copy Subject|Look Up|Inspect Element/.test(html.replace(/<!--[\s\S]*?-->/g, ""))
 );
 check(
   "「发送到聊天」先登记投递再去切视图（顺序反了就是切过去没东西可发）",
@@ -1867,6 +1902,125 @@ check(
 check(
   "点外面关闭走 window 的 pointerdown + contains 判归属（用 click 的话按住拖出去再松手会漏；不判 contains 会把菜单里自己的点击也当成外面）",
   /window\.addEventListener\("pointerdown"[\s\S]{0,300}?imgMenu\.contains/.test(cmpJs)
+);
+
+/* ------------------------- 撤回与本机删除（静态合约） -------------------------
+   这一整块只能静态钉：时间窗要真等一分钟、对端要真两台机器，桩里既跑不到也等不起。
+   而最容易坏恰恰是「两边各写一份」的那几处 —— 常量、文案、路由、命令注册，
+   改一处漏另一处不会报错，只会让用户看到一句对不上的提示或「撤回失败」 */
+const recallWinRust = /pub const RECALL_WINDOW_MS: i64 = ([\d_]+);/.exec(storeRs);
+const recallWinJs = /const RECALL_MS = (\d+);/.exec(xferJs);
+check(
+  "「一分钟」这个数两边相等：Rust 的 RECALL_WINDOW_MS 与前端的 RECALL_MS（前端那个只管入口露不露，真判据在 recall_check）",
+  !!recallWinRust &&
+    !!recallWinJs &&
+    Number(recallWinRust[1].replace(/_/g, "")) === Number(recallWinJs[1]) &&
+    /if now - m\.ts >= RECALL_WINDOW_MS/.test(storeRs)
+);
+check(
+  "recall_check 三条否决齐：不是自己发的、已经撤过、过了窗口（少一条就会出现「撤过的还能再撤一次」，或对方发来的也能被本机撤走）",
+  /pub fn recall_check\(m: &Message, now: i64\) -> Result<\(\), String> \{/.test(storeRs) &&
+    /if m\.dir != "out"/.test(storeRs) &&
+    /if m\.recalled \{/.test(storeRs) &&
+    /Err\("超过 1 分钟就不能撤回了"/.test(storeRs)
+);
+check(
+  "撤回与本机删除都只是「同 id 再追一行」：patch_flags 在场、read_messages 出口把 hidden 挡掉、待发队列同时避开两个标记",
+  /pub fn patch_flags\(\s*&self,\s*id: &str,\s*patch: impl FnOnce\(&mut Message\)/.test(storeRs) &&
+    /\.filter\(\|m\| !m\.hidden\)/.test(storeRs) &&
+    /m\.state == "queued" && !m\.recalled && !m\.hidden/.test(storeRs)
+);
+check(
+  "两个命令都进了 generate_handler（少注册一个，前端 invoke 只拿到「command not found」，而桩里那套是全绿的）",
+  /net::msg_recall,/.test(libRs) &&
+    /net::msg_delete,/.test(libRs) &&
+    /pub async fn msg_recall\(/.test(netMod) &&
+    /pub fn msg_delete\(/.test(netMod) &&
+    /invoke\("msg_recall"/.test(xferJs) &&
+    /invoke\("msg_delete"/.test(xferJs)
+);
+const recallFnRs = (/pub fn recall\([\s\S]*?\n\}/.exec(clientRs) || [""])[0];
+check(
+  "/recall 两端都有且方向对：client.rs 发这个路由，server.rs 认这个路由（只改一边就是「点了撤回对方那头毫无反应」）",
+  clientRs.includes('"/recall"') && serverRs.includes('("POST", "/recall")')
+);
+check(
+  "撤回请求只带签名头、不带 X-Session（带了会话头对端会顺手把「那个框」在本机建出来，撤回不该有这种副作用），且把 404 翻成人话",
+  recallFnRs.includes("signed_headers") &&
+    !recallFnRs.includes("session_headers") &&
+    /resp\.status == 404/.test(recallFnRs)
+);
+check(
+  "对端那侧只让发送者本人撤：handle_recall 既判它必须是收下来的那一条，也拿签名里的设备 ID 比 peer（不比的话任何一台都能撤别人的那一条）",
+  /fn handle_recall\(/.test(serverRs) &&
+    /if m\.dir != "in"/.test(serverRs) &&
+    /if m\.peer != from\.dev_id/.test(serverRs) &&
+    /if m\.hidden\s*\{\s*return Ok\(\(\)\);/.test(serverRs)
+);
+check(
+  "状态落库不会把刚撤的那条冲回来：四处状态写入全过 with_flags，with_flags 先读盘上的标记，投成功后还认 recalled 补一刀",
+  (clientRs.match(/super::with_flags\(&hub\.store, msg/g) || []).length === 3 &&
+    /let done = with_flags\(store, msg/.test(netMod) &&
+    /let \(recalled, hidden\) = store\.flags_of\(&msg\.id\);/.test(netMod) &&
+    /if done\.recalled \{/.test(clientRs)
+);
+check(
+  "会话栏那句短文案两边一份：Rust 的 RECALL_SUMMARY 与前端 RECALL_SUMMARY 字符串相等，且摘要与未读两条口径都认 recalled",
+  (/pub\(crate\) const RECALL_SUMMARY: &str = "([^"]+)";/.exec(netMod)?.[1] || "") ===
+    (/const RECALL_SUMMARY = "([^"]+)";/.exec(xferJs)?.[1] || "") &&
+    /if m\.recalled \{\s*RECALL_SUMMARY/.test(netMod) &&
+    /if m\.dir == "in" && !m\.recalled && m\.ts > /.test(netMod) &&
+    /if \(m\.recalled\) return RECALL_SUMMARY;/.test(xferJs)
+);
+/* 聊天气泡的右键菜单：撤回与本机删除都搬进这一份中文菜单了。
+   为什么要有这条静态合约：这一处「翻译成中文」完全活在页面 + 样式 + 菜单接线里，
+   任何一环丢了 node 自检都还是绿的 —— 漏一项 / 漏一条 [hidden] 规则 / 干脆没拦右键 */
+const msgMenuBlock = (() => {
+  const i = html.indexOf('id="chat-msg-menu"');
+  return i < 0 ? "" : html.slice(i, i + 900);
+})();
+check(
+  "气泡右键菜单是一份中文的：撤回与删除两项都在，且没有一条 WebView 原生菜单那套英文项",
+  msgMenuBlock.length > 0 &&
+    ["复制正文", "复制图片", "另存为…", "复制文件路径", "在文件夹中显示", "在对比中打开", "撤回这一条", "删除（只删本机）"].every(
+      (t) => msgMenuBlock.includes(t)
+    ) &&
+    !/Look Up|Translate|Search with|Copy Link|Share…|Speech|Inspect Element|Open Image|Download Image|Copy Subject/.test(
+      msgMenuBlock
+    ),
+  msgMenuBlock.slice(0, 60)
+);
+check(
+  "整条气泡都拦右键：监听挂在 .msg 外层 wrap 上（不再是「只有图片气泡拦」、「悬停才露一排按钮」那两套旧做法）",
+  /wrap\.addEventListener\("contextmenu", \(ev\) => openMsgMenu\(ev, rec\)\)/.test(xferJs) &&
+    !/bubble\.addEventListener\("contextmenu"/.test(xferJs) &&
+    !/stream\.addEventListener\("contextmenu"/.test(xferJs) &&
+    !xferJs.includes('className = "msg-acts"') &&
+    !cssBare.includes(".msg-acts") &&
+    !/\.msg \{[^}]*position: relative;/.test(css)
+);
+check(
+  "每一项按「这一条是什么」动态显隐：撤回走 recallable、删除永远在；关掉菜单时把「再点一次删除」回写回原文案",
+  /show\(ui\.msgRecall, recallable\(rec, t\.m\)\)/.test(xferJs) &&
+    /show\(ui\.msgDel, true\)/.test(xferJs) &&
+    /ui\.msgDel\.textContent = MSG_DEL_LABEL/.test(xferJs) &&
+    /const MSG_DEL_LABEL = "([^"]+)";/.test(xferJs)
+);
+check(
+  "菜单里的删除要两下：没臂上不真调后端，臂上 4 秒没人点自己退回原文案（右键手一下不该就没了一条消息）",
+  /if \(!msgMenu\.armed\) \{[\s\S]{0,320}?msgArmTimer = setTimeout\([\s\S]{0,240}?\}, 4000\);\s*return;\s*\}/.test(
+    xferJs
+  ) &&
+    /closeMsgMenu\(\);\s*deleteMessage\(rec\)/.test(xferJs)
+);
+check(
+  "菜单项显隐靠 hidden 属性，样式里必须有 .ctx-menu > [hidden]：.ctx-item 是 display:block，光给属性挡不住",
+  /\.ctx-menu > \[hidden\] \{[^}]*display: none;/.test(css) &&
+    /const show = \(node, on\) => \{\s*if \(node\) node\.hidden = !on;/.test(xferJs)
+);
+check(
+  "撤回之后的提示样式还在（菜单搬走之后不能顺手把这一条也删了）",
+  /\.msg\.is-recalled \.bubble \{/.test(css) && /\.msg-recalled \{/.test(css)
 );
 
 console.log(`\n合计 PASS=${passed} FAIL=${failed}`);

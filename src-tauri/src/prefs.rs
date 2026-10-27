@@ -1,11 +1,12 @@
 //! 用户偏好的读写命令：布局（1/2/4 图）、同步开关、滚轮行为，
-//! 以及传输视图的「本机接收」（提示音开关、收件目录、收件目录的摆放）。
+//! 以及传输视图的「本机接收」（提示音开关、收件目录、收件目录的摆放）
+//! 与「在线探测」（心跳节拍）。
 //!
 //! 只有两条命令，因为这份数据很小：前端启动时读一次，之后每次改动整体回写
 //! （`Store::save_prefs` 是原子写，崩了也不会留半截）。每一项都可选：只改布局时
 //! 不会顺手把同步状态重置掉，传输那边改收件目录也不会冲掉对比视图的布局。
 
-use crate::store::{Store, INBOX_LAYOUTS};
+use crate::store::{Store, HEARTBEAT_OPTIONS, INBOX_LAYOUTS};
 use serde_json::Value;
 use std::path::Path;
 use std::sync::Arc;
@@ -51,6 +52,7 @@ pub fn set_prefs(
     notify: Option<bool>,
     inbox: Option<String>,
     inbox_layout: Option<String>,
+    heartbeat_ms: Option<u64>,
 ) -> Result<Value, String> {
     let mut p = store.load_prefs();
     if let Some(l) = layout {
@@ -77,6 +79,14 @@ pub fn set_prefs(
             return Err(format!("未知的收件摆放方式: {l:?}"));
         }
         p.inbox_layout = l;
+    }
+    // 心跳节拍同样只认白名单里那四档（理由见 HEARTBEAT_OPTIONS）。这里必须硬拒而
+    // 不能交给 normalize：静默改掉会让下拉停在一个没生效的档位上
+    if let Some(h) = heartbeat_ms {
+        if !HEARTBEAT_OPTIONS.contains(&h) {
+            return Err(format!("不支持的探测间隔: {h} 毫秒"));
+        }
+        p.heartbeat_ms = h;
     }
     // normalize 会静默把脏值改回默认，这里先显式拦住：设置点了没反应还不出错，
     // 是最难归因的一种失败

@@ -296,7 +296,7 @@
                     id="xfer-input"
                     class="input compose-input"
                     rows="2"
-                    placeholder="写点什么，Enter 发送、Shift+Enter 换行；选好或拖进来的文件先放在上面，点发送才发出去（对方离线也能发，会排队自动补发）"
+                    placeholder="写点什么，Enter 发送、Shift+Enter 换行；选好或拖进来的文件先放在上面，点发送才发出去（对方离线也能发，会排队自动补发）。右键气泡：一分钟以内能撤回自己发的那条，删除只从这台机器拿掉"
                   ></textarea>
                   <button id="btn-xfer-send" class="btn btn-primary" disabled title="把输入框里的文字与待发送区的文件一起发出去；对方离线也会先排队，它上线后自动补发">发送</button>
                 </div>
@@ -363,6 +363,19 @@
                       </select>
                     </label>
                     <p class="hint">新收到的文件落在 <code id="inbox-layout-sample">…</code>。一个文件夹整批发过来时，它是上面这个目录里的一个同名子文件夹；改选项只影响之后收到的，已经收好的不会被搬动。</p>
+
+                    <!-- 在线探测：同样存在 prefs.json、走同一对命令（只传 heartbeatMs，不碰其它字段） -->
+                    <div class="set-sub">在线探测</div>
+                    <label class="field">
+                      <span>探测对端是否在线的间隔</span>
+                      <select id="inp-heartbeat" class="select">
+                        <option value="1000">1 秒</option>
+                        <option value="2000">2 秒</option>
+                        <option value="5000">5 秒</option>
+                        <option value="10000">10 秒</option>
+                      </select>
+                    </label>
+                    <p class="hint">本机每隔这一档 ping 一次已添加的对端：连续 3 次不通才算离线，对方上线也是在这一拍里自动补发排队的消息（最多等一个间隔）。改完下一拍就生效，不用重开；间隔越长越省电、局域网里探得越轻，代价是发现上线与判离线都跟着慢。</p>
 
                     <div class="cand-box" id="xfer-candidates"></div>
 
@@ -533,16 +546,20 @@
       <button class="ctx-item" id="ctx-chat-del" role="menuitem">删除聊天</button>
     </div>
 
-    <!-- 聊天气泡里图片的右键菜单：与对比视图那套同一批中文项、同一批命令，
-         差别只有一项 —— 这里本来就在聊天里，所以没有「发送到聊天」，换成「在对比中打开」。
-         只拦图片：文字气泡里的右键仍是系统的选词与拷贝 -->
-    <div class="ctx-menu" id="chat-img-menu" role="menu" aria-label="图片操作" hidden>
+    <!-- 聊天气泡的右键菜单（中文）：替掉 WebView 那套英文原生菜单（Look Up / Translate /
+         Search with Baidu / Share… / Inspect Element）。每一项按「这一条是什么」动态显隐：
+         文字才给「复制正文」，有本机路径才给文件那几项，图片才给「复制图片」；
+         撤回只给一分钟内自己发出去的那条，删除永远有（只删本机，对方那份不动） -->
+    <div class="ctx-menu" id="chat-msg-menu" role="menu" aria-label="消息操作" hidden>
+      <button class="ctx-item" id="cb-copy-text" role="menuitem">复制正文</button>
       <button class="ctx-item" id="cb-copy-img" role="menuitem">复制图片</button>
       <button class="ctx-item" id="cb-save" role="menuitem">另存为…</button>
       <button class="ctx-item" id="cb-copy-path" role="menuitem">复制文件路径</button>
-      <div class="ctx-sep"></div>
       <button class="ctx-item" id="cb-reveal" role="menuitem">在文件夹中显示</button>
       <button class="ctx-item" id="cb-compare" role="menuitem">在对比中打开</button>
+      <div class="ctx-sep" id="ctx-msg-sep"></div>
+      <button class="ctx-item" id="ctx-msg-recall" role="menuitem">撤回这一条</button>
+      <button class="ctx-item" id="ctx-msg-del" role="menuitem">删除（只删本机）</button>
     </div>
 
     <!-- module 作用域：顶层声明不再落到 window，避免与 Tauri 注入的全局（isTauri 等）撞名 -->

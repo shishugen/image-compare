@@ -314,6 +314,8 @@ pub fn run() {
             net::send_text,
             net::send_paths,
             net::msg_history,
+            net::msg_recall,
+            net::msg_delete,
             net::sessions,
             net::session_create,
             net::session_new,

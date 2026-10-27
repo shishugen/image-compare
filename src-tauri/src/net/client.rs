@@ -15,7 +15,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-const HEARTBEAT_MS: u64 = 1000;
+/// 离线判定要连续失败的拍数（跟着心跳走：3 拍 = 3 秒~30 秒，看用户选的档位）
 const OFFLINE_THRESHOLD: u32 = 3;
 
 #[derive(serde::Deserialize)]
@@ -104,9 +104,13 @@ pub fn spawn_heartbeat(hub: Arc<Hub>) {
             if hub.stop.load(Ordering::Relaxed) {
                 break;
             }
+            // 节拍每拍重读一次：设置里改了间隔不必重启，下一拍就是新节奏。
+            // prefs.json 不到 1KB，比这一拍的 ping 便宜几个数量级（与 inbox_dir 同一口径）。
+            // 白名单外的脏值已经在 normalize 里退回出厂档，这里拿到的总能直接用
+            let beat = hub.store.load_prefs().heartbeat_ms;
             if hub.device_snapshot().passphrase.is_empty() {
                 // 本机还没口令，任何 ping 都只会拿到「无法互认」，不该因此踢掉发现的设备
-                std::thread::sleep(Duration::from_millis(HEARTBEAT_MS));
+                std::thread::sleep(Duration::from_millis(beat));
                 continue;
             }
             let peers = hub.peers_snapshot();
@@ -187,7 +191,7 @@ pub fn spawn_heartbeat(hub: Arc<Hub>) {
             // 待发队列只挂在这一拍上：在线状态就是在这里改的，补发紧接着跑。
             // 不靠「离线转在线」的边沿 —— 重启后头一拍、解绑后头一次探测都会假触发
             hub.spawn_due_flush();
-            std::thread::sleep(Duration::from_millis(HEARTBEAT_MS));
+            std::thread::sleep(Duration::from_millis(beat));
         }
     });
 }
@@ -250,25 +254,31 @@ pub(crate) fn try_send_text(
 /// 投成功：同 ID 再追一行 sent。计数与原因一并清掉，否则下次断线时
 /// 「第 4 次失败」会接在一个已经成功的消息后面往下算
 fn mark_sent(hub: &Arc<Hub>, msg: &Message) -> Message {
-    let done = Message {
-        state: "sent".into(),
-        retry: 0,
-        reason: None,
-        ..msg.clone()
-    };
+    let done = super::with_flags(&hub.store, msg, |m| {
+        m.state = "sent".into();
+        m.retry = 0;
+        m.reason = None;
+    });
     if let Err(e) = hub.store.append_message(&done) {
         eprintln!("[net] 落库送达状态失败: {e}");
     }
     hub.emit("msg-updated", serde_json::json!({ "message": done }));
+    // 投递与撤回撞在一瞬时时才会走到这里：心跳拍读到的是「还没撤」的快照，
+    // 刚投出去用户就把它撤了 —— 对方已经收了原文，不补这一刀它就看不见「已撤回」。
+    // 补发失败也不能把这次投递判成失败（东西确实已经送达了）
+    if done.recalled {
+        if let Some(peer) = hub.peer_by_id(&done.peer) {
+            if let Err(e) = recall(hub, &peer, &done) {
+                eprintln!("[net] 补发撤回通知失败: {e}");
+            }
+        }
+    }
     done
 }
 
 /// 投之前先把气泡标成「传输中」：一条排队几小时的消息不能还在显示「待发」
 fn mark_sending(hub: &Arc<Hub>, msg: &Message) {
-    let t = Message {
-        state: "sending".into(),
-        ..msg.clone()
-    };
+    let t = super::with_flags(&hub.store, msg, |m| m.state = "sending".into());
     let _ = hub.store.append_message(&t);
     hub.emit("msg-updated", serde_json::json!({ "message": t }));
 }
@@ -280,11 +290,10 @@ fn finalize_failed(hub: &Arc<Hub>, msg: &Message, err: String, allow_retry: bool
     if allow_retry {
         super::retry_with(hub, msg, &err, hard);
     } else {
-        let failed = Message {
-            state: "failed".into(),
-            reason: Some(err.clone()),
-            ..msg.clone()
-        };
+        let failed = super::with_flags(&hub.store, msg, |m| {
+            m.state = "failed".into();
+            m.reason = Some(err.clone());
+        });
         let _ = hub.store.append_message(&failed);
         hub.emit("msg-updated", serde_json::json!({ "message": failed }));
     }
@@ -355,6 +364,32 @@ pub(crate) fn flush_session(hub: &Arc<Hub>, sess: &Session, ids: &[String]) {
             eprintln!("[net] 补发 {id} 失败: {e}");
         }
     }
+}
+
+/// 通知对端把 `msg` 那一条撤回（只改它那边那条气泡的显示，收件箱里落盘的文件不动）。
+/// 不带会话头：撤回靠的是消息自己的 ID（全局唯一），而 X-Session 会让对端
+/// 顺手把「对方那个框」在本机建出来 —— 撤回不该有这种副作用
+pub fn recall(hub: &Arc<Hub>, peer: &Peer, msg: &Message) -> Result<(), String> {
+    let body = serde_json::json!({ "msg_id": msg.id }).to_string().into_bytes();
+    let mut headers = signed_headers(hub, &store::sha256_hex(&body));
+    headers.push(("Content-Type".into(), "application/json".into()));
+    let resp = http::request_small(
+        &peer.host,
+        peer.port,
+        "POST",
+        "/recall",
+        &headers,
+        &body,
+        Duration::from_secs(10),
+    )?;
+    if resp.ok() {
+        return Ok(());
+    }
+    // 老版本根本没有这个路由：把那句「未知路由」翻成人话，否则用户只看到一个数字
+    if resp.status == 404 {
+        return Err("对端版本不支持撤回（它还没更新）".into());
+    }
+    Err(format!("对端返回 {}", resp.status))
 }
 
 /// 一条待发消息归属的会话已经不在了（用户删了那个框）：直接标失败落库，

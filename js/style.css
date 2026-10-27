@@ -1716,6 +1716,21 @@ textarea,
   margin-top: 6px;
 }
 
+/* 撤回与本机删除的入口在气泡的右键菜单里（.ctx-menu），不再在气泡下面常驻一排按钮：
+   文件气泡本来就有「另存为 / 复制 / 打开位置」那一行，多一排只会挤开条目间距 */
+
+/* 撤回之后那一条只剩一句话：不配底色与边框（那一层蓝/灰是给「有内容」用的） */
+.msg-recalled {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.msg.is-recalled .bubble {
+  padding: 0;
+  background: transparent;
+  border-color: transparent;
+}
+
 .cand-box {
   display: flex;
   flex-wrap: wrap;

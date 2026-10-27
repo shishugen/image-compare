@@ -231,7 +231,15 @@ const world = {
   // 被删过会话的框：历史还在，但列表不再从历史里把它补回来（与 Rust 的 hidden 同口径）
   hidden: [],
   hist: [],
+  // 用例灌一句原因就让桩拒掉那一类请求（验「被拦下来之后入口当场收起来」）
+  recallFails: null,
+  deleteFails: null,
 };
+
+/** 能撤回的时间窗：与 store.rs 的 RECALL_WINDOW_MS 、view-transfer.js 的 RECALL_MS 同一档 */
+const RECALL_MS = 60000;
+/** 与 Rust 的 RECALL_SUMMARY 一份口径 */
+const RECALL_SUMMARY = "撤回了一条消息";
 
 /** 与 Rust 的 Message::sid_of 同口径：没 sid 的老消息归它那台的基础对话 */
 const sidOf = (m) => m.sid || m.peer || "";
@@ -274,7 +282,8 @@ const firstPage = (peer) => world.hist.filter((m) => m.peer === peer).slice(-10)
 
 function sessionRowOf(id) {
   const stored = world.sessions.find((s) => s.id === id);
-  const mine = world.hist.filter((m) => sidOf(m) === id);
+  // 本机删掉的那几条不参与统计（与 read_messages 的 hidden 过滤同口径）
+  const mine = world.hist.filter((m) => sidOf(m) === id && !m.hidden);
   // 所属那台从历史里反推：同一个框的消息都带着同一个发送方设备 ID（Rust 的补漏行就这么算）
   const peer = stored ? stored.peer : mine.length ? mine[mine.length - 1].peer : "";
   const p = world.peers.find((x) => x.id === peer);
@@ -290,13 +299,21 @@ function sessionRowOf(id) {
     // 置顶只有会话表里存过的那几行有：补漏行/未标记永远不置顶（Rust 传的也是 false）
     pinned: !!stored?.pinned,
     created: stored?.created || 0,
-    // 与 Rust 同口径：只数对方发来的、且只数读指针之后的；未标记与补漏行（还没建会话的）不挂未读
+    // 与 Rust 同口径：只数对方发来的、且只数读指针之后的；撤回的那条不算（对方已经把它撤了）；
+    // 未标记与补漏行（还没建会话的）不挂未读
     unread:
       peer === "" || !stored
         ? 0
-        : mine.filter((m) => m.dir === "in" && m.ts > stored.read).length,
+        : mine.filter((m) => m.dir === "in" && !m.recalled && m.ts > stored.read).length,
     last: last?.ts || 0,
-    summary: last ? (last.kind === "text" ? last.text : `[文件] ${last.name || ""}`) : "",
+    // 撤回的那条只留一句话（与后端 session_stats 同口径）
+    summary: last
+      ? last.recalled
+        ? RECALL_SUMMARY
+        : last.kind === "text"
+          ? last.text
+          : `[文件] ${last.name || ""}`
+      : "",
   };
 }
 
@@ -337,9 +354,12 @@ function focus(id) {
 }
 
 const calls = [];
-/* 本机接收那两项：桩里就一份内存 prefs，set_prefs 的局部更新语义照 Rust 抄
-   （传来的字段覆盖，没传的保持原值；收件目录只认绝对路径与空串） */
-const prefs = { layout: "2", sync: true, wheel: "zoom", notify: true, inbox: "" };
+/* 本机接收 + 在线探测那几项：桩里就一份内存 prefs，set_prefs 的局部更新语义照 Rust 抄
+   （传来的字段覆盖，没传的保持原值；收件目录只认绝对路径与空串；
+   心跳节拍只认白名单那四档） */
+const prefs = { layout: "2", sync: true, wheel: "zoom", notify: true, inbox: "", heartbeat_ms: 1000 };
+// 与 store.rs 的 HEARTBEAT_OPTIONS 一份口径
+const HEARTBEAT_OPTS = [1000, 2000, 5000, 10000];
 const DEFAULT_INBOX = "/本机数据目录/inbox";
 // pick_folder 的返回值：用例改成一条路径就等于「用户在原生对话框里选了它」，
 // 改回 null 就是「点了取消」
@@ -416,10 +436,32 @@ window.__TAURI__.core.invoke = async (cmd, args = {}) => {
     case "msg_history": {
       // 必须先按对话框筛、再定位游标切页：反过来会让每页凑不满、游标还会串框
       const list = args.session === undefined ? world.hist : world.hist.filter((m) => sidOf(m) === args.session);
-      const cursor = args.before ? list.findIndex((m) => m.id === args.before) : -1;
-      const end = cursor >= 0 ? cursor : list.length;
+      const visible = list.filter((m) => !m.hidden); // 本机删掉的不再露出来
+      const cursor = args.before ? visible.findIndex((m) => m.id === args.before) : -1;
+      const end = cursor >= 0 ? cursor : visible.length;
       const start = Math.max(0, end - (args.limit || 50));
-      return list.slice(start, end).map((m) => ({ ...m }));
+      return visible.slice(start, end).map((m) => ({ ...m }));
+    }
+    case "msg_recall": {
+      // 与 Rust 的 recall_one 同口径：判据一条不少，而且只标 recalled（不动 state）
+      const m = world.hist.find((x) => x.id === args.id);
+      if (!m || m.hidden) throw new Error("找不到这条消息，可能已经被删掉了");
+      if (m.dir !== "out") throw new Error("只能撤回自己发出去的消息");
+      if (m.recalled) throw new Error("这条已经撤回了");
+      if (Date.now() - m.ts >= RECALL_MS) throw new Error("超过 1 分钟就不能撤回了");
+      if (world.recallFails) throw new Error(world.recallFails);
+      m.recalled = true;
+      // 两边都是同 ID 再追一行：推的事件与返回值都是那一条
+      emit("msg-updated", { message: { ...m } });
+      return { ...m };
+    }
+    case "msg_delete": {
+      // 本机删除：只标 hidden，对端那份与 state 都不动
+      const m = world.hist.find((x) => x.id === args.id);
+      if (!m) throw new Error("找不到这条消息，可能已经被删掉了");
+      if (world.deleteFails) throw new Error(world.deleteFails);
+      m.hidden = true;
+      return { ...m };
     }
     case "send_text": {
       const to = args.to || world.active;
@@ -524,6 +566,12 @@ window.__TAURI__.core.invoke = async (cmd, args = {}) => {
         const v = String(args.inbox);
         if (v && !v.startsWith("/")) throw new Error(`收件目录必须是绝对路径: ${v}`);
         prefs.inbox = v;
+      }
+      if ("heartbeatMs" in args) {
+        const v = Number(args.heartbeatMs);
+        // 照 Rust 硬拒（不是静默改回默认）：白名单外的档位会把心跳线程变成空转
+        if (!HEARTBEAT_OPTS.includes(v)) throw new Error(`不支持的探测间隔: ${v} 毫秒`);
+        prefs.heartbeat_ms = v;
       }
       return { ...prefs };
     }
@@ -1916,8 +1964,9 @@ const xferJs = readFileSync(join(here, "..", "js", "view-transfer.js"), "utf8");
 const rustNet = readFileSync(join(here, "..", "src-tauri", "src", "net", "mod.rs"), "utf8");
 const rustStore = readFileSync(join(here, "..", "src-tauri", "src", "store.rs"), "utf8");
 // 只看菜单那一块：index.html 里的注释也写着「Reload / Inspect Element」为何被替掉，不能一刀切
+// （聊天气泡那份菜单的注释里也有这两个字，窗口开宽了会把那边一块扫进来）
 const menuAt = html.indexOf('id="chat-menu"');
-const menuHtml = menuAt < 0 ? "" : html.slice(menuAt, menuAt + 700);
+const menuHtml = menuAt < 0 ? "" : html.slice(menuAt, menuAt + 400);
 check(
   "菜单三项都是中文（置顶 / 重命名 / 删除），菜单里没有 Reload / Inspect",
   /置顶该聊天/.test(menuHtml) &&
@@ -1957,16 +2006,41 @@ check(
   ""
 );
 
-/* 20d) 聊天气泡里的图片右键：换成中文菜单（与对比视图同一批命令）
-      只拦图片 —— 文字气泡里的右键要的是系统的选词与拷贝（截图里用户报的就是图片这一处） */
-const imgMenuEl = byId("chat-img-menu");
-// index.html 里这五枚是菜单的子节点；桩不解析 HTML，这里照实挂上
-for (const id of ["cb-copy-img", "cb-save", "cb-copy-path", "cb-reveal", "cb-compare"]) imgMenuEl.appendChild(byId(id));
-imgMenuEl.hidden = true;
+/* 20d) 聊天气泡的右键菜单：整条气泡都拦（文字 / 文件 / 图片），一份中文菜单按这一条是什么动态显隐
+      撤回与本机删除两个入口也住在这里 —— 不拦就是 WebView 那套英文菜单 */
+const msgMenuEl = byId("chat-msg-menu");
+// index.html 里这九枚是菜单的子节点；桩不解析 HTML，这里照实挂上（顺序与页面一致）。
+// 文本同步写桩：菜单项靠 textContent 认项，「这项叫什么」在测试里就得是个能看见的常量
+const MSG_ITEMS = [
+  ["cb-copy-text", "复制正文"],
+  ["cb-copy-img", "复制图片"],
+  ["cb-save", "另存为…"],
+  ["cb-copy-path", "复制文件路径"],
+  ["cb-reveal", "在文件夹中显示"],
+  ["cb-compare", "在对比中打开"],
+  ["ctx-msg-sep", "|"],
+  ["ctx-msg-recall", "撤回这一条"],
+  ["ctx-msg-del", "删除（只删本机）"],
+];
+for (const [id, label] of MSG_ITEMS) {
+  const n = byId(id);
+  n.textContent = label;
+  msgMenuEl.appendChild(n);
+}
+msgMenuEl.hidden = true;
 
 const bubbleOf = (id) => {
   const msg = bubbles().find((b) => b.dataset.id === id);
   return msg ? msg.children.find((c) => c.classSet.has("bubble")) || null : null;
+};
+/** 整条气泡都拦之后，监听挂在 .msg 外层上：右键直接打在气泡那一层 */
+const msgElOf = (id) => bubbles().find((b) => b.dataset.id === id) || null;
+/** 摊开在菜单里的项（hidden 不算），用文本认项而不是 id —— 改了 id 也不会假装通过 */
+const shownItems = () => msgMenuEl.children.filter((c) => !c.hidden).map((c) => c.text);
+const itemBy = (t) => msgMenuEl.children.find((c) => c.text === t && !c.hidden) || null;
+const openBubbleMenu = (msgEl) => {
+  rightClick(msgEl);
+  return shownItems();
 };
 
 // 切回甲机，造一条带本机路径的图片进当前流（截图里就是收件箱那张）
@@ -1987,22 +2061,27 @@ emit("msg-in", {
 });
 await settle();
 const imgBubble = bubbleOf("img1");
-const imgBlocked = rightClick(imgBubble);
+const imgBlocked = rightClick(msgElOf("img1"));
 check(
-  "图片气泡右键先 preventDefault：不再弹 Open Image / Download / Copy Subject 那套",
+  "图片气泡右键先 preventDefault：不再弹 Look Up / Translate / Share… 那套",
   imgBlocked === true,
   `blocked=${imgBlocked}`
 );
-check("弹的是自己的中文菜单", imgMenuEl.hidden === false, `hidden=${imgMenuEl.hidden}`);
+check("弹的是自己的中文菜单", msgMenuEl.hidden === false, `hidden=${msgMenuEl.hidden}`);
 check(
-  "菜单五枚都在（文案与命令的对应关系交给下面的静态合约）",
-  imgMenuEl.children.length === 5,
-  String(imgMenuEl.children.length)
+  "图片这一项都不落：复制图片 / 另存为 / 复制路径 / 在文件夹中显示 / 在对比中打开，再加隔断与删除",
+  shownItems().join(",") === "复制图片,另存为…,复制文件路径,在文件夹中显示,在对比中打开,|,删除（只删本机）",
+  shownItems().join(",")
+);
+check(
+  "别人发来的那条不给撤回入口（撤回只能撤自己发的）",
+  itemBy("撤回这一条") === null,
+  shownItems().join(",")
 );
 check(
   "菜单贴在鼠标处（与会话菜单共用 placeMenuAt）",
-  imgMenuEl.style.left === "120px" && imgMenuEl.style.top === "160px",
-  `${imgMenuEl.style.left},${imgMenuEl.style.top}`
+  msgMenuEl.style.left === "120px" && msgMenuEl.style.top === "160px",
+  `${msgMenuEl.style.left},${msgMenuEl.style.top}`
 );
 
 const sinceCopy = calls.length;
@@ -2013,9 +2092,9 @@ check(
   takeCalls("copy_as_file", sinceCopy).some(([, a]) => a.paths?.[0] === "/收件箱/圣诞雪花树纹针织图案.png"),
   JSON.stringify(takeCalls("copy_as_file", sinceCopy))
 );
-check("点完菜单自己收起", imgMenuEl.hidden === true, `hidden=${imgMenuEl.hidden}`);
+check("点完菜单自己收起", msgMenuEl.hidden === true, `hidden=${msgMenuEl.hidden}`);
 
-rightClick(imgBubble);
+rightClick(msgElOf("img1"));
 const sinceSave2 = calls.length;
 click(byId("cb-save"));
 await settle();
@@ -2025,7 +2104,7 @@ check(
   JSON.stringify(takeCalls("save_path_as", sinceSave2))
 );
 
-rightClick(imgBubble);
+rightClick(msgElOf("img1"));
 const sinceReveal2 = calls.length;
 click(byId("cb-reveal"));
 await settle();
@@ -2037,7 +2116,7 @@ check(
 
 // 「在对比中打开」交给对比视图：桩里注册一个处理者，相当于那边已经就绪
 api.registerOpenHandler("compare", () => {});
-rightClick(imgBubble);
+rightClick(msgElOf("img1"));
 click(byId("cb-compare"));
 await settle();
 check(
@@ -2048,17 +2127,30 @@ check(
 api.setView("transfer");
 await settle();
 
-// 文字气泡不拦：那里面要的是系统的选词与拷贝
+// 文字气泡也拦：要的就是「复制正文」这一项补上系统的选词拷贝（以前的漏处）
 const textMsg = bubbles().find((b) => b.classSet.has("kind-text"));
 const textBubble = textMsg ? textMsg.children.find((c) => c.classSet.has("bubble")) : null;
-const textBlocked = rightClick(textBubble);
+const itemsOfText = openBubbleMenu(textMsg);
 check(
-  "文字气泡右键不拦：选词/拷贝仍是系统那套（菜单也不开）",
-  textBlocked === false && imgMenuEl.hidden === true,
-  `blocked=${textBlocked} hidden=${imgMenuEl.hidden}`
+  "文字气泡也换成中文菜单，只给「复制正文」+ 隔断 + 撤回/删除",
+  itemsOfText.join(",") === "复制正文,|,删除（只删本机）",
+  itemsOfText.join(",")
+);
+check(
+  "文字气泡菜单里这一条没有文件那几项（本机路径压根不存在）",
+  !itemsOfText.includes("另存为…") && !itemsOfText.includes("复制图片") && !itemsOfText.includes("在对比中打开"),
+  itemsOfText.join(",")
+);
+const sinceTextCopy = calls.length;
+click(itemBy("复制正文"));
+await settle();
+check(
+  "「复制正文」拷的是这一条的文字（右键不再只能弹英文菜单）",
+  takeCalls("noop", sinceTextCopy).length === 0 && String(textBubble.textContent).length > 0,
+  textBubble.textContent
 );
 
-// 非图片文件也不拦：文件名要能选中、拷贝（只盯「有路径的图片」这一种）
+// 非图片文件：走文件那几项，不给图片项与对比
 emit("msg-in", {
   message: {
     id: "doc1",
@@ -2073,31 +2165,53 @@ emit("msg-in", {
   },
 });
 await settle();
-const docBlocked = rightClick(bubbleOf("doc1"));
+const itemsOfDoc = openBubbleMenu(msgElOf("doc1"));
 check(
-  "非图片文件右键不拦（.pdf 这类不该换成图片菜单）",
-  docBlocked === false && imgMenuEl.hidden === true,
-  `blocked=${docBlocked} hidden=${imgMenuEl.hidden}`
+  "非图片文件也换成同一份中文菜单：给文件那几项，不给「复制图片」「在对比中打开」",
+  itemsOfDoc.join(",") === "另存为…,复制文件路径,在文件夹中显示,|,删除（只删本机）",
+  itemsOfDoc.join(",")
 );
 
 // 关得干净：点菜单外面就收起
-rightClick(imgBubble);
+rightClick(msgElOf("img1"));
 fireWindow("pointerdown", byId("xfer-stream"));
-check("点菜单外面就收起（与系统菜单同一个手感）", imgMenuEl.hidden === true, `hidden=${imgMenuEl.hidden}`);
+check("点菜单外面就收起（与系统菜单同一个手感）", msgMenuEl.hidden === true, `hidden=${msgMenuEl.hidden}`);
 
 check(
-  "只拦图片：contextmenu 挂在文件气泡上且判 IMAGE_EXT，没挂到整个消息流",
-  /bubble\.addEventListener\("contextmenu"[\s\S]{0,400}?IMAGE_EXT\.test\(nm\)/.test(xferJs) &&
+  "整条气泡都拦：contextmenu 挂在 wrap 上，不再只挂图片气泡、也没挂到整个消息流",
+  /wrap\.addEventListener\("contextmenu", \(ev\) => openMsgMenu\(ev, rec\)\)/.test(xferJs) &&
+    !/bubble\.addEventListener\("contextmenu"/.test(xferJs) &&
     !/stream\.addEventListener\("contextmenu"/.test(xferJs),
   ""
 );
-const imgMenuAt = html.indexOf('id="chat-img-menu"');
-const imgMenuHtml = imgMenuAt < 0 ? "" : html.slice(imgMenuAt, imgMenuAt + 700);
+const msgMenuAt = html.indexOf('id="chat-msg-menu"');
+const msgMenuHtml = msgMenuAt < 0 ? "" : html.slice(msgMenuAt, msgMenuAt + 900);
 check(
-  "图片菜单五项都是中文，菜单里没有任何英文原生项",
-  ["复制图片", "另存为…", "复制文件路径", "在文件夹中显示", "在对比中打开"].every((t) => imgMenuHtml.includes(t)) &&
-    !/Open Image|Download Image|Copy Image|Copy Subject|Look Up|Share…|Inspect Element/.test(imgMenuHtml),
-  imgMenuHtml.slice(0, 60)
+  "菜单九枚都在一份菜单里（一份菜单管三种气泡，不再开两份）",
+  msgMenuAt >= 0 &&
+    [
+      "cb-copy-text",
+      "cb-copy-img",
+      "cb-save",
+      "cb-copy-path",
+      "cb-reveal",
+      "cb-compare",
+      "ctx-msg-sep",
+      "ctx-msg-recall",
+      "ctx-msg-del",
+    ].every((i) => msgMenuHtml.includes(`id="${i}"`)) &&
+    html.indexOf('id="chat-img-menu"') < 0,
+  msgMenuHtml.slice(0, 60)
+);
+check(
+  "菜单项全是中文，没有一条 WebView 原生菜单那套英文项",
+  ["复制正文", "复制图片", "另存为…", "复制文件路径", "在文件夹中显示", "在对比中打开", "撤回这一条", "删除（只删本机）"].every(
+    (t) => msgMenuHtml.includes(t)
+  ) &&
+    !/Look Up|Translate|Search with|Copy Link|Share…|Speech|Inspect Element|Open Image|Download Image|Copy Subject/.test(
+      msgMenuHtml
+    ),
+  msgMenuHtml.slice(0, 120)
 );
 
 /* 21) 本机接收：提示音开关与收件目录（都存 prefs.json，与对比视图那份共用） */
@@ -2224,18 +2338,70 @@ check(
   revealed.join(" | ")
 );
 
+/* 在线探测：心跳节拍（存同一份 prefs.json、走同一对命令） */
+const hbSel = () => byId("inp-heartbeat");
+const pickOpt = (v) => {
+  const node = hbSel();
+  node.value = String(v);
+  // 真 DOM 的 change 事件带 target（chooseInboxLayout 同样按 ev.target.value 读），
+  // 桩里少给这一句就会让处理器读到 undefined、静默当成「没变化」跳过
+  node.dispatchEvent({ type: "change", target: node });
+};
+
+check(
+  "打开抽屉把磁盘上的节拍填进下拉（读的键是 heartbeat_ms：get_prefs 回的是 Rust 原样序列化的下划线名，不是 camelCase）",
+  hbSel().value === "1000",
+  `value="${hbSel().value}"`
+);
+
+const hbSet0 = setCount();
+pickOpt(5000);
+await settle();
+check(
+  "切节拍只传一个 {heartbeatMs:5000}，不拿整份 prefs 回写（那会把对比视图选的布局一起盖掉）",
+  Object.keys(lastCall("set_prefs") || {}).join() === "heartbeatMs" &&
+    lastCall("set_prefs").heartbeatMs === 5000,
+  JSON.stringify(lastCall("set_prefs"))
+);
+check(
+  "存成功才把界面停在新档位：磁盘与下拉一起是 5000，且一次切换只写一次盘",
+  prefs.heartbeat_ms === 5000 && hbSel().value === "5000" && setCount() === hbSet0 + 1,
+  `磁盘=${prefs.heartbeat_ms} 下拉="${hbSel().value}" 多写了 ${setCount() - hbSet0} 次`
+);
+check(
+  "提示里带上“判离线约要 15 秒”：3 拍那个口径得让用户看得见（不然他会以为改了间隔还是 3 秒判离线）",
+  String(statusText()).includes("15 秒"),
+  statusText()
+);
+
+/* 白名单外的档位（手改磁盘、或前端漏出的值）：桩跟 Rust 一样硬拒 */
+pickOpt(1500);
+await settle();
+check(
+  "白名单外的档位被拒后下拉退回原那一档、磁盘不动，且原因上了屏（停在一个没生效的档位上最难查）",
+  hbSel().value === "5000" && prefs.heartbeat_ms === 5000 && String(statusText()).includes("不支持的探测间隔"),
+  `下拉="${hbSel().value}" 磁盘=${prefs.heartbeat_ms} 提示="${statusText()}"`
+);
+
+const hbSet1 = setCount();
+pickOpt(5000);
+await settle();
+check("再选当前那一档不重复写盘", setCount() === hbSet1, `多写了 ${setCount() - hbSet1} 次`);
+
 // 抽屉收起再打开：得重读一遍，否则另一个抽屉（或磁盘手改）变了这边永远显旧的
 prefs.notify = false; // 假装另一个抽屉刚把它关了
+prefs.heartbeat_ms = 10000; // 假装磁盘上这一项被改过了（手改 prefs.json 就是这条路）
 notifyChk().checked = true; // 只改 DOM 不发事件：界面上停着一个旧状态，这才是重读要修的东西
+hbSel().value = "1000";
 await settle();
 click(byId("btn-xfer-settings"));
 await settle();
 click(byId("btn-xfer-settings"));
 await settle();
 check(
-  "抽屉收起再打开会重读：磁盘上被改掉的开关能回到界面（不是只在启动读一次）",
-  notifyChk().checked === false && notifyTxt().text === "不响",
-  `checked=${notifyChk().checked} 文案="${notifyTxt().text}"`
+  "抽屉收起再打开会重读：磁盘上被改掉的开关与节拍能回到界面（不是只在启动读一次）",
+  notifyChk().checked === false && notifyTxt().text === "不响" && hbSel().value === "10000",
+  `checked=${notifyChk().checked} 文案="${notifyTxt().text}" 节拍="${hbSel().value}"`
 );
 
 /* 12) 对比视图右键「发送到聊天」：先摆进待发送区，选哪个框就发给哪个，点发送才真发 */
@@ -2382,6 +2548,165 @@ check(
     statusLog.slice(logBeforeGhost).some((t) => String(t).includes("还没添加为对端")) &&
     attachChips().includes("/tmp/投递/发不出去.png"),
   `${takeCalls("send_paths", deliverSince).length} | ${statusLog.slice(logBeforeGhost).join(" | ")} | ${attachChips().join(",")}`
+);
+
+/* 13b) 撤回与本机删除：一分钟内给自己的消息留两个入口，删除要两下。
+   时间窗的真判据在 Rust（store::recall_check），这里测的是「入口露不露、
+   被拒了收不收得回去、两边各自看到什么」这一整条前端链路 */
+await openChatWith("甲机");
+const rbSid = lastCall("msg_history")?.session;
+check(
+  "开一个干净的话题框用来测撤回（历史为空，气泡 id 才好断言）",
+  !!rbSid && bubbles().length === 0,
+  String(rbSid)
+);
+/** 菜单项是 byId 挂上去的真节点，靠 textContent 认项；靠文本判「这一项在不在」 */
+const recallItem = () => byId("ctx-msg-recall");
+const deleteItem = () => byId("ctx-msg-del");
+
+byId("xfer-input").value = "这句要撤回";
+click(byId("btn-xfer-send"));
+await settle();
+const rbMsg = world.hist.find((m) => m.text === "这句要撤回");
+const rbBub = bubbles().find((b) => b.dataset.id === rbMsg?.id);
+check(
+  "自己发出去的那条，右键菜单里「撤回」与「删除」两项都摊开（入口搬进右键菜单了）",
+  openBubbleMenu(rbBub).join(",") === "复制正文,|,撤回这一条,删除（只删本机）",
+  shownItems().join(",")
+);
+
+// 时间窗：两分钟前那条不配再有撤回入口
+emit("msg-updated", {
+  message: { id: "old-out", dir: "out", kind: "text", text: "早过了", state: "sent", ts: NOW - 90000, peer: "A", sid: rbSid },
+});
+await settle();
+const oldBub = bubbles().find((b) => b.dataset.id === "old-out");
+check(
+  "过了一分钟的那条只剩「删除」，撤回入口自己收掉",
+  openBubbleMenu(oldBub).join(",") === "复制正文,|,删除（只删本机）",
+  shownItems().join(",")
+);
+
+// 对方发来的那条留到摘要用例之后再摆进来：会话栏摘要取最后一条，
+// 它抢在最后就把「撤回的那条是什么样子」这条断言盖掉了
+
+const recallSince = calls.length;
+// 得重新在菜单里摊开这一条再点：菜单认的是「最后右键的那一条」，上一项刚右键过 old-out
+openBubbleMenu(rbBub);
+click(recallItem());
+await settle();
+const rbCalls = takeCalls("msg_recall", recallSince);
+check(
+  "点撤回只调一次 msg_recall，参数就是那条的 id",
+  rbCalls.length === 1 && rbCalls[0][1].id === rbMsg.id,
+  JSON.stringify(rbCalls[0] || null)
+);
+check(
+  "撤回后本机这条换成一句「你撤回了一条消息」，正文不再露出来",
+  rbBub.textContent.includes("你撤回了一条消息") && !rbBub.textContent.includes("这句要撤回"),
+  rbBub.textContent
+);
+// 菜单里重新摊开这一条：刚才那一下撤回点下去之后，入口应该已经收了
+check(
+  "撤过的不再给撤回入口（已经是撤过的那一条了）",
+  !openBubbleMenu(rbBub).includes("撤回这一条"),
+  shownItems().join(",")
+);
+check(
+  "会话栏那句摘要也换成「撤回了一条消息」（桩不解析 HTML，看 innerHTML 字符串）",
+  String(rowOf(rbSid)?.html).includes("撤回了一条消息"),
+  String(rowOf(rbSid)?.html).slice(0, 160)
+);
+
+// 对方发来的那条：只能删自己这边的，不能撤别人的
+emit("msg-in", {
+  message: { id: "in-1", dir: "in", kind: "text", text: "对方说的", state: "sent", ts: NOW, peer: "A", sid: rbSid },
+});
+await settle();
+const inBub = bubbles().find((b) => b.dataset.id === "in-1");
+check(
+  "对方发来的那条只给「删除」（撤回只能撤自己发的）",
+  openBubbleMenu(inBub).join(",") === "复制正文,|,删除（只删本机）",
+  shownItems().join(",")
+);
+
+// 删除要两下：与会话菜单那枚同一套手感，而且是在菜单里走
+const delSince = calls.length;
+rightClick(inBub);
+const delItem = deleteItem();
+click(delItem);
+await settle();
+check(
+  "删除第一下不真调后端，只把这一项变成「再点一次删除」且菜单不收起",
+  takeCalls("msg_delete", delSince).length === 0 &&
+    delItem.textContent === "再点一次删除" &&
+    msgMenuEl.hidden === false,
+  `${delItem.textContent} hidden=${msgMenuEl.hidden}`
+);
+click(delItem);
+await settle();
+check(
+  "第二下才真删：msg_delete 收到的就是那条的 id",
+  takeCalls("msg_delete", delSince).length === 1 && lastCall("msg_delete")?.id === "in-1",
+  JSON.stringify(lastCall("msg_delete"))
+);
+check(
+  "删掉的气泡当场从流里拿掉",
+  !bubbles().some((b) => b.dataset.id === "in-1"),
+  bubbles().map((b) => b.dataset.id).join(",")
+);
+
+// 被后端拦下来（对端版本不支持、或那一分钟已经过了）：不能偷偷把正文换成「已撤回」
+world.recallFails = "对端版本不支持撤回（它还没更新）";
+byId("xfer-input").value = "这句撤不掉";
+click(byId("btn-xfer-send"));
+await settle();
+const rbMsg2 = world.hist.find((m) => m.text === "这句撤不掉");
+const bub2 = bubbles().find((b) => b.dataset.id === rbMsg2?.id);
+// 先右键把这一条摊开再点：上一项刚删完，菜单里的「这一条」还指着被删的那条
+openBubbleMenu(bub2);
+click(recallItem());
+await settle();
+check(
+  "撤回被拒：正文原样留着，没被换成那句提示",
+  bub2.textContent.includes("这句撤不掉") && !bub2.classSet.has("is-recalled"),
+  bub2.textContent
+);
+check(
+  "撤回被拒后入口当场收起来，不再让人反复点",
+  !openBubbleMenu(bub2).includes("撤回这一条"),
+  shownItems().join(",")
+);
+world.recallFails = null;
+
+// 切走再切回来：三个状态都得从「盘上那一行」读回来，而不是靠内存里的旧气泡
+const baseRow = rowOf("A");
+if (baseRow) {
+  click(baseRow);
+  await settle();
+}
+click(rowOf(rbSid));
+await settle();
+check(
+  "重读历史：撤过的那条仍是提示态（recalled 真落库了）",
+  (() => {
+    const b = bubbles().find((x) => x.dataset.id === rbMsg.id);
+    return !!b && b.textContent.includes("你撤回了一条消息") && !b.textContent.includes("这句要撤回");
+  })(),
+  String(bubbles().find((x) => x.dataset.id === rbMsg.id)?.textContent)
+);
+check(
+  "重读历史：删掉的那条不再出现，而文件里那一行还在（只标 hidden、不删行）",
+  !bubbles().some((x) => x.dataset.id === "in-1") && world.hist.some((x) => x.id === "in-1" && x.hidden),
+  bubbles().map((x) => x.dataset.id).join(",")
+);
+check(
+  "重读历史：没撤成的那条正文照旧",
+  (() => {
+    const b = bubbles().find((x) => x.dataset.id === rbMsg2.id);
+    return !!b && b.textContent.includes("这句撤不掉");
+  })(),
+  String(bubbles().find((x) => x.dataset.id === rbMsg2.id)?.textContent)
 );
 
 const xferSrc = readFileSync(join(here, "..", "js", "view-transfer.js"), "utf8");

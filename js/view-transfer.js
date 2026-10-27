@@ -62,6 +62,8 @@ const ui = {
   btnInboxReveal: el("btn-inbox-reveal"),
   inboxLayout: el("inp-inbox-layout"),
   inboxSample: el("inbox-layout-sample"),
+  // 在线探测（心跳节拍）
+  heartbeatSel: el("inp-heartbeat"),
   dropHint: el("xfer-drop-hint"),
   dropText: el("xfer-drop-text"),
   // 待发送区（选好/拖进来的东西先摆在这里，点发送才发）
@@ -81,8 +83,17 @@ const ui = {
   chatRename: el("ctx-chat-rename"),
   chatSep: el("ctx-chat-sep"),
   chatDel: el("ctx-chat-del"),
-  // 聊天气泡里图片的右键菜单（与对比视图同批命令，中文）
-  chatImgMenu: el("chat-img-menu"),
+  // 聊天气泡的右键菜单（文字 / 文件 / 图片共用一份，中文）：撤回与本机删除的入口也在这里
+  msgMenu: el("chat-msg-menu"),
+  msgCopyText: el("cb-copy-text"),
+  msgCopyImg: el("cb-copy-img"),
+  msgSave: el("cb-save"),
+  msgCopyPath: el("cb-copy-path"),
+  msgReveal: el("cb-reveal"),
+  msgCompare: el("cb-compare"),
+  msgSep: el("ctx-msg-sep"),
+  msgRecall: el("ctx-msg-recall"),
+  msgDel: el("ctx-msg-del"),
   navBadge: el("nav-badge-xfer"),
   btnNewChat: el("btn-session-new"),
   chatPick: el("xfer-chat-pick"),
@@ -122,6 +133,8 @@ const state = {
   inboxDir: "",
   /** 收件目录里的摆放：day / month / flat。记一份是为了在下拉存盘失败时能退回原值 */
   inboxLayout: "day",
+  /** 心跳节拍（毫秒）：同上，存不下要能退回原来那一档 */
+  heartbeatMs: 1000,
 };
 
 /**
@@ -206,6 +219,14 @@ function railTime(ts) {
 }
 
 // IMAGE_EXT 从 api.js 导，三个视图共用一份口径
+
+/** 能撤回的时间窗（毫秒）：与 store.rs 的 RECALL_WINDOW_MS 同一个口径。这里只决定
+ *  入口露不露，真正的拦在那边 —— 气泡放着不动不会自己重画，前端这一档只是手感 */
+const RECALL_MS = 60000;
+/** 撤回之后两边各看到的那句话 */
+const RECALL_TEXT = { out: "你撤回了一条消息", in: "对方撤回了一条消息" };
+/** 会话栏摘要里那句短文案，与 Rust 的 RECALL_SUMMARY 一份口径 */
+const RECALL_SUMMARY = "撤回了一条消息";
 
 /** 一次铺多少条：跟微信一样先只看最近这几条，滚到顶再往前翻页 */
 const PAGE = 10;
@@ -529,40 +550,83 @@ function openChatMenu(ev, s, row) {
 }
 
 /* --------------------------------------------------------------------------
- * 聊天气泡里图片的右键菜单
+ * 聊天气泡的右键菜单
  *
  * 与对比视图那套（`#img-menu`）同一批命令、同一套中文文案，差别只有一项：
  * 这里本来就在聊天里，所以没有「发送到聊天」，换成「在对比中打开」。
  *
- * 只拦图片：文字气泡里的右键要的是系统的选词与拷贝，文件气泡里有时也要选文件名，
- * 拦住反而少东西 ——— 所以判断条件盯的是「有本机路径的图片」，不是整个消息流。
+ * 整条气泡都拦（文字 / 文件 / 图片都拦）：不拦就是 WebView 那套英文菜单
+ * （Look Up / Translate / Search with Baidu / Share… / Inspect Element），
+ * 而撤回与本机删除两个入口也得有个地方放。一个菜单管三种气泡：每一项按
+ * 这一条当下是什么动态显隐，比开三份菜单更容易对不齐。
+ * 文字气泡里因此拿不到系统的选词与拷贝，菜单里给了「复制正文」补上这一项。
  * ------------------------------------------------------------------------ */
-const bubbleMenu = { path: "", name: "" };
+const msgMenu = { rec: null, armed: false };
+/** 「删除」臂上之后没人点，几秒得自己退回去（与会话菜单那枚同一套手感） */
+let msgArmTimer = 0;
+const MSG_DEL_LABEL = "删除（只删本机）";
 
-function closeBubbleMenu() {
-  if (!ui.chatImgMenu || ui.chatImgMenu.hidden) return;
-  ui.chatImgMenu.hidden = true;
-  bubbleMenu.path = "";
-  bubbleMenu.name = "";
+function closeMsgMenu() {
+  if (!ui.msgMenu || ui.msgMenu.hidden) return;
+  ui.msgMenu.hidden = true;
+  msgMenu.rec = null;
+  msgMenu.armed = false;
+  clearTimeout(msgArmTimer);
+  if (ui.msgDel) ui.msgDel.textContent = MSG_DEL_LABEL;
 }
 
-function openBubbleMenu(ev, rec) {
-  if (!ui.chatImgMenu || !rec.path) return;
+/** 这一条当下算得出什么：路径与是不是图片都从最新那份快照看（占位气泡后来才补上） */
+function msgTargets(rec) {
+  const m = rec?.msg || {};
+  const path = m.path || rec?.path || "";
+  const name = m.name || rec?.name || "";
+  return {
+    m,
+    path,
+    name,
+    isText: m.kind === "text",
+    isImage: m.kind === "file" && !!path && IMAGE_EXT.test(name),
+    hasFile: !!path,
+  };
+}
+
+/** 在鼠标处摊开消息菜单，先把与这一条无关的项藏掉（贴边翻页交给 placeMenuAt） */
+function openMsgMenu(ev, rec) {
+  if (!ui.msgMenu || !rec) return;
   if (ev.preventDefault) ev.preventDefault();
   if (ev.stopPropagation) ev.stopPropagation();
-  if (!ui.chatImgMenu.hidden) closeBubbleMenu();
-  bubbleMenu.path = rec.path;
-  bubbleMenu.name = rec.name || rec.path;
-  placeMenuAt(ui.chatImgMenu, ev);
+  if (!ui.msgMenu.hidden) closeMsgMenu();
+  const t = msgTargets(rec);
+  const show = (node, on) => {
+    if (node) node.hidden = !on;
+  };
+  show(ui.msgCopyText, t.isText);
+  show(ui.msgCopyImg, t.isImage);
+  show(ui.msgSave, t.hasFile);
+  show(ui.msgCopyPath, t.hasFile);
+  show(ui.msgReveal, t.hasFile);
+  show(ui.msgCompare, t.isImage);
+  // 上面一组一项都没有（接收中、还拿不到路径的文件）时，那根隔断也不该留白
+  show(ui.msgSep, t.isText || t.isImage || t.hasFile);
+  show(ui.msgRecall, recallable(rec, t.m));
+  show(ui.msgDel, true);
+  if (ui.msgDel) ui.msgDel.textContent = MSG_DEL_LABEL;
+  msgMenu.rec = rec;
+  msgMenu.armed = false;
+  placeMenuAt(ui.msgMenu, ev);
 }
 
-async function runBubbleMenu(act) {
-  const p = bubbleMenu.path;
-  const name = bubbleMenu.name;
-  closeBubbleMenu();
-  if (!p) return;
+async function runMsgMenu(act) {
+  const t = msgTargets(msgMenu.rec);
+  closeMsgMenu();
+  const p = t.path;
+  const name = t.name || p;
+  // 除了「复制正文」，其余每一项都要本机路径；路径还没到手（接收中）就什么都不做
+  if (act !== "copy-text" && !p) return;
   try {
-    if (act === "copy-img") {
+    if (act === "copy-text") {
+      await copyText(t.m.text || "");
+    } else if (act === "copy-img") {
       // 与对比视图同一个命令：剪贴板里同时有文件与位图，粘到微信就是图
       await copyPathAsFile([p]);
     } else if (act === "save") {
@@ -577,20 +641,47 @@ async function runBubbleMenu(act) {
       openInCompare([p]);
     }
   } catch (err) {
-    console.error("[xfer] 图片菜单操作失败:", act, err);
+    console.error("[xfer] 消息菜单操作失败:", act, err);
     toast(errText(err) || `${name} 操作失败`, "error");
   }
 }
 
-for (const [id, act] of [
-  ["cb-copy-img", "copy-img"],
-  ["cb-save", "save"],
-  ["cb-copy-path", "copy-path"],
-  ["cb-reveal", "reveal"],
-  ["cb-compare", "compare"],
+for (const [node, act] of [
+  [ui.msgCopyText, "copy-text"],
+  [ui.msgCopyImg, "copy-img"],
+  [ui.msgSave, "save"],
+  [ui.msgCopyPath, "copy-path"],
+  [ui.msgReveal, "reveal"],
+  [ui.msgCompare, "compare"],
 ]) {
-  const btn = el(id);
-  if (btn) btn.addEventListener("click", () => runBubbleMenu(act));
+  if (node) node.addEventListener("click", () => runMsgMenu(act));
+}
+
+if (ui.msgRecall) {
+  ui.msgRecall.addEventListener("click", () => {
+    const rec = msgMenu.rec;
+    closeMsgMenu();
+    if (rec) recallMessage(rec);
+  });
+}
+if (ui.msgDel) {
+  ui.msgDel.addEventListener("click", () => {
+    const rec = msgMenu.rec;
+    if (!rec) return;
+    // 跟会话菜单那枚一样要两步：右键手一下不该就把一条消息从本机抹掉
+    if (!msgMenu.armed) {
+      msgMenu.armed = true;
+      ui.msgDel.textContent = "再点一次删除";
+      clearTimeout(msgArmTimer);
+      msgArmTimer = setTimeout(() => {
+        msgMenu.armed = false;
+        if (ui.msgDel) ui.msgDel.textContent = MSG_DEL_LABEL;
+      }, 4000);
+      return;
+    }
+    closeMsgMenu();
+    deleteMessage(rec);
+  });
 }
 
 /** 置顶 / 取消置顶：后端只改标记 + 存盘，顺序与底色都靠返回的那份 payload 重画 */
@@ -649,13 +740,13 @@ window.addEventListener("pointerdown", (ev) => {
   if (ui.chatMenu && !ui.chatMenu.hidden && !(t && ui.chatMenu.contains && ui.chatMenu.contains(t))) {
     closeChatMenu();
   }
-  if (ui.chatImgMenu && !ui.chatImgMenu.hidden && !(t && ui.chatImgMenu.contains && ui.chatImgMenu.contains(t))) {
-    closeBubbleMenu();
+  if (ui.msgMenu && !ui.msgMenu.hidden && !(t && ui.msgMenu.contains && ui.msgMenu.contains(t))) {
+    closeMsgMenu();
   }
 });
 const closeBothMenus = () => {
   closeChatMenu();
-  closeBubbleMenu();
+  closeMsgMenu();
 };
 window.addEventListener("wheel", closeBothMenus, { passive: true });
 window.addEventListener("resize", closeBothMenus);
@@ -998,6 +1089,11 @@ function buildBubble(m) {
     actsBox: null,
   };
 
+  // 整条气泡都拦右键（文字 / 文件 / 图片都拦）：不拦就是 WebView 那套英文菜单，
+  // 而撤回与本机删除两个入口也住在里面。挂在 wrap 而不是 bubble 上：
+  // 名字、大小、进度条、预览位都是这一条的一部分，点哪里都该是同一个菜单
+  wrap.addEventListener("contextmenu", (ev) => openMsgMenu(ev, rec));
+
   if (m.kind === "text") {
     const body = document.createElement("div");
     body.className = "msg-text";
@@ -1042,15 +1138,6 @@ function buildBubble(m) {
     bubble.appendChild(actsBox);
     rec.actsBox = actsBox;
     attachActions(rec, m);
-    // 图片气泡右键换成中文菜单。文字气泡与非图片文件不拦 —— 那里要的是系统的选词与拷贝，
-    // 拦住反而少东西（截图里用户报的就是图片这一处）
-    bubble.addEventListener("contextmenu", (ev) => {
-      // rec.path 是接收完（xfer-done）才补上的，占位气泡当时还没有，兜底看在建气泡时那份
-      const p = rec.path || m.path;
-      const nm = rec.name || m.name || "";
-      if (!(rec.kind === "file" && p && IMAGE_EXT.test(nm))) return;
-      openBubbleMenu(ev, { path: p, name: nm });
-    });
   } else {
     const body = document.createElement("div");
     body.className = "msg-text";
@@ -1394,24 +1481,130 @@ async function saveAs(path) {
 function paintMeta(rec, m) {
   // 收进来的那一条标的是对话框名而不是设备名：同一台的两个框得能看出不是同一个
   const who = m.dir === "in" ? sessName(msgSid(m), m.peer) : "本机";
-  const stateText =
-    rec.state === "sending" ? " · 传输中" : rec.state === "failed" ? " · 失败" : rec.state === "queued" ? " · 待发" : "";
+  // 撤回的那条不再报投递状态：那几个字段讲的是「有没有送到」，而它已经从两边撤下来了
+  const stateText = m.recalled
+    ? " · 已撤回"
+    : rec.state === "sending"
+      ? " · 传输中"
+      : rec.state === "failed"
+        ? " · 失败"
+        : rec.state === "queued"
+          ? " · 待发"
+          : "";
   rec.meta.textContent = `${who} · ${fmtTime(m.ts)}${stateText}`;
-  rec.el.classList.toggle("is-failed", rec.state === "failed");
-  rec.el.classList.toggle("is-sending", rec.state === "sending");
-  rec.el.classList.toggle("is-queued", rec.state === "queued");
+  const off = !!m.recalled;
+  rec.el.classList.toggle("is-failed", !off && rec.state === "failed");
+  rec.el.classList.toggle("is-sending", !off && rec.state === "sending");
+  rec.el.classList.toggle("is-queued", !off && rec.state === "queued");
   // 进度条只在真在传的时候才有意义：排队那几天它只能停在 0%，
   // 补发一开始（状态转 sending）就把它放回来
-  if (rec.barBox) rec.barBox.hidden = rec.state === "queued";
+  if (rec.barBox) rec.barBox.hidden = rec.state === "queued" || off;
   // 排队与失败都得看得出「为什么还没出去、已经白试了几次」，
   // 否则用户只看到一颗待发点，不知道是该等还是该重发
   const why = m.reason ? `（第 ${m.retry || 1} 次尝试失败：${m.reason}）` : "";
-  rec.el.title =
-    rec.state === "queued"
+  rec.el.title = m.recalled
+    ? RECALL_TEXT[m.dir === "in" ? "in" : "out"]
+    : rec.state === "queued"
       ? `对方离线，已排队；它上线后会自动补发${why}`
       : rec.state === "failed"
         ? `补发失败，已停手${why}；可以重新发送`
         : "";
+}
+
+/* --------------------------------------------------------------------------
+ * 撤回与本机删除
+ *
+ * 两件事只差在「问不问对方」：撤回限在发送方一分钟以内、且真去通知对端，两边
+ * 都不再显示正文；删除只是本机不再显示它，对端那份与收件箱里的文件一概不动。
+ * 硬判据（谁能撤、什么时候过期）写在 Rust 的 store::recall_check 里，下面那一档
+ * 只决定入口露不露 —— 气泡不会自己按时重画，真过期了那一刀还得那边拦。
+ * ------------------------------------------------------------------------ */
+
+/** 这一条还给不给撤回入口：本机发出的、没撤过、还在一分钟内，
+ *  而且这一轮没被后端判过（点了被拒多半就是时间窗过了，别再让人反复点） */
+function recallable(rec, m) {
+  return (
+    !!m &&
+    m.dir === "out" &&
+    !m.recalled &&
+    !rec.noRecall &&
+    Date.now() - (m.ts || 0) < RECALL_MS
+  );
+}
+
+/** 把这一条换成一句「撤回了一条消息」：正文、预览、文件操作全拆下来。
+ *  只改显示 —— 已经落进收件箱的那个文件不跟着删（它可能早被人打开过了） */
+function paintRecalled(rec) {
+  if (rec.recalledPainted) return;
+  rec.recalledPainted = true;
+  const m = rec.msg || {};
+  // 底色与边框跟着正文一起退场（那一层蓝/灰是给「有内容」用的）
+  rec.el.classList.add("is-recalled");
+  rec.bubble.textContent = "";
+  const line = document.createElement("div");
+  line.className = "msg-recalled";
+  line.textContent = RECALL_TEXT[m.dir === "in" ? "in" : "out"];
+  rec.bubble.appendChild(line);
+  if (rec.actsBox) rec.actsBox.textContent = "";
+  if (rec.thumbBox) rec.thumbBox.hidden = true;
+}
+
+/** 撤回这一条：成功就走一遍重画，两边都换成一句提示 */
+async function recallMessage(rec) {
+  const id = rec?.msg?.id;
+  if (!id) return;
+  try {
+    const done = await invoke("msg_recall", { id });
+    // 不等事件再画：点了该当场看见结果（msg-updated 推回来的也是这一条，重画一次不冲突）
+    if (done && done.id) {
+      upsertMessage(done);
+      reconcileDividers();
+    }
+    await loadSessions();
+    toast("已撤回：对方那边也不再显示正文");
+  } catch (err) {
+    console.error("[xfer] 撤回失败:", err);
+    toast(errText(err), "error");
+    // 被拦下来就记住这一轮别再给撤回入口（那一分钟已经过了，或者这台已经不认
+    // 对方了）—— 菜单每次摊开都重算，不记的话用户还会反复点
+    rec.noRecall = true;
+  }
+}
+
+/** 本机删除：成功后才把气泡拿掉，失败就原样留着 —— 不能让用户以为删了而它还在。
+ *  历史文件里那一行仍然留着，只是读的时候被 hidden 挡掉，所以重启也不会它又冒出来 */
+async function deleteMessage(rec) {
+  const id = rec?.msg?.id;
+  if (!id) return;
+  try {
+    await invoke("msg_delete", { id });
+  } catch (err) {
+    console.error("[xfer] 删除失败:", err);
+    toast(errText(err), "error");
+    return;
+  }
+  const s = cur();
+  s.bubbles.delete(id);
+  rec.el.remove();
+  if (s.oldestId === id) {
+    // 翻页锚点不能指着一条已经不显示的消息：后端把失效游标当成「从头给最新一页」，
+    // 「加载更早」会原地打转
+    s.oldestId = ui.stream.querySelector(".msg")?.dataset?.id || null;
+  }
+  if (!s.bubbles.size) {
+    // 删空了这一页但更早还有：得让后端再给一页，否则会话栏里那个框就翻不回去了
+    //（一条气泡都没有时「加载更早」那根栏是收起来的）
+    if (s.hasMore) {
+      await loadHistory();
+      return;
+    }
+    ui.stream.innerHTML = `<div class="stream-empty">这个对话框里的消息都被删掉了。</div>`;
+  }
+  renderOlderBar();
+  reconcileDividers();
+  applyFilter();
+  // 会话栏那句摘要很可能就是刚删掉的这一条，未读数也可能跟着变了
+  await loadSessions();
 }
 
 /**
@@ -1439,17 +1632,22 @@ function upsertMessage(m, anchor = null) {
   // 占位气泡后来才补齐的 name/path/size 也在这里落地
   rec.msg = { ...(rec.msg || {}), ...m };
   paintMeta(rec, m);
-  // 接收完成时才拿到落盘路径与真实名字/大小，逐块补上（已填过则内部直接返回）
-  if (rec.fileName && m.name) {
-    rec.fileName.textContent = m.name;
-    rec.fileName.title = m.path || "";
-  }
-  if (rec.fileSize && m.size) rec.fileSize.textContent = fmtSize(m.size);
-  attachThumb(rec, m);
-  attachActions(rec, m);
-  if (rec.bar && m.size) {
-    // 状态已终结时用满格，避免出现「已送达但进度条 98%」
-    rec.bar.style.width = m.state === "sent" ? "100%" : rec.bar.style.width || "0%";
+  if (rec.msg.recalled) {
+    // 撤回之后：正文与预览都不该再露出来，后面的进度/路径补全一律不走了
+    paintRecalled(rec);
+  } else {
+    // 接收完成时才拿到落盘路径与真实名字/大小，逐块补上（已填过则内部直接返回）
+    if (rec.fileName && m.name) {
+      rec.fileName.textContent = m.name;
+      rec.fileName.title = m.path || "";
+    }
+    if (rec.fileSize && m.size) rec.fileSize.textContent = fmtSize(m.size);
+    attachThumb(rec, m);
+    attachActions(rec, m);
+    if (rec.bar && m.size) {
+      // 状态已终结时用满格，避免出现「已送达但进度条 98%」
+      rec.bar.style.width = m.state === "sent" ? "100%" : rec.bar.style.width || "0%";
+    }
   }
   // 正筛着的时候来了新消息，不能让它绕过筛选直接冒出来
   if (filterActive()) applyFilter();
@@ -1538,6 +1736,8 @@ function bumpRail(m, sid, kind) {
 
 /** 会话栏摘要的口径与后端 session_stats() 一致，改这一行时要同时改那边 */
 function summarize(m) {
+  // 撤回的那条不再露正文（与 Rust 那份同口径，两边都得是同一句话）
+  if (m.recalled) return RECALL_SUMMARY;
   if (m.kind === "text") return m.text || "";
   if (m.kind === "folder") return `[文件夹] ${m.name || ""}`;
   if (m.kind === "file") return `[文件] ${m.name || ""}`;
@@ -1681,6 +1881,9 @@ function matches(rec) {
   const m = rec.msg;
   if (!m) return true;
   const f = state.filter;
+  // 撤回的那条不参加搜索：正文已经看不见了，命中它就是搜一个不存在的内容。
+  // 但没在筛的时候它仍要露着那句「撤回了一条消息」，所以判据盯的是筛着的时候
+  if (m.recalled) return !filterActive();
   if (f.kind !== "all" && classify(m) !== f.kind) return false;
   if (!f.q) return true;
   // 文字消息搜正文，文件/文件夹搜名字（path 不搜：太长且容易误命中目录部分）
@@ -2030,7 +2233,7 @@ async function savePairConfig() {
 /* --------------------------------------------------------------------------
  * 本机接收：提示音与收件目录
  *
- * 两项都存在 prefs.json，与对比视图那份是同一个文件、同一对命令（get_prefs / set_prefs）。
+ * 这几项都存在 prefs.json，与对比视图那份是同一个文件、同一对命令（get_prefs / set_prefs）。
  * set_prefs 是局部更新：这里只传 notify / inbox，不会把用户选的布局冲掉，反之也一样。
  * 声音本身在 Rust 侧播（js 里 new Audio() 会被 WKWebView 的自动播放策略拦下，
  * 而且窗口关掉后根本没人在场），这里只负责那个开关。
@@ -2096,6 +2299,9 @@ async function refreshRecvPrefs() {
     const p = await invoke("get_prefs");
     // 老 prefs.json 里没这两项时 Rust 已按出厂态补齐，这里只兜「命令整个没回」
     if (p && typeof p.notify === "boolean") paintNotifySwitch(p.notify);
+    // 心跳节拍。键名就是 heartbeat_ms：get_prefs 回的是 Rust 结构体原样序列化（下划线），
+    // 只有传进去的调用参数才走 Tauri 的 camelCase，两边拿同一个名字去读会永远读不到
+    if (p && typeof p.heartbeat_ms === "number") paintHeartbeat(p.heartbeat_ms);
   } catch (_) {
     /* 非 Tauri 环境（自检桩）保持 HTML 初始态 */
   }
@@ -2162,6 +2368,46 @@ async function chooseInboxLayout(ev) {
   );
   if (ok) paintInboxLayout(next);
   else paintInboxLayout(prev);
+}
+
+/* --------------------------------------------------------------------------
+ * 在线探测：心跳节拍
+ *
+ * 节拍是 Rust 那边心跳线程每拍从 prefs.json 读的（不缓存），所以这里存下去
+ * 下一拍就生效，不必重启；前端不自己开计时器，否则两份节拍会互相盖。
+ * ------------------------------------------------------------------------ */
+
+/** 与 store.rs 的 HEARTBEAT_OPTIONS 一份口径：多一档少一档都会让下拉与白名单对不上 */
+const HEARTBEAT_NAME = {
+  1000: "1 秒",
+  2000: "2 秒",
+  5000: "5 秒",
+  10000: "10 秒",
+};
+/** 连续几拍探不通才算离线（client.rs 的 OFFLINE_THRESHOLD），只用来拼那句提示 */
+const OFFLINE_BEATS = 3;
+
+function paintHeartbeat(ms) {
+  // 读回一个白名单外的值时按出厂那一档显示：界面上的选项必须与心跳线程真正
+  // 在用的那拍一致（value 设不进去时下拉会停在空白处，那比退回默认更难查）
+  const v = HEARTBEAT_NAME[ms] ? ms : 1000;
+  state.heartbeatMs = v;
+  if (ui.heartbeatSel) ui.heartbeatSel.value = String(v);
+}
+
+/** 切换探测间隔。存不下就把下拉退回原值：界面停在一个没生效的档位上，
+ * 用户等补发、等离线标记时按的那个时长就全猜错 */
+async function chooseHeartbeat(ev) {
+  const next = Number(ev?.target?.value) || 1000;
+  const prev = state.heartbeatMs;
+  if (next === prev) return;
+  // 参数名按 Tauri 默认 camelCase：Rust 那边是 `heartbeat_ms`
+  const ok = await saveRecvPrefs(
+    { heartbeatMs: next },
+    `探测间隔改成「${HEARTBEAT_NAME[next] || next}」，判离线约要 ${((next * OFFLINE_BEATS) / 1000) | 0} 秒，下一拍就生效`,
+  );
+  if (ok) paintHeartbeat(next);
+  else paintHeartbeat(prev);
 }
 
 /**
@@ -2443,6 +2689,7 @@ if (ui.btnInboxChoose) ui.btnInboxChoose.addEventListener("click", chooseInboxDi
 if (ui.btnInboxReset) ui.btnInboxReset.addEventListener("click", resetInboxDir);
 if (ui.btnInboxReveal) ui.btnInboxReveal.addEventListener("click", revealInboxDir);
 if (ui.inboxLayout) ui.inboxLayout.addEventListener("change", chooseInboxLayout);
+if (ui.heartbeatSel) ui.heartbeatSel.addEventListener("change", chooseHeartbeat);
 
 /* 搜索：输入就筛。不加防抖——纯内存遍历几百个气泡，比等防抖窗口更快出结果 */
 if (ui.search) {

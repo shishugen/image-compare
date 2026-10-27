@@ -299,6 +299,15 @@ pub struct Message {
     /// 最后一次失败的原因，气泡悬停时原样给用户看
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// 发送方把这条撤回了（只有发出去一分钟内的能撤）。两边都只当它是一句
+    /// 「撤回了一条消息」，正文不再显示。走的还是「同 ID 再追一行」那套追加式做法，
+    /// 所以老文件里没这个字段就是没撤回过
+    #[serde(default)]
+    pub recalled: bool,
+    /// 本机把这一条删了：读取时直接过滤掉，所以界面上再也看不见，
+    /// 而**对端那份完全不动**（这也是它和「撤回」的区别）
+    #[serde(default)]
+    pub hidden: bool,
 }
 
 /// 新增字段全靠这里兜底：构造点写 `..Default::default()`，
@@ -319,6 +328,8 @@ impl Default for Message {
             sid: String::new(),
             retry: 0,
             reason: None,
+            recalled: false,
+            hidden: false,
         }
     }
 }
@@ -333,6 +344,35 @@ impl Message {
             &self.sid
         }
     }
+
+    /// 这条已经落到对端了吗？只有 sent 才算：撤回得真去通知对方，
+    /// 而还没送达的那条（queued/sending/failed）本机把它撤掉就够了 ——
+    /// 对方根本没见过它，队列里出队即可，发出去的只是一次注定失败的请求
+    pub fn delivered(&self) -> bool {
+        self.state == "sent"
+    }
+}
+
+/// 能撤回的时间窗：发出去超过这个时限就不再给撤回入口。
+/// 只在这一份里写数，命令与界面提示都读它（改这里，两处的文案都得跟着改）
+pub const RECALL_WINDOW_MS: i64 = 60_000;
+
+/// 这条能不能撤回，判据只写这一份（撤回命令与单测都走它）。
+/// 界面把入口按时间收起来只是手感，真正的拦必须在这里：
+/// 气泡可能开了几分钟没重画，前端那个入口还在，点了就归这里说了算。
+/// Err 里的文案直接给用户看，所以每一条都说清「为什么不行」
+pub fn recall_check(m: &Message, now: i64) -> Result<(), String> {
+    if m.dir != "out" {
+        return Err("只能撤回自己发出去的消息".into());
+    }
+    if m.recalled {
+        return Err("这条已经撤回了".into());
+    }
+    // ts 是本机落库那一刻的 now_ms，不掺对端时钟，直接相减就是用户等了多久
+    if now - m.ts >= RECALL_WINDOW_MS {
+        return Err("超过 1 分钟就不能撤回了".into());
+    }
+    Ok(())
 }
 
 /// JSONL 去重：同一个 id 以最后写的那一行为准，但**保持首次出现的顺序** ——
@@ -425,6 +465,10 @@ pub struct Preferences {
     /// `INBOX_LAYOUT_DEFAULT`——所以升级上来就是按天分，不需要用户再点一次
     #[serde(default)]
     pub inbox_layout: String,
+    /// 在线探测的心跳节拍（毫秒）。同样只允许 `HEARTBEAT_OPTIONS` 里那几档，
+    /// 老 prefs.json 没这一项时补 `HEARTBEAT_DEFAULT`（= 改这功能之前的写死值）
+    #[serde(default = "default_heartbeat")]
+    pub heartbeat_ms: u64,
 }
 
 fn default_sync() -> bool {
@@ -445,6 +489,17 @@ pub const INBOX_LAYOUTS: [&str; 3] = ["day", "month", "flat"];
 /// 还能在界面上切成按月，不必因为出厂值不好用就去翻 prefs.json
 pub const INBOX_LAYOUT_DEFAULT: &str = "day";
 
+/// 心跳节拍的白名单（毫秒）。做成离散四档而不是任意数字：一个手滑填进去的
+/// 10 毫秒会把局域网变成 ping 洪水，而“离线 = 连续 3 拍失败”这个口径也会
+/// 跟着变成 30 毫秒的抖动误判——白名单让前端根本拿不出这种值
+pub const HEARTBEAT_OPTIONS: [u64; 4] = [1000, 2000, 5000, 10000];
+/// 出厂节拍，与这功能可配之前写死的那个值一致：升级上来行为不变
+pub const HEARTBEAT_DEFAULT: u64 = 1000;
+
+fn default_heartbeat() -> u64 {
+    HEARTBEAT_DEFAULT
+}
+
 impl Default for Preferences {
     /// 出厂态就是前端 HTML 里写死的那一份（两图 + 同步开 + 滚轮缩放 + 响一声 +
     /// 默认收件目录），两边不一致会让「读到空」与「读到默认」表现出差别，没必要
@@ -456,6 +511,7 @@ impl Default for Preferences {
             notify: default_notify(),
             inbox: String::new(),
             inbox_layout: INBOX_LAYOUT_DEFAULT.into(),
+            heartbeat_ms: HEARTBEAT_DEFAULT,
         }
     }
 }
@@ -481,6 +537,11 @@ impl Preferences {
         // 不认的值会让落盘规则静默退化成「不分目录」，而界面还显示着「按天」
         if !INBOX_LAYOUTS.contains(&self.inbox_layout.as_str()) {
             self.inbox_layout = INBOX_LAYOUT_DEFAULT.into();
+        }
+        // 节拍同理：白名单外的值（手改成 0 会把这个线程变成空转烤 CPU）退回出厂档。
+        // 设在这儿的值是「读到的」口径，set_prefs 那边还有一份显式拒绝
+        if !HEARTBEAT_OPTIONS.contains(&self.heartbeat_ms) {
+            self.heartbeat_ms = HEARTBEAT_DEFAULT;
         }
     }
 }
@@ -711,16 +772,63 @@ impl Store {
 
     /// JSONL 是追加式的：同一条消息的状态变更会再写一行，读取时以最后一条为准，
     /// 但保持首次出现的顺序（前端按时间铺气泡，不能因为更新状态就跳到列表末尾）。
+    /// 本机删掉的那些（`hidden`）在这里就筛掉：历史分页、会话摘要、未读数
+    /// 全走这一条出口，所以「删了」在哪个界面都是一样彻底（文件里那一行仍留着）
     pub fn read_messages(&self, limit: usize) -> Vec<Message> {
         let txt = match fs::read_to_string(self.file("messages.jsonl")) {
             Ok(t) => t,
             Err(_) => return Vec::new(),
         };
-        let mut merged = dedup_lines(&txt);
+        let mut merged: Vec<Message> = dedup_lines(&txt)
+            .into_iter()
+            .filter(|m| !m.hidden)
+            .collect();
         if merged.len() > limit {
             merged = merged.split_off(merged.len() - limit);
         }
         merged
+    }
+
+    /// 这一条最新的那一行，**不做任何可见性过滤**。
+    /// 与 read_messages 分开是因为用途不同：这里要的是「盘上现在写的是什么」，
+    /// 连被本机删掉的那条也得能拿到，否则改状态时会把 `hidden` 当成 false 写回去
+    pub fn raw_message(&self, id: &str) -> Option<Message> {
+        let txt = fs::read_to_string(self.file("messages.jsonl")).ok()?;
+        // 倒着找：最新那一行总在文件靠后的位置，先把 id 做廉价子串筛再反序列化
+        for line in txt.lines().rev() {
+            if !line.contains(id) {
+                continue;
+            }
+            if let Ok(m) = serde_json::from_str::<Message>(line) {
+                if m.id == id {
+                    return Some(m);
+                }
+            }
+        }
+        None
+    }
+
+    /// 这一条最新的两个可见性标记（没有这条就是都没标上）。
+    /// 状态写入（sent/failed/queued）拿的是**投递开始前**的快照做 clone，这期间用户
+    /// 可能撤了或删了它 —— 不保住这两个字段，一次成功的投递就会把「已撤回」冲掉，
+    /// 撤走的消息会在两边同时复活
+    pub fn flags_of(&self, id: &str) -> (bool, bool) {
+        self.raw_message(id)
+            .map(|m| (m.recalled, m.hidden))
+            .unwrap_or((false, false))
+    }
+
+    /// 同 ID 追一行，只改传进来的那部分（其余字段从盘上最新那一行原样带过去）。
+    /// 撤回与本机删除都走这里：它们不改投递状态，也就不该碰状态那几个字段
+    pub fn patch_flags(
+        &self,
+        id: &str,
+        patch: impl FnOnce(&mut Message),
+    ) -> Result<Message, String> {
+        let mut done = self.raw_message(id).ok_or("找不到这条消息，可能已经被删掉了")?;
+        patch(&mut done);
+        self.append_message(&done)?;
+        Ok(done)
     }
 
     /// 待发（离线排队）的、本机发出去的消息，按首次出现的顺序
@@ -740,7 +848,9 @@ impl Store {
         }
         dedup_lines(&txt)
             .into_iter()
-            .filter(|m| m.dir == "out" && m.state == "queued")
+            // 撤回与本机删除的那两条都得算出队：一条已经撤走的待发消息
+            // 不该在对方上线时又被补发出去，那等于把用户撤掉的东西又送回去
+            .filter(|m| m.dir == "out" && m.state == "queued" && !m.recalled && !m.hidden)
             .collect()
     }
 
@@ -1056,6 +1166,7 @@ mod tests {
         // 上一版 prefs.json 里根本没有这两项：缺字段就当出厂态（响一声 + 默认收件目录）
         assert!(p.notify, "缺 notify 字段不能变成静默");
         assert!(p.inbox.is_empty(), "缺 inbox 字段就是默认收件目录");
+        assert_eq!(p.heartbeat_ms, HEARTBEAT_DEFAULT, "缺 heartbeat_ms 就是原来的写死节拍");
 
         // 前端不认的布局与滚轮值：存进去就该被清掉（没有 CSS 的布局会让四个窗都不显示）
         for bad_layout in ["3", "", "8", "两图"] {
@@ -1068,6 +1179,27 @@ mod tests {
         // 整份被改坏也不能报错，回出厂态（偏好读不出来不值得挂掉界面初始化）
         std::fs::write(s.file("prefs.json"), "不是 JSON").unwrap();
         assert_eq!(s.load_prefs(), Preferences::default());
+        let _ = std::fs::remove_dir_all(&s.dir);
+    }
+
+    #[test]
+    fn 心跳节拍往返与白名单外的值退回出厂档() {
+        let s = 临时存储("heartbeat");
+        std::fs::create_dir_all(&s.dir).unwrap();
+        // 选了一档就活过重启：节拍是心跳线程每拍从磁盘读的，读回来就是生效的那一档
+        for &ok in &HEARTBEAT_OPTIONS {
+            s.save_prefs(&Preferences {
+                heartbeat_ms: ok,
+                ..Preferences::default()
+            })
+            .unwrap();
+            assert_eq!(s.load_prefs().heartbeat_ms, ok, "{ok} 是白名单里的档位，不该被改回去");
+        }
+        // 白名单外的一律退回出厂档：0 会让这个线程空转烤 CPU，负数与非数字根本解不开
+        for bad in ["0", "10", "999", "1500", "\"5000\""] {
+            std::fs::write(s.file("prefs.json"), format!(r#"{{ "heartbeat_ms": {bad} }}"#)).unwrap();
+            assert_eq!(s.load_prefs().heartbeat_ms, HEARTBEAT_DEFAULT, "脏值 {bad} 必须退回出厂档");
+        }
         let _ = std::fs::remove_dir_all(&s.dir);
     }
 
@@ -1506,5 +1638,90 @@ mod tests {
         assert_eq!(msgs[0].state, "sent");
         assert_eq!(msgs[0].retry, 0, "送达后计数与原因都得清掉");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 撤回与本机删除只追一行不改投递状态() {
+        let dir = std::env::temp_dir().join(format!("imgcmp-recall-{}", now_ms()));
+        let s = Store::new(dir.clone());
+        let base = Message {
+            id: "m1".into(),
+            dir: "out".into(),
+            kind: "text".into(),
+            text: Some("甲".into()),
+            state: "sent".into(),
+            ts: now_ms(),
+            peer: "a".into(),
+            sid: "a".into(),
+            ..Default::default()
+        };
+        s.append_message(&base).unwrap();
+
+        // 老文件没有这两个字段：读出来就是没撤过、没删过
+        assert!(!s.raw_message("m1").unwrap().recalled);
+        assert!(!s.raw_message("m1").unwrap().hidden);
+
+        let after = s.patch_flags("m1", |m| m.recalled = true).unwrap();
+        assert_eq!(after.state, "sent", "撤回不能顺手改投递状态");
+        assert_eq!(after.text.as_deref(), Some("甲"), "正文字段得原样带过去");
+        assert!(after.recalled);
+        // 行号只多了一条：同 ID 追加，不是改写
+        let txt = fs::read_to_string(s.file("messages.jsonl")).unwrap();
+        assert_eq!(txt.lines().count(), 2);
+
+        // 已撤回的待发消息必须出队：否则对方上线时会被补发出去，
+        // 等于把用户撤掉的东西又送回去
+        s.append_message(&Message {
+            id: "m2".into(),
+            state: "queued".into(),
+            ..base.clone()
+        })
+        .unwrap();
+        s.patch_flags("m2", |m| m.recalled = true).unwrap();
+        assert_eq!(
+            s.pending_messages()
+                .iter()
+                .map(|m| m.id.clone())
+                .collect::<Vec<_>>(),
+            Vec::<String>::new(),
+            "撤回后的那条不该还挂在队列里"
+        );
+
+        // 本机删除：读取口径里彻底看不见，而盘上那一行还在（对端那份更不会被碰）
+        s.patch_flags("m1", |m| m.hidden = true).unwrap();
+        assert!(s.read_messages(100).iter().all(|m| m.id != "m1"));
+        assert!(s.raw_message("m1").is_some(), "只是不显示，历史文件不删行");
+        // hidden 的那条改状态时也得保住标记，不能被当成 false 写回去
+        assert_eq!(s.flags_of("m1"), (true, true));
+        assert_eq!(s.flags_of("没有这条"), (false, false));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 撤回判据只认一分钟内自己发出去的那几条() {
+        let 现在 = 1_700_000_000_000;
+        let 我发的 = Message {
+            dir: "out".into(),
+            ts: 现在 - 1000,
+            ..Default::default()
+        };
+        assert!(recall_check(&我发的, 现在).is_ok(), "刚发出去的该给撤回入口");
+
+        // 刚好满一分钟：窗口是开区间，这一条已经没有入口了
+        assert!(recall_check(
+            &Message {
+                ts: 现在 - RECALL_WINDOW_MS,
+                ..我发的.clone()
+            },
+            现在
+        )
+        .is_err());
+        assert!(recall_check(&Message { dir: "in".into(), ..我发的.clone() }, 现在).is_err());
+        assert!(
+            recall_check(&Message { recalled: true, ..我发的.clone() }, 现在).is_err(),
+            "撤过的不能算第二次成功"
+        );
+        // 提示文案里那个数字必须跟着常量走，不然改了窗口界面上还在说一分钟
+        assert_eq!(RECALL_WINDOW_MS, 60_000);
     }
 }

@@ -772,6 +772,12 @@ impl Hub {
 
     /// 心跳每一拍调一次。队列空（绝大多数时候）就直接走，不碰任何锁与线程
     pub fn spawn_due_flush(self: &Arc<Self>) {
+        // 快速闸门：一个在线对端都没有就没法补发，不必去读 messages.jsonl——
+        // 历史文件可以很大，没必要陪着心跳每秒全量读一遍。离线排队的消息
+        // 不丢：对端上线的那一拍，这个条件自然成立
+        if self.peers_snapshot().iter().all(|p| !p.online) {
+            return;
+        }
         for (sid, ids) in self.flush_plan() {
             // 先查会话再占许可：会话没了就把那几条直接标失败，
             // 不能让它们永远挂着「待发」
@@ -849,6 +855,11 @@ impl Hub {
     }
 }
 
+/// 会话栏里那句「谁撤回了一条消息」的文案。两侧都得写成一样（前端那份在
+/// view-transfer.js 的 summarize 里），否则会话行与气泡会各说一套；
+/// 静态合约把这两个字符串钉在一起
+pub(crate) const RECALL_SUMMARY: &str = "撤回了一条消息";
+
 /// 一遍历史算出每个对话框的未读数、最后一条时间与摘要。
 /// 拆成纯函数是为了能把未读口径当面议定：只数对方发来的、只数读指针之后的。
 /// key 是会话 ID（不是对端 ID）：同一台的几个框要各算各的
@@ -861,15 +872,21 @@ fn session_stats<'a>(msgs: &'a [Message], reads: &HashMap<&str, i64>) -> HashMap
         e.peer = m.peer.as_str();
         if m.ts >= e.last {
             e.last = m.ts;
-            e.summary = match m.kind.as_str() {
-                "text" => m.text.clone().unwrap_or_default(),
-                "file" => format!("[文件] {}", m.name.clone().unwrap_or_default()),
-                "folder" => format!("[文件夹] {}", m.name.clone().unwrap_or_default()),
-                other => other.to_string(),
+            // 撤回的那条只留一句话：正文不能继续顶在会话栏上（前端 summarize() 同口径）
+            e.summary = if m.recalled {
+                RECALL_SUMMARY.to_string()
+            } else {
+                match m.kind.as_str() {
+                    "text" => m.text.clone().unwrap_or_default(),
+                    "file" => format!("[文件] {}", m.name.clone().unwrap_or_default()),
+                    "folder" => format!("[文件夹] {}", m.name.clone().unwrap_or_default()),
+                    other => other.to_string(),
+                }
             };
         }
-        // 未读只数对方发来的，自己发的不算
-        if m.dir == "in" && m.ts > *reads.get(key).unwrap_or(&0) {
+        // 未读只数对方发来的，自己发的不算；撤回的那条也不算 —— 对方已经把它撤了，
+        // 那一行还挂红点就是在催用户去读一句「没东西」
+        if m.dir == "in" && !m.recalled && m.ts > *reads.get(key).unwrap_or(&0) {
             e.unread += 1;
         }
     }
@@ -1065,17 +1082,28 @@ pub(crate) fn flush_targets(
 /// 到上限才转「失败」。补发与投递两条路都走这里，口径只有一份
 pub(crate) fn retry(store: &Store, msg: &Message, err: &str, hard: bool) -> Message {
     let n = msg.retry + 1;
-    let done = Message {
-        state: if hard || n >= MAX_RETRY {
+    let done = with_flags(store, msg, |m| {
+        m.state = if hard || n >= MAX_RETRY {
             "failed".into()
         } else {
             "queued".into()
-        },
-        retry: n,
-        reason: Some(err.to_string()),
-        ..msg.clone()
-    };
+        };
+        m.retry = n;
+        m.reason = Some(err.to_string());
+    });
     let _ = store.append_message(&done);
+    done
+}
+
+/// 状态落库前先把盘上最新的两个可见性标记（撤回 / 本机删除）盖回来。
+/// 每一处状态写入拿的都是**投递开始前**的快照做 clone，这期间用户可能刚把这条撤了；
+/// 不盖回来，一次成功的投递就会把「已撤回」冲成 false，撤走的消息会在两边同时复活
+pub(crate) fn with_flags(store: &Store, msg: &Message, patch: impl FnOnce(&mut Message)) -> Message {
+    let (recalled, hidden) = store.flags_of(&msg.id);
+    let mut done = msg.clone();
+    done.recalled = recalled;
+    done.hidden = hidden;
+    patch(&mut done);
     done
 }
 
@@ -1358,6 +1386,54 @@ fn page_messages(
 #[tauri::command]
 pub fn sessions(hub: State<'_, Arc<Hub>>) -> Value {
     hub.sessions_json()
+}
+
+/// 撤回自己一分钟以内发出去的那一条（两边都不再显示正文）。
+/// 要等一个网络往返（10 秒超时），所以跟 send_text 一样放 blocking 线程里跑，
+/// 不能把主线程顶住。参数只用一个 id：与 msg_history 那些同一套命名口径
+#[tauri::command]
+pub async fn msg_recall(hub: State<'_, Arc<Hub>>, id: String) -> Result<Message, String> {
+    let hub = hub.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || recall_one(&hub, &id))
+        .await
+        .map_err(|e| format!("撤回任务被中断: {e}"))?
+}
+
+/// 撤回那一条：判据、出队、通知对端三步都只走一份口径
+fn recall_one(hub: &Arc<Hub>, id: &str) -> Result<Message, String> {
+    // 只从可见的历史里找：本机删过的那条界面上已经没入口了，不该还能撤
+    let m = hub
+        .store
+        .read_messages(usize::MAX)
+        .into_iter()
+        .find(|x| x.id == id)
+        .ok_or("找不到这条消息")?;
+    store::recall_check(&m, store::now_ms())?;
+    // 已经送达的那条必须先去对方把它撤掉，成了本机才跟着改：反过来的话，
+    // 本机显示「已撤回」而对方还挂着原文，那句提示就是假的
+    // 还没送达的（待发/失败）则相反：对方根本没见过它，发出去只是一次注定失败的往返，
+    // 本机标上撤回就是从队列里拿掉（pending_messages 已不再拾它）
+    if m.delivered() {
+        let peer = hub
+            .peer_by_id(&m.peer)
+            .ok_or("所属那台已经不在列表里，这条撤回不了")?;
+        client::recall(hub, &peer, &m).map_err(|e| format!("撤回失败：{e}"))?;
+    }
+    let done = hub.store.patch_flags(id, |x| x.recalled = true)?;
+    hub.emit("msg-updated", serde_json::json!({ "message": done.clone() }));
+    // 会话栏那句摘要也得跟着换成「撤回了一条消息」，不然列表里还露着原文
+    hub.emit_sessions();
+    Ok(done)
+}
+
+/// 本机删除一条消息：只是这一台不再显示它，对端那份与收件箱里的文件都不动，
+/// 也不限时间（这是它与「撤回」的唯一区别）。不碰网络，同步返回就行
+#[tauri::command]
+pub fn msg_delete(hub: State<'_, Arc<Hub>>, id: String) -> Result<Message, String> {
+    let done = hub.store.patch_flags(&id, |m| m.hidden = true)?;
+    // 删掉的那条可能正是会话栏里那句摘要，也可能带走了唯一的未读
+    hub.emit_sessions();
+    Ok(done)
 }
 
 /// 确保某台的基础对话在列表里（幂等：重复调用只会把它建出来，不会多出第二个框）
@@ -1828,6 +1904,44 @@ mod tests {
         assert_eq!(st["a"].summary, "更新的");
         // 读指针表里没有的会话（刚从历史里露出来的）当作一条都没读过
         assert_eq!(st["b"].unread, 1);
+    }
+
+    #[test]
+    fn 撤回的那条不挂未读而摘要只留一句话() {
+        let 撤过 = Message {
+            recalled: true,
+            ..消息("正文不该露", "a", "in", 200)
+        };
+        let msgs = vec![消息("正常的一条", "a", "in", 100), 撤过];
+        let reads: HashMap<&str, i64> = [("a", 0i64)].into_iter().collect();
+        let st = session_stats(&msgs, &reads);
+        assert_eq!(st["a"].unread, 1, "撤掉的那条不该再催用户去读，没撤的那条照数");
+        assert_eq!(st["a"].summary, RECALL_SUMMARY, "会话栏不能还露着撤走的正文");
+        assert_eq!(st["a"].last, 200, "撤回不改时间：这一行仍按最后一条排");
+    }
+
+    #[test]
+    fn 补发失败不能把撤回标记冲掉() {
+        let dir = std::env::temp_dir().join(format!("imgcmp-recallkeep-{}", store::now_ms()));
+        let store = Store::new(dir.clone());
+        let base = Message {
+            id: "m1".into(),
+            dir: "out".into(),
+            kind: "text".into(),
+            state: "queued".into(),
+            ts: 1,
+            peer: "a".into(),
+            ..Default::default()
+        };
+        store.append_message(&base).unwrap();
+        // 心跳拍先读到了「还没撤」的快照，就在它要投出去的那一瞬用户撤了这条：
+        // 拿这份旧快照落的状态会把 recalled 写回 false，撤走的东西等于复活了
+        let 旧快照 = base.clone();
+        store.patch_flags("m1", |m| m.recalled = true).unwrap();
+        let done = retry(&store, &旧快照, "对方没响应", false);
+        assert!(done.recalled, "一次失败的状态写入不该把撤回冲掉");
+        assert_eq!(done.state, "queued", "没到上限还是待发");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
