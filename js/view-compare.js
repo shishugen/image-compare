@@ -45,6 +45,8 @@ const ui = {
   btnTile: el("btn-tile"),
   // 窗口置顶（只这一次运行有效，不存盘）
   btnTopmost: el("btn-topmost"),
+  // 把这扇窗从浏览轮转里摘出去（与置顶无关，钉的是一扇图窗）
+  btnPinPane: el("btn-pin-pane"),
   tvRoot: el("cmp-tileview"),
   tvCanvas: el("tv-canvas"),
   tvZoom: el("tv-zoom"),
@@ -333,6 +335,11 @@ const LAYOUTS = ["1", "2", "4"];
 const LAYOUT_KEYS = { 1: ["a"], 2: ["a", "b"], 4: ["a", "b", "c", "d"] };
 const LAYOUT_NAMES = { 1: "单图浏览", 2: "两图并排", 4: "四图 2×2" };
 let layout = "2"; // 启动时被 applyPrefs 覆盖成磁盘上那一份
+/** 哪几扇窗被「固定」住了（不参与浏览轮转），存的是窗 key。
+ *  与后面那枚「置顶」的 pinned 不是一回事：那个钉的是整个窗口，这个钉的是一扇图窗。
+ *  不写 prefs.json：固定的是「这一扇窗此刻这张图」，重启后窗里根本没图，
+ *  跟置顶同一条纪律（每次启动从干净状态开始）。 */
+const panePins = new Set();
 
 /** 当前布局下可见的窗 */
 function visiblePanes() {
@@ -398,6 +405,52 @@ function refreshLayoutUI() {
       label.title = single ? "只剩一个窗，同步没有作用（切回 2/4 图可用）" : "开启后所有可见窗的缩放平移保持一致";
     }
   }
+  // 单图档下「固定」也一起灰：只有一扇窗，固定了浏览就没地方落了（取态在这一个入口里算）
+  refreshPinUI();
+}
+
+/** 固定哪扇：认用户明确点过的那扇（panePicked），不是 activePane —— 后者会被 assign()
+ *  顺手改掉，分不清「用户选的」还是「刚被浏览铺上的」（与粘贴落点同一套取态）。
+ *  没点过、或点的那扇已被切档切走时，退回活动窗。 */
+function pinTargetPane() {
+  const visible = visiblePanes();
+  if (panePicked && visible.includes(panePicked)) return panePicked;
+  return visible.includes(activePane) ? activePane : null;
+}
+
+/** 固定上限：这一档至少得留一扇能落图（单图 0 扇、两图 1 扇、四图 3 扇）。
+ *  两图把两扇都固定 = 「轮流展示」的落窗清零，浏览整个瘫掉（用户原话「两张图片，只能固定1张」）。
+ *  能固定回 null；否则回那句要说给人听的话——tooltip 与状态行共用这一份措辞，
+ *  免得两处各写一句越改越不一样。目标窗本来已固定时永远回 null（那是取消，不受上限管） */
+function pinLimitNote(target) {
+  if (!target || panePins.has(target.key)) return null;
+  const seq = LAYOUT_KEYS[layout] || LAYOUT_KEYS[2];
+  const held = seq.filter((k) => panePins.has(k));
+  if (seq.length - held.length > 1) return null;
+  return `${LAYOUT_NAMES[layout]}最多固定 ${seq.length - 1} 扇：${held.map((k) => k.toUpperCase()).join("/")} 窗已经固定着，${String(target.key).toUpperCase()} 窗得留着落图`;
+}
+
+/** 「固定」按钮与窗上角标的取态：一律从 panePins 推导出，不另存一份布尔。
+ *  切窗（setPicked）、切档（refreshLayoutUI）、清空都得重刷，
+ *  否则按钮亮着的是「上一扇」的态 */
+function refreshPinUI() {
+  const target = pinTargetPane();
+  const on = !!target && panePins.has(target.key);
+  if (ui.btnPinPane) {
+    const single = layout === "1";
+    // 灰两个来路：单图档（固定了就没窗落）、以及点下去会撞上固定上限（这一扇得留着落图）
+    const note = pinLimitNote(target);
+    ui.btnPinPane.disabled = single || !!note;
+    ui.btnPinPane.classList.toggle("is-active", on);
+    ui.btnPinPane.title = single
+      ? "只剩一个窗，固定了浏览就没地方落了（切回 2/4 图可用）"
+      : note ||
+        (on
+          ? `${String(target.key).toUpperCase()} 窗已固定：轮流展示时它原地不动，再点一次取消`
+          : "把这扇窗从「轮流展示」里摘出去：点侧栏逐张看时它原地不动，别的窗接着换。固定的是这一扇窗（不是窗里那张图），再点一次取消。不是右边那枚「置顶」（那个钉的是整个窗口）。只这一次运行有效");
+  }
+  // 窗上的标记：一次能固定好几扇（四图最多三扇），得看得出具体是哪几扇，不能只靠按钮亮不亮
+  for (const k of PANE_KEYS) panes[k] && panes[k].viewport.classList.toggle("is-pinned", panePins.has(k));
 }
 
 /* --------------------------------------------------------------------------
@@ -811,12 +864,21 @@ function stripMetaText(it) {
   return it.size === undefined ? seenText(it.seen) : formatBytes(it.size);
 }
 
+/** 轮转落窗的池子：当前档的可见窗里摘掉被固定的那几扇。
+ *  顺序、绕回、fallback 全部留在 nextBrowseSlot 里没动，只是池子短了 */
+function rotatableKeys() {
+  return (LAYOUT_KEYS[layout] || LAYOUT_KEYS[2]).filter((k) => !panePins.has(k));
+}
+
 /** 浏览落窗：可见窗序列（a→b→c→d，按当前档位裁）里「上一个用过的窗」的下一个，到末尾绕回第一个。
  *  两图下就是原来的严格交替（行为一字不差）；四图下 A→B→C→D→A，屏幕上始终是连着的四张对照；
- *  单图只剩 A 一个窗，点列表就是换掉那一张。
- *  还没浏览过去（slot 不在序列里）时从活动窗的下一个起 —— 刚手动打开的那张不能被第一次浏览顺手顶掉 */
+ *  单图只剩 A 一个窗，点列表就是换掉那一张。被「固定」的窗从池子里摘掉，
+ *  轮转只在剩下的窗里走（上一张落在固定窗里时，下一张就从池子头开始）。
+ *  还没浏览过去（slot 不在序列里）时从活动窗的下一个起 —— 刚手动打开的那张不能被第一次浏览顺手顶掉。
+ *  池子空了（可见窗全固定）时回 undefined：唯一的调用方 browseTo 在之前就拦下了，
+ *  这里不叠第二层护栏 */
 function nextBrowseSlot() {
-  const seq = LAYOUT_KEYS[layout] || LAYOUT_KEYS[2];
+  const seq = rotatableKeys();
   const cur = seq.includes(browse.slot)
     ? browse.slot
     : activePane && seq.includes(activePane.key)
@@ -857,7 +919,7 @@ function recordView(path, { reorder = true } = {}) {
 function noteLoaded(pane, src) {
   if (!pane) return;
   // 只有落在当前档的可见序列里才记账：往隐藏窗里塞一张不该搅动浏览的轮转
-  if ((LAYOUT_KEYS[layout] || LAYOUT_KEYS[2]).includes(pane.key)) browse.slot = pane.key;
+  if ((LAYOUT_KEYS[layout] || LAYOUT_KEYS[2]).includes(pane.key) && !panePins.has(pane.key)) browse.slot = pane.key;
   const path = typeof src === "string" ? src : pane.meta?.path || "";
   // 记一次查看：返回值就是整份新历史，直接拿来渲染，不再多发一次 get_history
   recordView(path);
@@ -1452,6 +1514,12 @@ async function browseTo(index) {
     browse.wanted = index;
     return;
   }
+  // 池空护栏：可见窗全固定着，浏览就没地方落。当场不动、不发命令、游标也不推
+  //（与「载入失败不推进游标」同一条纪律：状态行说的话必须和界面一致）
+  if (!rotatableKeys().length) {
+    setStatus("可见窗都固定着，浏览落不了窗（先取消一枚固定）");
+    return;
+  }
   const key = nextBrowseSlot();
   const pane = panes[key];
   browse.sel = index;
@@ -1481,7 +1549,7 @@ async function browseTo(index) {
   setPicked(pane);
   markStrip();
   requestNearThumbs();
-  const held = otherKeys(key).map((x) => `${x.toUpperCase()} 窗`);
+  const held = otherKeys(key).map((x) => `${x.toUpperCase()} 窗${panePins.has(x) ? "（固定）" : ""}`);
   setStatus(
     layout === "1"
       ? `第 ${index + 1}/${browse.items.length} 张`
@@ -1832,6 +1900,8 @@ function pasteTargetKey() {
 function setPicked(pane) {
   panePicked = pane;
   for (const key of PANE_KEYS) panes[key].viewport.classList.toggle("is-picked", panes[key] === pane);
+  // 「固定」认的是这一扇，所以点窗就得重读一次按钮取态（不刷的话按钮还亮着上一扇的态）
+  refreshPinUI();
 }
 
 /* --------------------------------------------------------------------------
@@ -1955,6 +2025,10 @@ if (ui.setWheel) {
 el("btn-clear").addEventListener("click", () => {
   // 清空一切：隐藏窗里的图不跟着布局切换留尾，免得下次切回来“莫名多出图”
   for (const p of Object.values(panes)) p.clear();
+  // 固定也一起归零：窗里没图了，「固定这一扇此刻这张图」就不成立了，
+  // 留着会让下一次浏览莫名少一个落窗（而且重启本来也是这个态，不存盘）
+  panePins.clear();
+  refreshPinUI();
   refreshZoom();
   // 列表保留（还是那个目录），但当前项没了：slot 记在序列最后一个，下一次浏览绕回第一个（A）
   browse.idx = -1;
@@ -1991,6 +2065,40 @@ if (ui.btnTopmost) {
       console.error("[pin] 置顶没生效:", err);
       setStatus("置顶没生效: " + errText(err));
     }
+  });
+}
+
+/* ------------------------------- 固定这一扇窗 ------------------------------- */
+// 跟上面那枚「置顶」没关系：置顶钉的是整个窗口，这里钉的是一扇图窗不参与浏览轮转。
+// 取态只从 panePins 推（refreshPinUI 那一段），这里只翻转目标窗那一个元素。
+if (ui.btnPinPane) {
+  ui.btnPinPane.addEventListener("click", () => {
+    const pane = pinTargetPane();
+    if (!pane) {
+      // 当前档一个可见窗都认不出来（理论上到不了：活动窗总在可见序列里）
+      setStatus("没认出要固定哪扇窗");
+      return;
+    }
+    const k = pane.key;
+    // 上限那一道：按钮此时看着是灰的，灰态只是给人看的；真机上按不到，
+    // 自检里那枚 disabled 拦不住点击（假 DOM 只是个字段）——所以这一道也得跟上
+    const note = pinLimitNote(pane);
+    if (note) {
+      setStatus(note);
+      return;
+    }
+    const on = !panePins.has(k);
+    if (on) panePins.add(k);
+    else panePins.delete(k);
+    refreshPinUI();
+    if (!on) {
+      setStatus(`已取消固定 ${k.toUpperCase()} 窗，重新参与轮流展示`);
+      return;
+    }
+    // 固定成功的这一刻池子必然还剩至少一扇（上面那道上限拦住了「把落窗清零」）
+    setStatus(
+      `已固定 ${k.toUpperCase()} 窗：轮流展示时它原地不动，新的一批落在 ${rotatableKeys().map((x) => x.toUpperCase()).join("/")} 窗`
+    );
   });
 }
 

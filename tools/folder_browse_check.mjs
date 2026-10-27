@@ -600,6 +600,17 @@ async function clickEmptyPane(paneKey) {
   await settle();
 }
 const mark = () => calls.length;
+/**
+ * 单击一扇窗（不管空不空）：把它记成「用户点过的那扇」（panePicked）。
+ * 与 clickEmptyPane 同一套事件（pointerdown → click → pointerup，位移 0 算单击），
+ * 但只用来选窗：有图的窗单走到 setPicked 就 return，不会往空窗里退回文件选择框。
+ */
+function pickPane(paneKey) {
+  const vp = byId("pane-" + paneKey).querySelector(".viewport");
+  vp.dispatchEvent({ type: "pointerdown", button: 0, pointerId: 1, clientX: 30, clientY: 30 });
+  vp.dispatchEvent({ type: "click", clientX: 30, clientY: 30, target: vp, preventDefault() {}, stopPropagation() {} });
+  vp.dispatchEvent({ type: "pointerup", pointerId: 1, clientX: 30, clientY: 30 });
+}
 
 /* ---------------- 行 → 窗拖拽要用到的三件：真实矩形 + 窗口事件 + 牌 ---------------- */
 /** 桩里四个窗的画布矩形全压在原点，命中判定分不出格：这里按布局给它们盖屏幕位置。
@@ -1637,6 +1648,263 @@ check(
 );
 check("浏览那一路记录失败也只是说一声，不抛出", statusText().includes("记录查看失败"), statusText());
 world.historyErr = false;
+
+/* ===================== 19) 「固定」：轮流展示跳过这一扇窗 ===================== */
+const pinBtn = () => byId("btn-pin-pane");
+const pinMark = (k) => byId("pane-" + k).querySelector(".viewport").classSet.has("is-pinned");
+const pinActive = () => pinBtn().classSet.has("is-active");
+/** 连点下标那几行，每趟记「哪些窗的图变了」 */
+async function landOn(idxs) {
+  const out = [];
+  for (const i of idxs) {
+    const before = shot();
+    click(rows()[i]);
+    await settle();
+    out.push(changedPanes(before).join(""));
+  }
+  return out;
+}
+
+await useSource("dir");
+click(byId("btn-clear"));
+await settle();
+world.pick = [`${ALPHA}/IMG_10.png`];
+await clickEmptyPane("a");
+key("2");
+await settle();
+check("回到目录源拿到 5 行（下面全按下标点行）", rows().length === 5 && srcOf("a") === `${ALPHA}/IMG_10.png`, `${rows().length} 行`);
+
+/* —— 一枚都不固定时，新代码路径必须与今天逐字一致（这是回归基线，不是新功能） —— */
+click(byId("btn-clear"));
+await settle();
+world.pick = [`${ALPHA}/IMG_10.png`];
+await clickEmptyPane("a");
+check("一枚不固定时按钮不亮也能点", pinActive() === false && pinBtn().disabled === false);
+check("一枚不固定时窗上没标记", pinMark("a") === false && pinMark("b") === false);
+check("基线轮转还是 b→a→b→a", (await landOn([0, 1, 2, 3])).join(",") === "b,a,b,a");
+check("基线状态行不提「固定」两个字", !statusText().includes("固定"), statusText());
+
+/* —— 固定 A：两图下浏览全落 B，A 那张原地不动 —— */
+click(byId("btn-clear"));
+await settle();
+world.pick = [`${ALPHA}/IMG_10.png`];
+await clickEmptyPane("a");
+const keepA = srcOf("a");
+pickPane("a");
+const sincePin = mark();
+click(pinBtn());
+await settle();
+check("亮了的是 .is-active（全站唯一的高亮口径，不另造 is-on）", pinActive() && pinBtn().classSet.has("is-active"));
+check("A 窗挂上了自己的标记", pinMark("a") && pinMark("b") === false);
+check("点完说一句落在哪几扇", /已固定 A 窗.*B 窗/.test(statusText()), statusText());
+check("按钮的 title 跟着改成「A 窗已固定」", pinBtn().title.includes("A 窗已固定"), pinBtn().title);
+check("固定不存盘：一个 prefs 写盘都没走", calls.slice(sincePin).filter(([c]) => c === "set_prefs").length === 0);
+check("固定 A 后连点三行全落 B", (await landOn([0, 1, 2])).join(",") === "b,b,b");
+check("A 窗那张原地不动（就是「不要轮流展示」那句需求）", srcOf("a") === keepA, srcOf("a"));
+check("状态行说清 A 是固定不是留尾", /A 窗（固定）留着/.test(statusText()), statusText());
+
+/* —— 按钮的态跟着「点的那扇」走，不是跟着上一次 —— */
+pickPane("b");
+check("换一扇点，按钮灭下来（亮灭认的是当前这一扇）", pinActive() === false);
+check("但 A 窗上的标记不跟着丢（固定不等于选中）", pinMark("a") === true);
+/* 在固定的那扇上拖一下平移：pointerdown 会把 activePane 抢过去，但那不是「用户选的窗」 */
+const vpDragA = byId("pane-a").querySelector(".viewport");
+vpDragA.dispatchEvent({ type: "pointerdown", button: 0, pointerId: 1, clientX: 30, clientY: 30 });
+vpDragA.dispatchEvent({ type: "pointermove", clientX: 140, clientY: 30, buttons: 1 });
+vpDragA.dispatchEvent({ type: "pointerup", pointerId: 1, clientX: 140, clientY: 30 });
+check(
+  "在固定窗上拖一下（activePane 被它抢走了）也不改按钮取态：认的仍是点过的那扇",
+  pinActive() === false && pinMark("a") === true,
+  pinBtn().title.slice(0, 18)
+);
+check(
+  "两图下 B 是最后一扇能落图的窗：这一枚灰着，title 把上限说清",
+  pinBtn().disabled === true && /最多固定 1 扇/.test(pinBtn().title) && /B 窗得留着落图/.test(pinBtn().title),
+  pinBtn().title
+);
+/* 假 DOM 不会替浏览器拦 disabled 的点击，这里正好拿它扇一下 handler 里那道拒绝 */
+click(pinBtn());
+await settle();
+check(
+  "两图下点第二扇被拒：B 没被固定，A 的固定不受影响",
+  pinMark("b") === false && pinMark("a") === true && pinActive() === false,
+  `${pinMark("a")}/${pinMark("b")}`
+);
+check(
+  "拒的时候状态行把哪扇占着、哪扇得留着都说圆了",
+  /两图并排最多固定 1 扇：A 窗已经固定着，B 窗得留着落图/.test(statusText()),
+  statusText()
+);
+check("被拒这一下同样没写盘", calls.slice(sincePin).filter(([c]) => c === "set_prefs").length === 0);
+
+/* —— 再点一次是取消 —— */
+pickPane("a");
+click(pinBtn());
+await settle();
+check("取消固定：标记摘掉、按钮灭下来", pinMark("a") === false && pinActive() === false);
+check("取消那一下说一句「重新参与轮流展示」", statusText().includes("已取消固定 A 窗"), statusText());
+check("取消后浏览回到两格交替（这一档没窗被固定了）", (await landOn([0, 1])).join(",") === "a,b", statusText());
+
+/* —— 四图：固定中间那扇（C），轮转跳过它；切档不丢；手动载入允许覆盖 —— */
+key("4");
+await settle();
+click(byId("btn-clear"));
+await settle();
+check("清空把固定一起归零（窗里没图了，「固定这一扇这张图」不成立）", !pinMark("a") && !pinMark("b") && !pinMark("c") && !pinActive());
+world.pick = [`${ALPHA}/IMG_10.png`];
+await clickEmptyPane("a");
+check("四图基线：一枚不固定时走 b→c→d→a", (await landOn([0, 1, 2, 3])).join(",") === "b,c,d,a");
+check("四图基线状态行也不提「固定」", !statusText().includes("固定"), statusText());
+const keepC = srcOf("c");
+pickPane("c");
+click(pinBtn());
+await settle();
+check("四图下固定 C：按钮认的是点过的这一扇", pinActive() && pinMark("c") && !pinMark("a"));
+check("固定 C 后连点三行走 b→d→a（C 被跳过，绕回也不落它）", (await landOn([4, 0, 1])).join(",") === "b,d,a", statusText());
+check("C 窗那张纹丝不动", srcOf("c") === keepC, srcOf("c"));
+check("状态行里 C 带「（固定）」，与其余三格区分开", statusText().includes("C 窗（固定）"), statusText());
+
+/* 切到两图：C 的固定不丢（只是这档看不见它），轮转照旧在 A/B 里走 */
+key("2");
+await settle();
+check("切档没把固定弄丢：C 的标记还挂着，按钮认的是当前这扇所以不亮", pinMark("c") && pinActive() === false);
+check("两图下这枚还能点（单图才灰）", pinBtn().disabled === false);
+check("切到两图后浏览走 b→a（与 C 的固定无关）", (await landOn([3, 4])).join(",") === "b,a", statusText());
+check("这两步里 C 窗的图也没被动过", srcOf("c") === keepC, srcOf("c"));
+key("4");
+await settle();
+check("切回四图：C 仍不参与轮转，走 b→d→a", (await landOn([0, 1, 3])).join(",") === "b,d,a", statusText());
+
+/* 手动往固定的窗里换一张：走「从侧栏把那一行拖进 C」这条真实落窗路
+   （⌘O 不认点过的窗、⌘V 的入口在 view-transfer 里，本桩没加它），
+   验的是「固定只拦轮流展示那一步，手动载入一律放行」 */
+/** 点第 i 行并返回「状态行说落到哪个窗」，同时核一眼那个窗里确实是这一张
+ *  （与 changedPanes 不同的一点：落回同一个窗、图上又是同一张时 src 不会变，
+ *    那种情况不能当成「没落窗」） */
+async function landRow(i) {
+  const path = rowPaths()[i];
+  click(rows()[i]);
+  await settle();
+  const m = statusText().match(/→([A-D]) 窗/);
+  const k = m ? m[1].toLowerCase() : "";
+  return k && srcOf(k) === path ? k : "?" + k;
+}
+
+setPaneRect("a", 0, 0, 400, 400);
+setPaneRect("b", 500, 0, 400, 400);
+setPaneRect("c", 0, 500, 400, 400);
+setPaneRect("d", 500, 500, 400, 400);
+const beforeManual = shot();
+rowDown(rows()[4], 30, 30); // scan.tif 那一行
+fireWin("mousemove", { clientX: 200, clientY: 700, buttons: 1 }); // 拖进 C 的矩形
+fireWin("mouseup", { clientX: 200, clientY: 700 });
+await settle();
+check("固定的窗照样允许手动换图（拖进那一扇不被拦）", srcOf("c") === `${ALPHA}/scan.tif` && pinMark("c"), srcOf("c"));
+check("手动换图也不会顺手动到别的窗", changedPanes(beforeManual).join(",") === "c", changedPanes(beforeManual).join(","));
+/* 刚起过拖：浏览器补来的那一下 click 会被吃掉（第 15 节那条纪律），先把它喂掉 */
+const afterManual = shot();
+click(rows()[2]);
+await settle();
+check("拖完补来的那一下什么都没干（不是「没落窗」的假样本）", changedPanes(afterManual).length === 0, changedPanes(afterManual).join(","));
+clickRow(2); // IMG_10：此刻哪个窗都没显示它，落没落上看得出
+await settle();
+check(
+  "手动塞进固定窗的那一张没把轮转位据过去：下一张仍按 a→b 走（落 B，不是退回池子头 A）",
+  changedPanes(afterManual).join("") === "b",
+  `${changedPanes(afterManual).join(",")} | ${statusText()}`
+);
+
+/* 单图档：灰掉不给点，但不替用户改集合（1 被「原始像素 1:1」占了，单图档的快捷键是 3） */
+key("3");
+await settle();
+check(
+  "单图档下这枚灰着（只一扇窗，固定了浏览就没地方落）",
+  pinBtn().disabled === true && /只剩一个窗/.test(pinBtn().title),
+  pinBtn().title
+);
+check("灰掉不等于取消：C 的标记还挂着", pinMark("c"));
+key("2");
+await settle();
+check("切回两图又能点（灰的只是单图那一档）", pinBtn().disabled === false);
+
+/* 全部取消：轮转回到四格 */
+key("4");
+await settle();
+pickPane("c");
+check("取消前按钮亮着（目标仍是固定的 C）", pinActive());
+click(pinBtn());
+await settle();
+check("取消最后一枚固定后窗上标记全清", !pinMark("a") && !pinMark("b") && !pinMark("c") && !pinMark("d") && !pinActive());
+const back = [];
+for (const i of [4, 0, 2]) back.push(await landRow(i));
+check("取消后 C 重新参与轮转：走 c→d→a", back.join(",") === "c,d,a", back.join(",") + " | " + statusText());
+check("此刻状态行也不提「固定」了", !statusText().includes("固定"), statusText());
+
+/* —— 上限与池空护栏（放在最后，因为这一段要同时固定三扇，会弄乱上面几段的轮转起点）—— */
+/* 四图能固定三扇：这一档有四个落窗，挖掉三个还剩一个 */
+for (const k of ["a", "b", "c"]) {
+  pickPane(k);
+  click(pinBtn());
+  await settle();
+}
+check("四图下连固三扇都接住（上限是三，不是两图那个 1）", pinMark("a") && pinMark("b") && pinMark("c") && !pinMark("d"), `${pinMark("a")}/${pinMark("b")}/${pinMark("c")}/${pinMark("d")}`);
+pickPane("d");
+check(
+  "只剩 D 能落图时 D 这一枚灰着（title 报的是这一档的上限 3 扇）",
+  pinBtn().disabled === true && /最多固定 3 扇/.test(pinBtn().title) && /D 窗得留着落图/.test(pinBtn().title),
+  pinBtn().title
+);
+click(pinBtn());
+await settle();
+check(
+  "第四扇点下去也被拒：D 没固定上，另外三扇不受影响",
+  pinMark("d") === false && pinMark("a") && pinMark("b") && pinMark("c"),
+  statusText()
+);
+check("被拒那句与两图那条同出一门（都是 pinLimitNote 的措辞）", /最多固定 3 扇.*D 窗得留着落图/.test(statusText()), statusText());
+
+/* 池空护栏现在唯一的来路：四图里固定的那几扇正好涵盖了两图的全部可见窗，切档切过去
+   （上限只拦住「在当前档把落窗清零」，拦不住用户从另一档摆好的这个态） */
+key("2");
+await settle();
+check("切到两图：A、B 都固定着，这一档一个能落图的窗都没了", pinMark("a") && pinMark("b"), statusText());
+const freeIdx = rowPaths().findIndex((p) => p !== srcOf("a") && p !== srcOf("b"));
+const beforeFull = shot();
+const curBefore = currentIndex();
+const selBefore = selIndex();
+const sinceFull = mark();
+click(rows()[freeIdx]); // 挑一张这两扇里都没显示的，才走得到落窗那一步（不撞「已经在看这一张」短路）
+await settle();
+check(
+  "可见窗全固定：一个窗都没变、一次读盘都没走",
+  changedPanes(beforeFull).length === 0 && calls.slice(sinceFull).filter(([c]) => c === "read_image").length === 0,
+  `${changedPanes(beforeFull).join("") || "无"}/${calls.slice(sinceFull).filter(([c]) => c === "read_image").length} 次读盘`
+);
+check("全固定时状态行说的是「都固定着」，不提落哪个窗", statusText().includes("都固定着") && !/→[A-D] 窗/.test(statusText()), statusText());
+check("全固定时游标与选中行都不推（与「载入失败不推进」同一条纪律）", currentIndex() === curBefore && selIndex() === selBefore, `${currentIndex()}/${selIndex()}`);
+check("全固定时两个窗里的图原样留着（不是清空也不是换图）", shot().a === beforeFull.a && shot().b === beforeFull.b && shot().a !== "");
+check("池空这档里按钮亮着、能点：点下去是取消固定，不会把用户锁死", pinActive() === true && pinBtn().disabled === false, pinBtn().title);
+const pinABefore = [pinMark("a"), pinMark("b")];
+click(pinBtn());
+await settle();
+check(
+  "取消一枚固定后这一档重新有落窗（另一扇还固定着）",
+  [pinMark("a"), pinMark("b")].some((v, i) => v !== pinABefore[i]) && (pinMark("a") || pinMark("b")),
+  statusText()
+);
+const resume = await landRow(freeIdx === 0 ? 1 : 0);
+check("池子恢复后浏览重新落得了窗", /^[a-d]$/.test(resume), `${resume} | ${statusText()}`);
+
+key("4");
+await settle();
+for (const k of ["a", "b", "c"]) {
+  if (!pinMark(k)) continue;
+  pickPane(k);
+  click(pinBtn());
+  await settle();
+}
+check("收尾：全部取消后窗上标记全清", !pinMark("a") && !pinMark("b") && !pinMark("c") && !pinMark("d") && !pinActive());
+check("清空后四格轮转回到 b→c→d→a", (await landOn([0, 1, 2, 3])).join(",") === "b,c,d,a", statusText());
 
 console.log(failed ? `\n${failed} 项未通过` : "\n全部通过");
 process.exit(failed ? 1 : 0);

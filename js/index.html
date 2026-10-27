@@ -73,6 +73,10 @@
                 </label>
                 <!-- 工具栏这枚「滚轮缩放/平移」下拉已拆（用户要求）：只在右侧「设置」抽屉里选，
                      真值也存在那里（view-compare.js 的 wheelMode()） -->
+                <!-- 「固定」与「同步」不是一类东西（一个管落窗、一个管缩放平移），所以做成
+                     点击翻转的按钮而不是第二个 label.switch：两枚开关并排会让人以为同一类 -->
+                <button id="btn-pin-pane" class="btn btn-toggle"
+                  title="把这扇窗从「轮流展示」里摘出去：点侧栏逐张看时它原地不动，别的窗接着换。固定的是这一扇窗（不是窗里那张图），再点一次取消。不是右边那枚「置顶」（那个钉的是整个窗口）。只这一次运行有效">固定</button>
               </div>
 
               <div class="tb-spacer"></div>
@@ -344,27 +348,31 @@
                       <button id="btn-pair-save" class="btn btn-primary">保存口令与设备名</button>
                       <p class="hint">口令只存本机，用于互认与请求签名。局域网内是明文传输，别用来传敏感文件。</p>
 
-                      <div class="cand-box" id="xfer-candidates"></div>
+                      <!-- 已添加的对端：一台一行，改备注 / 打开对话 / 解绑都长在那一行上。
+                           这一屏以前是一组单值输入框，作用对象是「当前会话所属的那台」却没写在
+                           界面上；行由 view-transfer.js 从 list_peers 铺出来，标题上的台数也归它 -->
+                      <div class="set-sub" id="xfer-peer-title">已添加的对端</div>
+                      <div class="peer-list" id="xfer-peer-list"></div>
+                      <p class="hint">改备注只存本机、只改本机显示（会话栏 / 顶栏 / 新建聊天的默认名），对端那边看不到任何变化；解绑只是不再主动发给它，而且不会再自动连回来 —— 要恢复得在下面的候选里点它一下或再填一次 IP。聊天历史与收到的文件都留着。</p>
 
+                      <div class="set-sub">添加新对端</div>
                       <label class="field">
                         <span>对端 IP:端口</span>
                         <input id="inp-manual-addr" class="input" placeholder="192.168.1.23 或 192.168.1.23:45790" />
                       </label>
+                      <label class="field">
+                        <span>备注名（可选）</span>
+                        <input id="inp-manual-alias" class="input" maxlength="40" placeholder="添加时就起好，省得回头再到列表里改" />
+                      </label>
                       <button id="btn-bind-addr" class="btn">手动添加对端</button>
                       <p class="hint">mDNS 被网络策略屏蔽时的兜底；端口留空会从 45789 起逐个试探。可以同时添加多台，每台一个对话框。</p>
 
-                      <label class="field">
-                        <span>对端备注名</span>
-                        <input id="inp-peer-alias" class="input" maxlength="40" placeholder="像微信那样给它起个备注，留空则用对方报的设备名" />
-                      </label>
-                      <button id="btn-peer-alias" class="btn">保存备注名</button>
-                      <p class="hint">备注只存本机、只改本机显示（会话栏 / 顶栏 / 新建聊天的默认名），对端那边看不到任何变化。</p>
+                      <div class="cand-box" id="xfer-candidates"></div>
 
                       <div class="drawer-acts">
                         <button id="btn-reprobe" class="btn btn-ghost">重新探测在线</button>
-                        <button id="btn-unbind" class="btn btn-ghost danger">解绑当前对端</button>
                       </div>
-                      <p class="hint">解绑只是不再主动发给它，而且不会再自动连回来 —— 要恢复得在上面的候选里点一下或再填一次 IP。聊天历史与收到的文件都留着。Windows 首次监听会弹防火墙提示，必须勾「允许访问（私有网络）」。</p>
+                      <p class="hint">「重新探测在线」ping 的是当前正在聊的那台，也就是上面列表里高亮的那一行。Windows 首次监听会弹防火墙提示，必须勾「允许访问（私有网络）」。</p>
                     </div>
 
                     <!-- 第二页：本机偏好，全存在同一份 prefs.json 里 -->

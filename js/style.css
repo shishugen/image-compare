@@ -502,6 +502,40 @@ body.is-strip-drag {
   cursor: pointer;
 }
 
+/* 被「固定」的窗：轮流展示时它原地不动。左上角已被 .pane-tag（A/B/C/D）占着，
+   角标放右上角、与它同样式；内沿那一圈很淡的描边是给「两扇都固定」用的——
+   那时候得看得出是哪两扇，不能只靠工具栏那枚按钮亮不亮。
+   pointer-events: none 不能省：这是挂在画面上的字，吃了点击就多一块拖不动的地方。 */
+.viewport.is-pinned {
+  box-shadow: inset 0 0 0 1px rgba(76, 141, 255, 0.42);
+}
+
+.viewport.is-pinned::after {
+  content: "固定";
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 2;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  padding: 0 8px;
+  border-radius: 11px;
+  background: rgba(20, 22, 26, 0.72);
+  backdrop-filter: blur(4px);
+  font-size: 12px;
+  color: var(--accent);
+  pointer-events: none;
+}
+
+/* 单图档下「固定」没有作用对象（只一扇窗，固定了浏览就没地方落）。
+   全站没有 .btn:disabled 这条规则，这里只给这一枚补——不动全局，
+   免得把工具栏其他处于瞬时禁用态的按钮一起改了样 */
+#btn-pin-pane:disabled {
+  opacity: 0.38;
+  cursor: not-allowed;
+}
+
 /* 选中的窗格不再描那一圈蓝边（用户要求拆掉那个框，它压在图上太抢眼）。
    .is-picked 这个类仍然挂着，只当 devtools 里查「下一次 ⌘V 会进哪一格」的标记用，
    粘贴落点的真实状态在 view-compare.js 的 panePicked。 */
@@ -1988,6 +2022,86 @@ textarea,
 
 .cand:hover {
   border-color: var(--accent);
+}
+
+/* 已添加的对端：抽屉「配对」那一页顶部的一台一行。与会话栏那套分开：那边是
+   「框」粒度（一台能占好几行、还混着未标记），这边是「设备」粒度，动作也不同
+   （改备注 / 打开对话 / 解绑）。行由 view-transfer.js 的 buildPeerRow 铺 */
+.peer-list {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.peer-row {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.peer-row:last-child {
+  border-bottom: none;
+}
+
+.peer-row:hover {
+  background: var(--bg);
+}
+
+/* 当前正在聊的那台：全站同一套 .is-active，不另发明一种高亮（与 .session-row 同款） */
+.peer-row.is-active {
+  background: var(--bg);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.peer-row-top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.peer-row-top b {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.peer-row-meta {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--text-dim);
+  /* 地址与时间得在一行里看完：390px 的抽屉里一换行就把一行撑成三行 */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.peer-row-acts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 5px;
+}
+
+/* 行内改备注：顶掉名字那一格，不弹系统对话框（webview 里 prompt 不一定能用），
+   与会话栏那个 .s-rename 同一用途 */
+.peer-rename {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 1px 4px;
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--text);
+  font-size: inherit;
+  font-family: inherit;
+}
+
+.peer-empty {
+  padding: 10px;
+  font-size: 12px;
+  color: var(--text-dim);
 }
 
 /* ==========================================================================

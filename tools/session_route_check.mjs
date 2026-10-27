@@ -626,9 +626,15 @@ window.__TAURI__.core.invoke = async (cmd, args = {}) => {
       // 就认死这条测试地址就是 X（用例 13 要拿它把未登记的那台变成弹层里可点的）
       const [host, pPort] = String(args.addr).split(":");
       if (`${host}:${pPort}` !== "10.0.0.9:45789") throw new Error("桩只认这条测试地址");
+      // 这里原来写的是 now()：桩里根本没这个函数，每次 bind_peer_addr 都当场抛
+      // ReferenceError 失败。而调用记录在进 case 之前就 push 了，于是「走的是 bind_peer_addr」
+      // 那类断言照样绿 —— 一批「添加对端」的用例其实全在失败分支上空转
+      // 另外 alias 也不能写死空串：与 Rust 的 bind_peer 同口径，备注名是本机打上去的，
+      // 对方报的身份里没这个字段，重新登记时必须从旧记录里搬过来
+      const oldX = world.peers.find((x) => x.id === "X");
       world.peers = [
         ...world.peers.filter((x) => x.id !== "X"),
-        { id: "X", name: "陌生机", alias: "", host, port: Number(pPort) || 45789, online: true, bound: true, last_seen: now() },
+        { id: "X", name: "陌生机", alias: oldX?.alias || "", host, port: Number(pPort) || 45789, online: true, bound: true, last_seen: Date.now() },
       ];
       // 与 Rust 的 bind_peer 同口径：亲手重新添加等于撤回「别再自动连它」
       world.ignored = world.ignored.filter((i) => i !== "X");
@@ -1124,26 +1130,69 @@ await settle();
 check("本机不认识的会话 ID 会被认下来", sidOf(world.hist.find((m) => m.id === "x11")) === "C-new");
 check("认下来的框出现在会话栏", !!rowOf("C-new"), rows().map((r) => r.dataset.id).join(","));
 
-/* 17) 对端备注名（像微信那个备注）：只改本机显示，新建聊天也用它 */
+/* 「已添加的对端」那一屏的取行工具：行由 buildPeerRow 铺，归属只认 dataset.peer */
+const peerRows = () => byId("xfer-peer-list").children.filter((c) => c.classSet.has("peer-row"));
+const peerRowOf = (id) => peerRows().find((r) => r.dataset.peer === id) || null;
+const rowPart = (id, cls) => peerRowOf(id)?.children.find((c) => c.classSet.has(cls)) || null;
+const peerNamePart = (id) => rowPart(id, "peer-row-top");
+const peerMetaOf = (id) => rowPart(id, "peer-row-meta");
+const peerActBtns = (id) => (rowPart(id, "peer-row-acts")?.children || []).filter((c) => c.classSet.has("link-btn"));
+const peerAct = (id, label) => peerActBtns(id).find((b) => b.text === label) || null;
+/** 桩里不解析 HTML，拿不到行内那个 <b>；名字看整行的 textContent（它含子节点） */
+const peerRowText = (id) => peerRowOf(id)?.textContent || "";
+const keyDown = (node, key, over = {}) =>
+  node.dispatchEvent({ type: "keydown", key, isComposing: false, preventDefault() {}, stopPropagation() {}, ...over });
+const blurOf = (node) => node.dispatchEvent({ type: "blur", preventDefault() {}, stopPropagation() {} });
+
+/* 17) 已添加的对端：一台一行，改备注长在那一行上 */
 click(rowOf("A"));
 await settle();
-const aliasInp = byId("inp-peer-alias");
 check(
-  "当前这台已登记时备注框可编辑，回显的是现有备注",
-  aliasInp.disabled === false && aliasInp.value === "",
-  `${aliasInp.disabled}/${aliasInp.value}`
+  "列表按后端顺序一台一行（前端不再排第二次）",
+  peerRows().map((r) => r.dataset.peer).join(",") === world.peers.map((p) => p.id).join(","),
+  `${peerRows().map((r) => r.dataset.peer).join(",")} vs ${world.peers.map((p) => p.id).join(",")}`
 );
+check(
+  "标题带上台数（拿渲染出来的行数对，别拿写死的数）",
+  byId("xfer-peer-title").text === `已添加的对端（${peerRows().length} 台）` && peerRows().length === 3,
+  `${byId("xfer-peer-title").text} / ${peerRows().length} 行`
+);
+check(
+  "当前正在聊的那台在列表里标出来，别台不标",
+  !!peerRowOf("A")?.classSet.has("is-active") && !peerRowOf("C")?.classSet.has("is-active"),
+  peerRows().map((r) => `${r.dataset.peer}:${r.classSet.has("is-active") ? "act" : "-"}`).join(",")
+);
+check(
+  "没备注时用对方上报的设备名，行上是地址与在线态",
+  peerRowText("A").includes("甲机") && peerMetaOf("A").text === "10.0.0.2:45789 · 在线",
+  String(peerMetaOf("A")?.text)
+);
+check(
+  "行上摊着「改备注 / 打开对话 / 解绑」三枚动作",
+  peerActBtns("A").map((b) => b.text).join("/") === "改备注/打开对话/解绑",
+  peerActBtns("A").map((b) => b.text).join("/")
+);
+click(peerAct("A", "改备注"));
+await settle();
+const aliasInp = peerNamePart("A").querySelector(".peer-rename");
+check(
+  "点行上的「改备注」把那一行换成输入框，回显现有备注",
+  !!aliasInp && aliasInp.value === "",
+  `${!!aliasInp}/${aliasInp?.value}`
+);
+check("别那一行不受影响（只有这一行在编辑）", !peerNamePart("C").querySelector(".peer-rename"));
 aliasInp.value = "办公室那台";
 since = calls.length;
-click(byId("btn-peer-alias"));
+keyDown(aliasInp, "Enter");
 await settle();
 check(
-  "点保存会拿当前对话框所属的那台去改备注",
+  "回车存的是这一行那台",
   lastCall("set_peer_alias")?.peer === "A" && lastCall("set_peer_alias")?.alias === "办公室那台",
   JSON.stringify(lastCall("set_peer_alias"))
 );
 check("保存后两边列表都重取了（后端会顺手改对话框名）", takeCalls("sessions", since).length >= 1);
-check("备注名会回显在输入框里", aliasInp.value === "办公室那台", aliasInp.value);
+check("存完那一行不再是编辑态", !peerNamePart("A").querySelector(".peer-rename"));
+check("行上露的是备注名", peerRowText("A").includes("办公室那台"), peerRowText("A"));
 check(
   "顶栏那台的名字跟着备注走",
   byId("xfer-peer").html.includes("<b>办公室那台</b>"),
@@ -1163,56 +1212,285 @@ check(
   lastCall("session_new")?.name === `办公室那台 · ${todayTag}`,
   JSON.stringify(lastCall("session_new"))
 );
-// 清空备注 = 退回对方上报的设备名
-aliasInp.value = "   ";
-click(byId("btn-peer-alias"));
+/* 行内编辑的两个细节：输入法组合期的 Enter 是「选词」不是「提交」；点旁边（失焦）算认了 */
+click(peerAct("A", "改备注"));
+await settle();
+const inpIme = peerNamePart("A").querySelector(".peer-rename");
+inpIme.value = "打到一半还没选完词";
+since = calls.length;
+keyDown(inpIme, "Enter", { isComposing: true });
+await settle();
+check(
+  "输入法组合期间的 Enter 不提交（那一下是「选词」）",
+  takeCalls("set_peer_alias", since).length === 0 && !!peerNamePart("A").querySelector(".peer-rename"),
+  JSON.stringify(takeCalls("set_peer_alias", since))
+);
+blurOf(inpIme);
+await settle();
+check(
+  "失焦也算认了，而且存的仍是这一行那台",
+  lastCall("set_peer_alias")?.peer === "A" && lastCall("set_peer_alias")?.alias === "打到一半还没选完词",
+  JSON.stringify(lastCall("set_peer_alias"))
+);
+check(
+  "失焦后那一行换回名字",
+  !peerNamePart("A").querySelector(".peer-rename") && peerRowText("A").includes("打到一半还没选完词"),
+  peerRowText("A")
+);
+// 还原成后面几步要用到的那份备注
+click(peerAct("A", "改备注"));
+await settle();
+const inpBack = peerNamePart("A").querySelector(".peer-rename");
+inpBack.value = "办公室那台";
+keyDown(inpBack, "Enter");
+await settle();
+check(
+  "A 的备注还原成「办公室那台」",
+  world.peers.find((p) => p.id === "A")?.alias === "办公室那台",
+  String(world.peers.find((p) => p.id === "A")?.alias)
+);
+/* 心跳每秒都可能推一次 peers-changed：编辑中的那一行不能被动到 */
+click(peerAct("A", "改备注"));
+await settle();
+const inpA = peerNamePart("A").querySelector(".peer-rename");
+document.activeElement = inpA;
+inpA.value = "打字打到一半";
+since = calls.length;
+for (let i = 0; i < 3; i++) {
+  world.peers.find((p) => p.id === "A").last_seen = at(0, 12, i + 1);
+  emit("peers-changed", statusPayload());
+  await settle();
+}
+check("连推 3 次 peers-changed 草稿不丢", inpA.value === "打字打到一半", inpA.value);
+check(
+  "那一行的输入框还是同一个节点（没被重建拆掉）",
+  peerNamePart("A").querySelector(".peer-rename") === inpA
+);
+check("编辑期间没替用户偷偷存盘", takeCalls("set_peer_alias", since).length === 0, JSON.stringify(takeCalls("set_peer_alias", since)));
+// 焦点移开了但没保存：草稿得留着，心跳不能替用户把它抹掉
+document.activeElement = null;
+inpA.value = "改到一半没保存";
+emit("peers-changed", statusPayload());
+await settle();
+check("焦点移开后未保存的草稿也不会被心跳抹掉", inpA.value === "改到一半没保存", inpA.value);
+// Esc 取消：不发命令、当场换回名字
+keyDown(inpA, "Escape");
+await settle();
+check(
+  "Esc 取消不会发 set_peer_alias",
+  takeCalls("set_peer_alias", since).length === 0,
+  JSON.stringify(lastCall("set_peer_alias"))
+);
+check("Esc 之后那一行不再是编辑态", !peerNamePart("A").querySelector(".peer-rename"));
+check("Esc 不碰后端那份备注", world.peers.find((p) => p.id === "A")?.alias === "办公室那台", String(world.peers.find((p) => p.id === "A")?.alias));
+
+/* 行上的动作只认本行：当前在聊的是 A，改的却是 C 那一行 */
+click(peerAct("C", "改备注"));
+await settle();
+const inpC = peerNamePart("C").querySelector(".peer-rename");
+// 比的是列表行的高亮，不是会话栏：上面刚给 A 开过一个话题，会话栏里 A 那一行
+// （基础对话）本来就不该是亮的，拿它断言「当前仍是 A」测不到东西
+check("当前那台仍是 A（改 C 行不会把焦点带走）", !!peerRowOf("A")?.classSet.has("is-active") && !peerRowOf("C")?.classSet.has("is-active"));
+inpC.value = "丙机那台";
+since = calls.length;
+keyDown(inpC, "Enter");
+await settle();
+check(
+  "回车存的是这一行那台，不是当前正在聊的那台",
+  lastCall("set_peer_alias")?.peer === "C" && lastCall("set_peer_alias")?.alias === "丙机那台",
+  JSON.stringify(lastCall("set_peer_alias"))
+);
+check("存备注不会顺手把会话焦点切走", takeCalls("session_focus", since).length === 0);
+check("C 行不再是编辑态且名字已更新", !peerNamePart("C").querySelector(".peer-rename") && peerRowText("C").includes("丙机那台"), peerRowText("C"));
+// 清空备注 = 退回对方上报的设备名（空串是个明确意图）
+click(peerAct("C", "改备注"));
+await settle();
+const inpC2 = peerNamePart("C").querySelector(".peer-rename");
+inpC2.value = "   ";
+keyDown(inpC2, "Enter");
 await settle();
 check(
   "备注只填空格等于清掉，存的是空串",
-  lastCall("set_peer_alias")?.alias === "" && world.peers.find((p) => p.id === "A")?.alias === "",
+  lastCall("set_peer_alias")?.alias === "" && world.peers.find((p) => p.id === "C")?.alias === "",
   JSON.stringify(lastCall("set_peer_alias"))
 );
-// 顶栏看的是「当前这个框」的名字：上面那个用例在 A 上又开了一个话题框，
-// 得先切回基础对话那一行（那个话题框叫「备注 · 日期」，本就不该跟着备注回滚）
+check("清掉后备注行退回设备名", peerRowText("C").includes("丙机") && !peerRowText("C").includes("丙机那台"), peerRowText("C"));
+
+/* 三条草稿保护逐条查（后端那份真变了才回写）。
+   顺序有讲究：先测「后端没变」再测「后端变了」——反过来的话后两条都会落到回写分支上，
+   断言的就不是那一条保护了 */
+click(peerAct("C", "改备注"));
+await settle();
+const inpC3 = peerNamePart("C").querySelector(".peer-rename");
+// 保护二：焦点已经移开、框里是一份未保存的草稿，而后端那份压根没变
+document.activeElement = null;
+inpC3.value = "改到一半没保存";
+since = calls.length;
+emit("peers-changed", statusPayload());
+await settle();
+check("保护二：没聚焦但是未保存草稿时后端没变就不回写", inpC3.value === "改到一半没保存", inpC3.value);
+// 保护一：后端那份真变了（别处存的），但焦点还在框里 —— 也不能盖掉手打的
+document.activeElement = inpC3;
+inpC3.value = "手打到一半";
+world.peers.find((p) => p.id === "C").alias = "别处改的";
+emit("peers-changed", statusPayload());
+await settle();
+check("保护一：焦点在框里时后端变了也不回写", inpC3.value === "手打到一半", inpC3.value);
+check("回写全程没替用户存过盘", takeCalls("set_peer_alias", since).length === 0, JSON.stringify(takeCalls("set_peer_alias", since)));
+// 保护三：焦点移开、后端与代码上次写进去的不一样 —— 该跟着后端走
+document.activeElement = null;
+emit("peers-changed", statusPayload());
+await settle();
+check("保护三：后端那份真变了会回写进输入框", inpC3.value === "别处改的", inpC3.value);
+keyDown(inpC3, "Escape");
+await settle();
+// 把桩里这份临时改出来的备注抹掉（不走命令：上面那一串本就没存过）
+world.peers.find((p) => p.id === "C").alias = "";
+emit("peers-changed", statusPayload());
+await settle();
+check("全列表不会同时开着两行编辑", peerRows().filter((r) => peerNamePart(r.dataset.peer).querySelector(".peer-rename")).length === 0);
+// 还原：上面改出来的 A 备注清掉，后面的用例仍按设备名说事
+click(peerAct("A", "改备注"));
+await settle();
+const inpA2 = peerNamePart("A").querySelector(".peer-rename");
+inpA2.value = "";
+keyDown(inpA2, "Enter");
+await settle();
+check("A 的备注已还原", world.peers.find((p) => p.id === "A")?.alias === "", String(world.peers.find((p) => p.id === "A")?.alias));
 click(rowOf("A"));
 await settle();
 check("清掉备注后顶栏退回设备名", byId("xfer-peer").html.includes("<b>甲机</b>"), byId("xfer-peer").html);
-// 心跳每秒都可能推一次 peers-changed，正在打的字不能被回写冲掉
-click(rowOf("A"));
+
+/* 17b) 行上的「打开对话 / 新建对话」：一台可以好几个框，跳最近有过消息的那个 */
+const cSess = sessionsPayload().sessions.filter((s) => s.peer === "C");
+const cWant = cSess.reduce((a, b) => (b.last > a.last ? b : a), cSess[0]);
+// 故意再给 C 摆一个置顶的老框（置顶的永远排第一位）：不这么摆，后端回来的顺序里
+// 「第一个」就是「last 最大的」，reduce 与拿 mine[0] 完全等价，这条断言就没牙了
+world.sessions.push({ id: "C-pinned", peer: "C", name: "丙机 · 置顶的老框", created: at(3, 9), read: at(3, 9), pinned: true });
+emit("sessions-changed", sessionsPayload());
 await settle();
-document.activeElement = aliasInp;
-aliasInp.value = "打字打到一半";
-emit("peers-changed", statusPayload());
-await settle();
-check("心跳推状态不会把正在编辑的备注冲掉", aliasInp.value === "打字打到一半", aliasInp.value);
-// 焦点移开了但没保存：草稿得留着，心跳不能替用户把它抹掉
-document.activeElement = null;
-aliasInp.value = "改到一半没保存";
-emit("peers-changed", statusPayload());
-await settle();
-check("焦点移开后未保存的草稿也不会被心跳抹掉", aliasInp.value === "改到一半没保存", aliasInp.value);
-// 但换到别一台就得让位：输入框跟的是「当前这台」的备注
-click(rowOf("X"));
+const cOrder = sessionsPayload().sessions.filter((s) => s.peer === "C");
+check(
+  "置顶之后列表第一个不再是最近的那个（拿它当「第一个」就会跳错）",
+  cOrder[0].id === "C-pinned" && cOrder[0].id !== cWant.id && cOrder[0].last < cWant.last,
+  cOrder.map((s) => `${s.id}:${s.last}`).join(",")
+);
+since = calls.length;
+click(peerAct("C", "打开对话"));
 await settle();
 check(
-  "切到别的那台时输入框换成它自己的备注（草稿不跟过去）",
-  aliasInp.value === (world.peers.find((p) => p.id === "X")?.alias || ""),
-  aliasInp.value
+  "有多个框时跳的是最近有过消息的那个（不是列表第一个）",
+  takeCalls("session_focus", since).some(([, a]) => a.id === cWant.id),
+  `${cWant.id} <- ${JSON.stringify(takeCalls("session_focus", since).map(([, a]) => a.id))}`
 );
+check("切过去之后列表里的高亮跟着换了一行", !!peerRowOf("C")?.classSet.has("is-active") && !peerRowOf("A")?.classSet.has("is-active"));
+// 一台框都没有的那台：同一枚动作改叫「新建对话」
+world.peers.push({ id: "Z", name: "丁二机", alias: "", host: "10.0.0.40", port: 45789, online: false, last_seen: at(1, 8) });
+emit("peers-changed", statusPayload());
+await settle();
+check(
+  "一台框都没有时那一行的动作叫「新建对话」",
+  !!peerAct("Z", "新建对话") && !peerAct("Z", "打开对话"),
+  peerActBtns("Z").map((b) => b.text).join("/")
+);
+check(
+  "离线那台写的是「离线（最近 …）」而不是在线",
+  /^10\.0\.0\.40:45789 · 离线（最近 /.test(peerMetaOf("Z").text),
+  peerMetaOf("Z").text
+);
+since = calls.length;
+click(peerAct("Z", "新建对话"));
+await settle();
+check(
+  "「新建对话」走 session_create 且名字用显示名",
+  lastCall("session_create")?.peer === "Z" && lastCall("session_create")?.name === "丁二机",
+  JSON.stringify(lastCall("session_create"))
+);
+check("开完当场切进那个框（基础对话的 id 就是设备 ID）", takeCalls("session_focus", since).some(([, a]) => a.id === "Z"));
+check(
+  "再去看那一行，动作已经变成「打开对话」",
+  !!peerAct("Z", "打开对话") && !peerAct("Z", "新建对话"),
+  peerActBtns("Z").map((b) => b.text).join("/")
+);
+// 抹掉这两台临时摆出来的东西，别让后面的用例拿多出来的行说事
+world.sessions = world.sessions.filter((s) => s.id !== "C-pinned");
+world.peers = world.peers.filter((p) => p.id !== "Z");
+world.sessions = world.sessions.filter((s) => s.peer !== "Z");
+world.hist = world.hist.filter((m) => m.peer !== "Z");
+world.active = "A";
+emit("sessions-changed", sessionsPayload());
+emit("peers-changed", statusPayload());
+await settle();
 click(rowOf("A"));
 await settle();
-aliasInp.value = "";
 
-/* 18) 解绑：不再自动连回来，要恢复只能亲手重新添加 */
+/* 17c) 添加时就填备注：bind_peer_addr 之后紧跟一次 set_peer_alias，用的就是差集认出的那台 */
+// X 在前面那一条用例里是被直接推进 world.peers 的（937 行），这里先把它从已登记
+// 名单里撤掉：不撤，差集永远是空的，下面那发 set_peer_alias 根本不会发
+world.peers = world.peers.filter((p) => p.id !== "X");
+emit("peers-changed", statusPayload());
+await settle();
+byId("inp-manual-addr").value = "10.0.0.9:45789";
+byId("inp-manual-alias").value = "仓库那台";
+since = calls.length;
+click(byId("btn-bind-addr"));
+await settle();
+check("添加走的是 bind_peer_addr", takeCalls("bind_peer_addr", since).length === 1);
+check(
+  "添加成功后补一发备注，peer 是差集认出的那台而不是用户填的地址",
+  lastCall("set_peer_alias")?.peer === "X" && lastCall("set_peer_alias")?.alias === "仓库那台",
+  JSON.stringify(lastCall("set_peer_alias"))
+);
+check("备注排在建会话之前：基础对话一开始就叫备注名", world.sessions.find((s) => s.id === "X")?.name === "仓库那台", String(world.sessions.find((s) => s.id === "X")?.name));
+check("列表里多了一行而且带着那个备注", peerRowText("X").includes("仓库那台"), peerRowText("X"));
+check(
+  "添加完两个输入框都清空了（不会下一台沿用上一台的备注）",
+  byId("inp-manual-addr").value === "" && byId("inp-manual-alias").value === "",
+  `${byId("inp-manual-addr").value}/${byId("inp-manual-alias").value}`
+);
+// 重复添加同一台：差集为空，不能拿人家已有的备注开刷
+world.peers.find((p) => p.id === "X").alias = "自己改的名";
+emit("peers-changed", statusPayload());
+await settle();
+byId("inp-manual-addr").value = "10.0.0.9:45789";
+byId("inp-manual-alias").value = "不该被写进去的名";
+since = calls.length;
+click(byId("btn-bind-addr"));
+await settle();
+check(
+  "差集为空（重复添加）时一发 set_peer_alias 都不能发",
+  takeCalls("set_peer_alias", since).length === 0,
+  JSON.stringify(takeCalls("set_peer_alias", since))
+);
+check("那台原有的备注还在", world.peers.find((p) => p.id === "X")?.alias === "自己改的名", String(world.peers.find((p) => p.id === "X")?.alias));
+// 抹掉这台临时机器（后面的用例按 A/C 两台说事）
+world.peers = world.peers.filter((p) => p.id !== "X");
+world.sessions = world.sessions.filter((s) => s.peer !== "X");
+world.hist = world.hist.filter((m) => m.peer !== "X");
+world.active = "A";
+emit("peers-changed", statusPayload());
+await settle();
+click(rowOf("A"));
+await settle();
+
+/* 18) 解绑：长在行上、两步确认，不再自动连回来 */
 // 真机上 mDNS 不会因为解绑就停止广播，桩里也跟着把它摆在候选里
 world.discovered.push({ id: "C", name: "丙机", host: "10.0.0.3", port: 45789 });
 click(rowOf("C"));
 await settle();
 since = calls.length;
-click(byId("btn-unbind"));
+const unBtn = peerAct("C", "解绑");
+click(unBtn);
 await settle();
 check(
-  "解绑调的是 unbind_peer 且带着当前这台的设备 ID",
+  "第一下只把按钮变成待确认，不发 unbind_peer",
+  takeCalls("unbind_peer", since).length === 0 && unBtn.text === "确认解绑？",
+  unBtn.text
+);
+click(unBtn);
+await settle();
+check(
+  "第二下才真解，且带的是这一行的设备 ID",
   takeCalls("unbind_peer", since).length === 1 && lastCall("unbind_peer")?.peer === "C",
   JSON.stringify(lastCall("unbind_peer"))
 );
@@ -1224,9 +1502,13 @@ check(
 check("这台已不在 peers 里了", !world.peers.some((p) => p.id === "C"));
 emit("peers-changed", statusPayload());
 await settle();
+check(
+  "列表里那一行跟着少一行",
+  !peerRowOf("C") && peerRows().length === world.peers.length,
+  peerRows().map((r) => r.dataset.peer).join(",")
+);
 const cand = byId("xfer-candidates").children.find((c) => c.classSet.has("cand") && c.text.includes("丙机"));
 check("候选按钮上标出「已解绑」", !!cand && cand.text.includes("（已解绑）"), String(cand?.text));
-check("解绑后备注框禁用（这台已经没有登记记录可改）", aliasInp.disabled === true, String(aliasInp.disabled));
 // 弹层里点它：必须先重新添加，添加没成就不能开框（否则是个永远发不出去的新框）
 since = calls.length;
 const unbound = await openChatWith("丙机 · 10.0.0.3");
@@ -3681,6 +3963,80 @@ check(
   ]
     .filter(Boolean)
     .join(" / ") || "页面与脚本都清干净了"
+);
+
+/* 静态合约：「已添加的对端」这一屏里那几条只能从源码上钉住的约定。
+   行为断言能验「做对了」，验不了「不再从 state.cur 反查」这种「不该存在的东西」 */
+const fnBody = (name) => {
+  const s = xferSrc.indexOf(`function ${name}(`);
+  if (s < 0) return "";
+  const e = xferSrc.indexOf("\n}", s);
+  return xferSrc.slice(s, e < 0 ? s + 2000 : e + 2);
+};
+check(
+  "底部那组单值表单彻底拆干净了（页面与脚本两侧都不能再残留它的 id 与接线）",
+  !/inp-peer-alias|btn-peer-alias|btn-unbind\b/.test(html) &&
+    !/\bui\.(peerAlias|btnPeerAlias|btnUnbind)\b|function syncAliasInput|function unbindOne/.test(xferSrc),
+  [
+    /inp-peer-alias|btn-peer-alias|btn-unbind\b/.test(html) ? "页面里还有旧控件" : "",
+    /\bui\.(peerAlias|btnPeerAlias|btnUnbind)\b|function syncAliasInput|function unbindOne/.test(xferSrc) ? "脚本里还有旧接线" : "",
+  ]
+    .filter(Boolean)
+    .join(" / ") || "旧三件套没影了"
+);
+check(
+  "新屏需要的三个元素都在页面里（列表 / 带台数的标题 / 添加时的可选备注）",
+  /id="xfer-peer-list"/.test(html) && /id="xfer-peer-title"/.test(html) && /id="inp-manual-alias"/.test(html)
+);
+check(
+  "set_peer_alias 与 unbind_peer 的 peer 取自本行，不从 state.cur 反查",
+  /invoke\("set_peer_alias", \{ peer: p\.id, alias \}\)/.test(fnBody("savePeerAlias")) &&
+    /invoke\("unbind_peer", \{ peer: p\.id \}\)/.test(fnBody("unbindPeer")) &&
+    !/state\.cur/.test(fnBody("savePeerAlias") + fnBody("unbindPeer") + fnBody("openPeerSession")),
+  JSON.stringify({
+    alias: /peer: p\.id/.test(fnBody("savePeerAlias")),
+    unbind: /peer: p\.id/.test(fnBody("unbindPeer")),
+    cur泄漏: /state\.cur/.test(fnBody("savePeerAlias") + fnBody("unbindPeer") + fnBody("openPeerSession")),
+  })
+);
+check(
+  "排序只有一处：列表那一侧不再排第二次（后端 peers_snapshot 按 display_name 排过）",
+  !/\.sort\(/.test(fnBody("renderPeerList")),
+  fnBody("renderPeerList").includes(".sort(") ? "renderPeerList 里多了一次 sort" : "没排"
+);
+check(
+  "显示名走 peerLabel（与 Rust 的 Peer::display_name 同口径），不是直接拿 p.name",
+  /name\.textContent = peerLabel\(p\)/.test(fnBody("buildPeerRow")) && !/name\.textContent = p\.name/.test(fnBody("buildPeerRow"))
+);
+check(
+  "编辑期间一律不重建，进出编辑态才 force（重建会补发 blur、替用户认了半截草稿）",
+  /function renderPeerList\(force = false\)/.test(xferSrc) &&
+    /if \(peerEdit && !force\)/.test(fnBody("renderPeerList")) &&
+    /if \(sig === peerSig && !force\) return;/.test(fnBody("renderPeerList"))
+);
+check(
+  "解绑仍是两步确认且不靠 window.confirm/prompt",
+  !/window\.(confirm|prompt)/.test(fnBody("armRailDelete") + fnBody("armPeerUnbind")) &&
+    /dataset\.armed !== "1"/.test(fnBody("armPeerUnbind")) &&
+    /setTimeout\(\(\) => \{[\s\S]{0,160}?\}, 4000\)/.test(fnBody("armPeerUnbind")),
+  fnBody("armPeerUnbind").includes('"1"') ? "有 armed" : "没 armed"
+);
+check(
+  "添加时的备注走差集认台、而且排在建会话之前（否则基础对话的名字得靠回头改）",
+  /const fresh = ok \? \(state\.status\?\.peers \|\| \[\]\)\.find\(\(p\) => !known\.has\(p\.id\)\) : null;\s*if \(fresh && alias\)/.test(
+    fnBody("bindAddr")
+  ) &&
+    fnBody("bindAddr").indexOf("set_peer_alias") < fnBody("bindAddr").indexOf("session_create") &&
+    !/if \(alias\)\s*\{/.test(fnBody("bindAddr")),
+  JSON.stringify({
+    差集: /!known\.has\(p\.id\)/.test(fnBody("bindAddr")),
+    先备注: fnBody("bindAddr").indexOf("set_peer_alias") < fnBody("bindAddr").indexOf("session_create"),
+  })
+);
+check(
+  "列表的样式不是空气（行 / 编辑框 / 空态三类都在 style.css 里）",
+  [".peer-list", ".peer-row", ".peer-rename", ".peer-empty"].every((c) => css.includes(c)),
+  [".peer-list", ".peer-row", ".peer-rename", ".peer-empty"].filter((c) => !css.includes(c)).join(",") || "都在"
 );
 
 console.log(failed ? `\n${failed} 项未通过` : "\n全部通过");

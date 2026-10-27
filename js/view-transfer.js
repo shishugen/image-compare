@@ -44,12 +44,14 @@ const ui = {
   deviceName: el("inp-device-name"),
   btnPair: el("btn-pair-save"),
   manualAddr: el("inp-manual-addr"),
+  // 添加时就顺手起个备注，省得「先加进列表、再回到列表里改」两跳
+  manualAlias: el("inp-manual-alias"),
   btnManual: el("btn-bind-addr"),
-  peerAlias: el("inp-peer-alias"),
-  btnPeerAlias: el("btn-peer-alias"),
-  btnUnbind: el("btn-unbind"),
   btnReprobe: el("btn-reprobe"),
   candidates: el("xfer-candidates"),
+  // 已添加的对端：一台一行，改备注 / 打开对话 / 解绑都在行上
+  peerList: el("xfer-peer-list"),
+  peerTitle: el("xfer-peer-title"),
   settings: el("xfer-settings"),
   btnSettings: el("btn-xfer-settings"),
   // 抽屉里的两页与两枚页签：「配对」只管设备身份，本机偏好全在「设置」那一页
@@ -317,6 +319,8 @@ function renderStatus(s) {
       ui.candidates.appendChild(b);
     }
   }
+  // 已添加的对端：一台一行。跟候选一样只看 status 那一份，不另拉一次 IPC
+  renderPeerList();
   ui.passphrase.value = "";
   ui.passphrase.placeholder = s.passphrase_set ? "已设置，留空不修改" : "设置配对口令（≥4 字符）";
   if (ui.deviceName.value === "" && s.device_name) ui.deviceName.value = s.device_name;
@@ -366,60 +370,260 @@ function renderPeerHead() {
     }</span>`;
   }
   ui.btnSend.disabled = !canSend || state.sending;
-  ui.btnUnbind.disabled = !(sess && peer);
   ui.btnReprobe.disabled = !(sess && peer);
-  // 备注名是改「这台」的，不是改某个对话框的：没有登记过的对端没得改
-  syncAliasInput(peer);
+  // 备注与解绑不再看「当前这台」的脸色：它们长在列表每一行上（见 renderPeerList）
   // 多台之后手动添加不再受「已绑定」限制：每台都值得一行地址
   ui.btnManual.disabled = !state.status?.passphrase_set;
 }
 
-/** 上一次由代码写进备注框的那份值，与它是给哪一台的（回写前要比这两个） */
+/* --------------------------------------------------------------------------
+ * 已添加的对端：一台一行，改备注 / 打开对话 / 解绑都长在那一行上
+ *
+ * 抽屉里为什么要有这一份（会话栏不已经一台好几行了）：会话栏是「框」粒度，
+ * 一台能占好几行、还混着「未标记」那一格，管不了「这台叫什么、在哪台机器上、
+ * 要不要解绑」。这三件事以前做在页面底部一组单值输入框上，作用对象是
+ * 「当前会话所属的那台」而页面上一个字没说 —— 给第二台改备注得先去会话栏
+ * 切过去、再回这个抽屉。数据与命令本来就是对端粒度的（status 里带着全部 peers，
+ * set_peer_alias / unbind_peer 都收 peer），所以这一版纯前端：
+ * peer 一律取自本行，不再从 state.cur 反查。
+ * ------------------------------------------------------------------------ */
+
+/** 正在行内改备注的那一行（null = 没有在改）。留着它是因为心跳每秒都可能推一次
+ *  peers-changed：重建时这一行得原样接回去，否则输入框连打到一半的草稿一起被拆掉 */
+let peerEdit = null;
+/** 上一次由代码写进行内输入框的那份值，与它是给哪一台的（回写前要比这两个） */
 let aliasShown = "";
 let aliasShownFor = "";
+/** 列表重建的签名，与 railSig 一个用途：别每秒拆建一次 DOM */
+let peerSig = "";
 
-/** 把备注名输入框对齐到当前这台。它跟着「当前对话框所属的那台」走，
- *  而不是跟着用户正在打的内容走 —— 心跳每秒都可能推一次 peers-changed：
- *  1. 正在编辑（焦点在这个框里）绝不回写，否则字打到一半就被冲掉；
- *  2. 没在编辑但框里是一份**未保存的草稿**（与代码上次写进去的那份不一样、
- *     后端却没变）也不回写，否则点去别处一下就把草稿抹了；
- *  3. 换了那一台，或后端那份真变了（存好了 / 被改回来了）才回写 */
-function syncAliasInput(peer) {
-  if (!ui.peerAlias) return;
-  const on = !!peer;
-  ui.peerAlias.disabled = !on;
-  if (ui.btnPeerAlias) ui.btnPeerAlias.disabled = !on;
-  if (!on) {
-    ui.peerAlias.value = "";
-    aliasShown = "";
-    aliasShownFor = "";
-    return;
-  }
-  const want = peer.alias || "";
-  if (document.activeElement === ui.peerAlias) return;
-  if (aliasShownFor === peer.id && ui.peerAlias.value !== aliasShown && want === aliasShown) return;
-  ui.peerAlias.value = want;
-  aliasShown = want;
-  aliasShownFor = peer.id;
+/** 某一台名下的所有对话框。「未标记」那行的 peer 是空串，永远进不来 */
+function peerSessions(peerId) {
+  if (!peerId) return [];
+  return state.sessionList.filter((s) => s.peer === peerId);
 }
 
-/** 保存当前这台的备注名。空串是个明确意图：清掉备注，退回对方上报的设备名 */
-async function savePeerAlias() {
-  const sess = sessionRowOf(state.cur);
-  const peerId = sess?.peer;
-  if (!peerId) {
-    toast("这台还没添加，改不了备注", "error");
+/** 铺列表。顺序就是后端那份（peers_snapshot 按 display_name 排过），这里不再排第二次：
+ *  两边各排一遍迟早会长出两个顺序。名字走 peerLabel，与 Rust 的 Peer::display_name 同口径 */
+function renderPeerList(force = false) {
+  const box = ui.peerList;
+  if (!box) return;
+  const peers = state.status?.peers || [];
+  if (peerEdit && !force) {
+    // 编辑期间一律不重建：清空重铺会把那个输入框从文档里摘掉，而摘掉聚焦元素
+    // 浏览器会补发一次 blur —— 等于替用户把还没打完的草稿「认了」。
+    // 行上的在线点晚几十秒刷新没代价，草稿被冲掉有。
+    syncPeerAliasInput(peers.find((x) => x.id === peerEdit.peerId));
     return;
   }
-  const alias = ui.peerAlias.value.trim();
+  const curPeer = sessionRowOf(state.cur)?.peer || "";
+  const sig = JSON.stringify([
+    peers.map((p) => [p.id, p.name, p.alias, p.host, p.port, p.online, p.last_seen]),
+    curPeer,
+    // 一台有没有框决定它那行的动作叫「打开对话」还是「新建对话」
+    state.sessionList.map((s) => [s.peer, s.id]),
+  ]);
+  if (sig === peerSig && !force) return;
+  peerSig = sig;
+  if (ui.peerTitle) ui.peerTitle.textContent = peers.length ? `已添加的对端（${peers.length} 台）` : "已添加的对端";
+  box.textContent = "";
+  if (!peers.length) {
+    const e = document.createElement("div");
+    e.className = "peer-empty";
+    e.textContent = "还没有添加任何对端：下面填一台的 IP，或等它给你发一条消息。";
+    box.appendChild(e);
+    return;
+  }
+  for (const p of peers) box.appendChild(buildPeerRow(p, curPeer));
+}
+
+/** 一行：名字（或编辑中的输入框）+ 地址与在线态 + 三个动作。
+ *  动作直接摊开不折进右键菜单：这一屏一共就几行，藏在菜单里没人找得到 */
+function buildPeerRow(p, curPeer) {
+  const row = document.createElement("div");
+  // 当前正在聊的那台标一档高亮：这一屏不再有「当前」这个隐含对象了，不标就看不出谁是谁
+  row.className = "peer-row" + (curPeer && p.id === curPeer ? " is-active" : "");
+  row.dataset.peer = p.id;
+
+  const top = document.createElement("div");
+  top.className = "peer-row-top";
+  const dot = document.createElement("span");
+  dot.className = "dot " + (p.online ? "dot-on" : "dot-off");
+  top.appendChild(dot);
+  if (peerEdit && peerEdit.peerId === p.id) top.appendChild(buildAliasInput(peerEdit, p));
+  else {
+    const name = document.createElement("b");
+    name.textContent = peerLabel(p);
+    name.title = p.alias
+      ? `备注名（只在本机显示），对方报的设备名：${p.name || "没上报"}`
+      : "对方上报的设备名，点「改备注」起一个只给自己看的";
+    top.appendChild(name);
+  }
+  row.appendChild(top);
+
+  const meta = document.createElement("div");
+  // 与顶栏同一句文案、同一个字段：这个时间是「最近一次 ping 通」，
+  // 不是最后一条消息（那是会话栏右边那一列）
+  meta.className = "peer-row-meta";
+  meta.textContent = `${p.host}:${p.port} · ${p.online ? "在线" : "离线（最近 " + fmtTime(p.last_seen) + "）"}`;
+  row.appendChild(meta);
+
+  const acts = document.createElement("div");
+  acts.className = "peer-row-acts";
+  acts.appendChild(rowAction("改备注", "就地改这台在本机显示的名字，对端那边不会有任何变化", () => startPeerAliasEdit(p)));
+  const hasSess = peerSessions(p.id).length > 0;
+  acts.appendChild(
+    rowAction(
+      hasSess ? "打开对话" : "新建对话",
+      hasSess ? "切到这台最近有过消息的那个对话框" : "这台还没有对话框，点一下把基础对话开出来",
+      () => openPeerSession(p)
+    )
+  );
+  acts.appendChild(
+    rowAction("解绑", "不再主动连它，也不会再自动连回来；历史与收到的文件都不动", (btn) => armPeerUnbind(btn, p), true)
+  );
+  row.appendChild(acts);
+  return row;
+}
+
+/** 行上那枚动作。stopPropagation 不能少：它跟整行共用一次点击流，
+ *  冒上去会让正在编辑的那一行被 blur 提前收尾 */
+function rowAction(label, title, onClick, danger = false) {
+  const b = document.createElement("button");
+  b.className = "link-btn" + (danger ? " danger" : "");
+  b.textContent = label;
+  b.title = title;
+  b.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    onClick(b);
+  });
+  return b;
+}
+
+/** 名字那一格换成输入框。与会话栏那个 startRename 同一套做法（webview 里 prompt
+ *  不一定能用，也没地方放「确定」）：回车与点旁边都算认了，Esc 取消 */
+function buildAliasInput(self, p) {
+  const input = document.createElement("input");
+  input.className = "peer-rename";
+  input.type = "text";
+  input.value = p.alias || "";
+  input.maxLength = 40;
+  input.placeholder = "给它起个备注，留空则用对方报的设备名";
+  self.input = input;
+  input.addEventListener("click", (ev) => ev.stopPropagation());
+  input.addEventListener("keydown", (ev) => {
+    ev.stopPropagation();
+    // 输入法组合期间的 Enter 是「选词」不是「提交」，跟输入框那一条同口径
+    if (ev.isComposing) return;
+    if (ev.key === "Enter") self.close(true);
+    else if (ev.key === "Escape") self.close(false);
+  });
+  input.addEventListener("blur", () => self.close(true));
+  return input;
+}
+
+/** 打开某一行的编辑。一次只允许一行在编辑：换行时前一行按「认了」收尾，
+ *  而不是静默丢草稿（blur 自己也会走这一条，两个入口不会存两次：close 里有闭包标） */
+function startPeerAliasEdit(p) {
+  if (peerEdit) {
+    if (peerEdit.peerId === p.id) return;
+    peerEdit.close(true);
+  }
+  const self = { peerId: p.id, input: null, closed: false };
+  self.close = async (commit) => {
+    if (self.closed) return;
+    self.closed = true;
+    const alias = (self.input?.value ?? "").trim();
+    // 期间用户可能已经点开别行了：那种情况下不能把别人的编辑态抹掉
+    if (peerEdit === self) peerEdit = null;
+    // 没改过就不发：点一下输入框又出去不该多一次写盘与改名
+    if (commit && alias !== (p.alias || "")) await savePeerAlias(p, alias);
+    // 无论存没存，都得重建一次才能把输入框换回名字
+    renderPeerList(true);
+  };
+  peerEdit = self;
+  aliasShown = p.alias || "";
+  aliasShownFor = p.id;
+  // force：进出编辑态的那一次必须重建，才能把名字换成输入框（或换回来）
+  renderPeerList(true);
+  self.input?.focus();
+  self.input?.select();
+}
+
+/** 把行内那个输入框对齐到后端那份。三条保护照搬原来的 syncAliasInput：
+ *  1. 焦点在框里绝不回写（打到一半不能被打断）；
+ *  2. 没聚焦但框里是一份未保存的草稿（与代码上次写进去的不一样、后端却没变）也不回写；
+ *  3. 后端那份真变了（存好了 / 被改回来了）才回写 */
+function syncPeerAliasInput(p) {
+  if (!peerEdit?.input || !p) return;
+  const inp = peerEdit.input;
+  const want = p.alias || "";
+  if (document.activeElement === inp) return;
+  if (aliasShownFor === p.id && inp.value !== aliasShown && want === aliasShown) return;
+  inp.value = want;
+  aliasShown = want;
+  aliasShownFor = p.id;
+}
+
+/** 存这一行的备注。空串是个明确意图：清掉备注，退回对方上报的设备名 */
+async function savePeerAlias(p, alias) {
   try {
-    await invoke("set_peer_alias", { peer: peerId, alias });
+    await invoke("set_peer_alias", { peer: p.id, alias });
     toast(alias ? `已把这台备注为「${alias}」` : "已清除备注，退回对方上报的设备名");
   } catch (err) {
     toast(errText(err), "error");
     return;
   }
   // 后端会顺手把还叫旧名的对话框一起改名，所以两边列表都得重取
+  await refreshStatus();
+  await loadSessions();
+}
+
+/** 那一行的「打开对话 / 新建对话」：一台可以有好几个框，跳最近有过消息的那个；
+ *  一个都还没有就直接把基础对话开出来（与刚添加完那一步同一个命令、同一个名字） */
+async function openPeerSession(p) {
+  const mine = peerSessions(p.id);
+  if (!mine.length) {
+    try {
+      applySessions(await invoke("session_create", { peer: p.id, name: peerLabel(p) }));
+    } catch (err) {
+      toast(errText(err), "error");
+      return;
+    }
+    // 基础对话的会话 ID 就是设备 ID（与 bindAddr 收尾那一步同一口径）
+    await openSession(p.id);
+    return;
+  }
+  const latest = mine.reduce((a, b) => (b.last > a.last ? b : a), mine[0]);
+  await openSession(latest.id);
+}
+
+/** 解绑也是两步：webview 里 window.confirm 不一定可用（与会话栏删框同一口径），
+ *  点一下变成「确认解绑？」，4 秒内再点一次才真解 */
+function armPeerUnbind(btn, p) {
+  if (btn.dataset.armed !== "1") {
+    btn.dataset.armed = "1";
+    btn.textContent = "确认解绑？";
+    toast("再点一次「确认解绑？」才会解绑这台：聊天记录与收到的文件都不动，要恢复得在候选里点它或再填一次 IP");
+    setTimeout(() => {
+      if (!btn.isConnected) return;
+      btn.dataset.armed = "";
+      btn.textContent = "解绑";
+    }, 4000);
+    return;
+  }
+  return unbindPeer(p);
+}
+
+/** 解绑某一台。参数取自本行，不是「当前正在聊的那台」 */
+async function unbindPeer(p) {
+  try {
+    await invoke("unbind_peer", { peer: p.id });
+    toast(`已解绑「${peerLabel(p)}」：不再主动连它，它下次发消息仍会回到原来的对话框`);
+  } catch (err) {
+    toast(errText(err), "error");
+    return;
+  }
   await refreshStatus();
   await loadSessions();
 }
@@ -449,6 +653,8 @@ function applySessions(payload) {
   }
   renderSessionRail();
   renderPeerHead();
+  // 那一行的动作叫「打开对话」还是「新建对话」看这台有没有框，会话列表一动就得跟着铺
+  renderPeerList();
 }
 
 /* --------------------------------------------------------------------------
@@ -1354,18 +1560,6 @@ async function newTopic(peer) {
     console.error("[xfer] 开新话题失败:", err);
     toast(errText(err), "error");
   }
-}
-
-async function unbindOne(s) {
-  if (!s) return;
-  try {
-    await invoke("unbind_peer", { peer: s.peer });
-    toast(`已解绑「${s.name}」：不再主动连它，它下次发消息仍会回到这个对话框`);
-  } catch (err) {
-    toast(errText(err), "error");
-  }
-  await refreshStatus();
-  await loadSessions();
 }
 
 /** webview 里 window.confirm 不一定可用（收藏视图删除也是这个口径），
@@ -2975,9 +3169,11 @@ async function chooseHeartbeat(ev) {
  * 添加一台对端。多台之后这不是「换一台绑」而是「多一台可发」，
  * `autoFocus` 为 true 时顺手给它建好基础对话并切过去（这台已经能开好几个框，
  * 这里建的永远是最早那一个：新话题走 session_new）；返回是否成功，
- * 让「＋ 新聊天」那类调用点能在失败时别接着建会话
+ * 让「＋ 新聊天」那类调用点能在失败时别接着建会话。
+ * `alias` 是添加时就填好的备注名（可空）：认台靠的就是下面那份差集，
+ * 差集为空（重复添加同一台）就当没这回事，不能把人家已有的备注盖掉
  */
-async function bindAddr(addr, autoFocus = true) {
+async function bindAddr(addr, autoFocus = true, alias = "") {
   if (!addr) {
     toast("填对端 IP，形如 192.168.1.23 或 192.168.1.23:45790", "error");
     return false;
@@ -2990,6 +3186,7 @@ async function bindAddr(addr, autoFocus = true) {
   try {
     await invoke("bind_peer_addr", { addr });
     ui.manualAddr.value = "";
+    if (ui.manualAlias) ui.manualAlias.value = "";
     toast("已添加对端");
   } catch (err) {
     ok = false;
@@ -2998,23 +3195,32 @@ async function bindAddr(addr, autoFocus = true) {
     await refreshStatus();
     await loadSessions();
   }
-  if (ok && autoFocus) {
-    const fresh = (state.status?.peers || []).find((p) => !known.has(p.id));
-    if (fresh) {
-      // 刚添加就顺手把基础对话建出来：只切焦点不建行，会话栏里连个高亮都没有
-      try {
-        applySessions(await invoke("session_create", { peer: fresh.id, name: peerLabel(fresh) }));
-      } catch (err) {
-        toast(errText(err), "error");
-      }
-      await openSession(fresh.id);
+  const fresh = ok ? (state.status?.peers || []).find((p) => !known.has(p.id)) : null;
+  if (fresh && alias) {
+    // 备注得在建会话之前写：基础对话的名字取的就是显示名，晚一步就得上面那一行的「改备注」补
+    try {
+      await invoke("set_peer_alias", { peer: fresh.id, alias });
+      fresh.alias = alias;
+      await refreshStatus();
+    } catch (err) {
+      // 添加成了、备注没写上：说清楚，不静默吞（那一台照样能聊，行上随时能改）
+      toast(errText(err), "error");
     }
+  }
+  if (fresh && autoFocus) {
+    // 刚添加就顺手把基础对话建出来：只切焦点不建行，会话栏里连个高亮都没有
+    try {
+      applySessions(await invoke("session_create", { peer: fresh.id, name: peerLabel(fresh) }));
+    } catch (err) {
+      toast(errText(err), "error");
+    }
+    await openSession(fresh.id);
   }
   return ok;
 }
 
 function bindManual() {
-  bindAddr(ui.manualAddr.value.trim());
+  bindAddr(ui.manualAddr.value.trim(), true, (ui.manualAlias?.value || "").trim());
 }
 
 /* --------------------------------------------------------------------------
@@ -3205,16 +3411,15 @@ if (ui.lightbox && ui.lightboxClose) {
 }
 
 ui.btnPair.addEventListener("click", savePairConfig);
-// 备注名：点按钮与按回车走同一条保存，不拿 blur 当保存（从输入框移开鼠标不等于想改名）
-ui.btnPeerAlias.addEventListener("click", savePeerAlias);
-ui.peerAlias.addEventListener("keydown", (ev) => {
-  if (ev.key === "Enter" && !ev.isComposing) savePeerAlias();
-});
+// 备注不再放在页面底部统一改：它长在列表每一行上（见 startPeerAliasEdit）
 ui.btnManual.addEventListener("click", bindManual);
 ui.manualAddr.addEventListener("keydown", (ev) => {
   if (ev.key === "Enter") bindManual();
 });
-ui.btnUnbind.addEventListener("click", () => unbindOne(sessionRowOf(state.cur)));
+// 备注那一档是可选的：回车直接走添加，不逼用户再去点一次按钮
+ui.manualAlias?.addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter" && !ev.isComposing) bindManual();
+});
 ui.btnReprobe.addEventListener("click", async () => {
   const sess = sessionRowOf(state.cur);
   if (!sess) return;

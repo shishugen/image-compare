@@ -850,7 +850,7 @@ check("抽屉住在 relative 宿主里（.cmp-body，同传输视图的 .panel-b
 check("抽屉有 Esc/收起之外的关闭入口", html.includes('data-close-drawer="cmp-settings"') && html.includes('id="btn-set-close"'));
 
 /* 传输视图那个配对抽屉也得按这里对：session_route_check 的 DOM 桩会按 id 自动造元素，
-   HTML 里拆了这两个控件那边照样全绿 —— 这类「拆了 DOM 没拆 JS 引用」只能靠静态合约兜 */
+   HTML 里拆了/改了控件那边照样全绿 —— 这类「拆了 DOM 没拆 JS 引用」只能靠静态合约兜 */
 const xferJs = readFileSync(join(here, "..", "js", "view-transfer.js"), "utf8");
 // 抽屉 toggle 与切页两个函数体。磁盘那几样只该在切页时读，toggle 里只重置「本次读过没有」
 const drawerToggleBody = (() => {
@@ -864,12 +864,18 @@ const applyPageBody = (() => {
   return at >= 0 && end > at ? xferJs.slice(at, end) : "";
 })();
 check(
-  "配对设置抽屉里有备注名那一栏（输入框 + 保存按钮）",
-  html.includes('id="inp-peer-alias"') && html.includes('id="btn-peer-alias"')
+  "配对那一页有「已添加的对端」那一屏（带台数的标题 + 列表）与添加时的可选备注名",
+  html.includes('id="xfer-peer-title"') && html.includes('id="xfer-peer-list"') && html.includes('id="inp-manual-alias"')
+);
+check(
+  "旧的单值备注栏（输入框 + 保存按钮 + 解绑当前对端）从 HTML 里彻底拆了",
+  !/id="inp-peer-alias"|id="btn-peer-alias"|id="btn-unbind"/.test(html)
 );
 check(
   "JS 读的 id 与 HTML 对得上，且真去调了 set_peer_alias",
-  xferJs.includes('el("inp-peer-alias")') && xferJs.includes('el("btn-peer-alias")') && xferJs.includes('invoke("set_peer_alias"')
+  xferJs.includes('el("xfer-peer-list")') &&
+    xferJs.includes('el("inp-manual-alias")') &&
+    xferJs.includes('invoke("set_peer_alias"')
 );
 check("解绑的提示说清了不会再自动连回来", html.includes("不会再自动连回来"));
 
@@ -907,7 +913,7 @@ check(
 check(
   "配对那一页不含本机偏好，设置那一页不含对端动作（各归各的，不重不漏）",
   ["inbox-dir-value", "storage-rows", "inp-heartbeat", "chk-notify-sound"].every((id) => prefsPage.includes(`id="${id}"`) && !pairPage.includes(`id="${id}"`)) &&
-    ["inp-passphrase", "xfer-candidates", "inp-manual-addr", "inp-peer-alias", "btn-unbind"].every((id) => pairPage.includes(`id="${id}"`) && !prefsPage.includes(`id="${id}"`))
+    ["inp-passphrase", "xfer-candidates", "inp-manual-addr", "inp-manual-alias", "xfer-peer-list"].every((id) => pairPage.includes(`id="${id}"`) && !prefsPage.includes(`id="${id}"`))
 );
 check(
   "切页只改 hidden，不重建那一页（重建会把刚填一半的口令与正在跑的臂一起弄没）",
@@ -2486,6 +2492,106 @@ check(
   "置顶要么根本不存盘（现状：每次启动普通窗），要么存了就得有两处应用点（命令层 + 启动读盘）",
   !persistedPin || pinCallSites >= 2,
   `存盘=${persistedPin} 应用点=${pinCallSites}`
+);
+
+/* ------------------- 「固定这一扇窗」的静态合约 -------------------
+   这一项行为主体（跳过固定窗轮转、池空不推游标、切档不丢）全在
+   tools/folder_browse_check.mjs 第 19 节里跑真代码验了。这里只钉桩看不见的
+   那几样：HTML 里按钮长什么样、样式表里有没有那一条、代码走的是哪个入口。
+   为什么这些值得前移：假 DOM 不解析 HTML（byId 任意 id 都能造出一个元素），
+   HTML 改了 id / 忘了出厂态 / CSS 没写，行为层全是绿的。 */
+// 按「function X( 到下一个行首 }」切片：只看目标函数体内部，不被同名注释骗
+const cmpFn = (name) => {
+  const s = cmpJs.indexOf(`function ${name}(`);
+  if (s < 0) return "";
+  const e = cmpJs.indexOf("\n}", s);
+  return cmpJs.slice(s, e < 0 ? s + 2000 : e + 2);
+};
+
+check(
+  "HTML 里有那枚「固定」：id 只出现一次、走 .btn-toggle 那套、就在「同步」同一个 tb-group 里",
+  (html.match(/id="btn-pin-pane"/g) || []).length === 1 &&
+    /class="btn btn-toggle"[^>]*>\s*固定\s*<\/button>/.test(html) &&
+    html.indexOf('id="chk-sync"') < html.indexOf('id="btn-pin-pane"') &&
+    html.indexOf('id="btn-pin-pane"') < html.indexOf("btn-topmost") &&
+    cmpJs.includes('el("btn-pin-pane")'),
+  "按钮必须夹在同步与置顶之间那一段里"
+);
+check(
+  "出厂不亮也不灰（HTML 里就亮着/灰着 = 一启动就骗人：panePins 是空的）",
+  !/id="btn-pin-pane"[^>]*(is-active|disabled)/.test(html) && !/class="btn btn-toggle is-active"[^>]*>\s*固定/.test(html)
+);
+check(
+  "那句 title 把两个易混点写明了：固定的是「这一扇窗」不是「这张图」，且与右边那枚「置顶」不是回事",
+  /title="[^"]*固定的是这一扇窗（不是窗里那张图）[^"]*置顶[^"]*"[^>]*>\s*固定/.test(html),
+  "只看 HTML 里静态那一句，JS 会跟着当前窗改写它"
+);
+check(
+  "灰掉走真 disabled，高亮走全站那套 is-active（不另发明 is-on），而且灰态在 refreshLayoutUI 这个唯一入口里算",
+  /ui\.btnPinPane\.disabled = single \|\| !!note;/.test(cmpFn("refreshPinUI")) &&
+    /ui\.btnPinPane\.classList\.toggle\("is-active", on\)/.test(cmpFn("refreshPinUI")) &&
+    /refreshPinUI\(\);/.test(cmpFn("refreshLayoutUI")) &&
+    !/is-on/.test(cmpFn("refreshPinUI"))
+);
+check(
+  "固定上限只一处算（pinLimitNote）：这一档至少留一扇能落图；tooltip 与状态行共用那句措辞，不两处各写一句",
+  /if \(seq\.length - held\.length > 1\) return null;/.test(cmpFn("pinLimitNote")) &&
+    /if \(!target || panePins\.has\(target\.key\)\) return null;/.test(cmpFn("pinLimitNote")) &&
+    cmpFn("refreshPinUI").includes("pinLimitNote(target)") &&
+    (cmpJs.match(/最多固定/g) || []).length === 1,
+  "「最多固定」那句全文件只能出现一次（在 pinLimitNote 里），出现第二次就是两处各写一句"
+);
+check(
+  "上限那道在点击 handler 里也得跟上（灰态只是给人看的，假 DOM 不替浏览器拦 disabled 的点击），而且拦在改集合之前",
+  (() => {
+    const h = cmpJs.slice(cmpJs.indexOf('ui.btnPinPane.addEventListener("click"'), cmpJs.indexOf("/* ------------------------------- 分隔条拖动"));
+    return (
+      h.indexOf("pinLimitNote(pane)") > -1 &&
+      h.indexOf("pinLimitNote(pane)") < h.indexOf("panePins.add(k)") &&
+      /if \(note\) \{\s*setStatus\(note\);\s*return;\s*\}/.test(h)
+    );
+  })()
+);
+check(
+  "轮转落窗只一个出口：nextBrowseSlot 拿的是池子，池子只在 rotatableKeys 里筛 panePins",
+  /const seq = rotatableKeys\(\);/.test(cmpFn("nextBrowseSlot")) &&
+    !/LAYOUT_KEYS\[layout\]/.test(cmpFn("nextBrowseSlot")) &&
+    /\.filter\(\(k\) => !panePins\.has\(k\)\)/.test(cmpFn("rotatableKeys"))
+);
+const browseBody = cmpJs.slice(cmpJs.indexOf("async function browseTo("), cmpJs.indexOf("function stepBrowse"));
+check(
+  "池空护栏排在算落窗之前：拦下时一个窗都没动、游标也没推（与「载入失败不推游标」同一条纪律）",
+  browseBody.indexOf("rotatableKeys().length") > -1 &&
+    browseBody.indexOf("rotatableKeys().length") < browseBody.indexOf("const key = nextBrowseSlot()") &&
+    /if \(!rotatableKeys\(\)\.length\) \{[\s\S]{0,160}?return;/.test(browseBody)
+);
+check(
+  "固定窗不进浏览记账：noteLoaded 里那句 browse.slot 带着「没被固定」的前提",
+  /&& !panePins\.has\(pane\.key\)\) browse\.slot = pane\.key;/.test(cmpFn("noteLoaded"))
+);
+check(
+  "固定哪扇认「点过的那扇」优先（panePicked），activePane 只是退路——assign() 也会改 activePane",
+  cmpFn("pinTargetPane").indexOf("panePicked") < cmpFn("pinTargetPane").indexOf("activePane") &&
+    /if \(panePicked && visible\.includes\(panePicked\)\) return panePicked;/.test(cmpFn("pinTargetPane"))
+);
+check(
+  "清空把固定一起归零，而单图档灰掉不替用户改集合（refreshPinUI 里只写 disabled，不碰 panePins）",
+  /panePins\.clear\(\);/.test(browseBody + cmpJs.slice(cmpJs.indexOf('el("btn-clear")'))) &&
+    !/panePins\.(add|delete|clear)/.test(cmpFn("refreshPinUI"))
+);
+check(
+  "固定不存盘：prefs 的三个口子（出厂值 / 写盘 / 读盘应用）里都没有 panePins，全文件也只当内存态用",
+  !/panePins/.test(cmpFn("currentPrefs") + cmpFn("applyPrefs")) &&
+    (cmpJs.match(/panePins/g) || []).length >= 6 &&
+    !/savePrefs\([^)]*panePins/.test(cmpJs) &&
+    /const panePins = new Set\(\);/.test(cmpJs)
+);
+check(
+  "窗上的标记在样式表里真长得出来：.viewport.is-pinned 与那枚角标都在，且角标不吃点击",
+  css.includes(".viewport.is-pinned") &&
+    // 两条 [^}]* 不能省：用 [\s\S]* 会一路滑到下一条规则里的 pointer-events: none，
+    // 把 ::after 本身删干净也照样绿（M11 踩过）
+    /\.viewport\.is-pinned::after\s*\{[^}]*content: "固定"[^}]*pointer-events: none;[^}]*\}/.test(css)
 );
 
 console.log(`\n合计 PASS=${passed} FAIL=${failed}`);
