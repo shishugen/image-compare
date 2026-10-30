@@ -32,6 +32,20 @@ pub fn clear_history(store: State<'_, Arc<Store>>) -> Result<(), String> {
     store.inner().save_history(&HistoryFile::default())
 }
 
+/// 归类移动文件后修正查看历史：一批 (旧路径, 新路径) 原地换新，不置顶不重排。
+///
+/// 与 `record` 不同，这不是「又看了一次」，只是路径变了 —— 所以走
+/// `HistoryFile::rename_paths` 而不是逐条 `record`（那样会把刚移动的那几张顶到最前，
+/// 侧栏顺序会莫名其妙地打乱）。读写都是整份，一次拿全再存回。
+pub fn rename_paths(store: &Store, pairs: &[(String, String)]) -> Result<(), String> {
+    if pairs.is_empty() {
+        return Ok(());
+    }
+    let mut h = store.load_history();
+    h.rename_paths(pairs);
+    store.save_history(&h)
+}
+
 fn record(store: &Store, path: &str) -> Result<HistoryFile, String> {
     // 明确报错而不是静默收下：前端传了相对路径是实现写错了，吞掉的话
     // 「以为记了其实没记」比崩掉难查得多（同 `set_prefs` 的口径）

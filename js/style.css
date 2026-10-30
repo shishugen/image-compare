@@ -916,7 +916,8 @@ body:not(.layout-2) .splitter {
 
 body[data-view="compare"] .view-compare,
 body[data-view="transfer"] .view-transfer,
-body[data-view="fav"] .view-fav {
+body[data-view="fav"] .view-fav,
+body[data-view="sort"] .view-sort {
   display: flex;
 }
 
@@ -2588,4 +2589,227 @@ textarea,
    「未标记」那一行只有删除项，置顶/重命名与隔断都得真消失而不是留白 */
 .ctx-menu > [hidden] {
   display: none;
+}
+
+
+/* ==========================================================================
+ * 视图四：图片归类
+ *
+ * 左右分栏复用 .panel-body（本来就是横向）：左边配规则，右边摆预览结果。
+ * 规则行与表头共用一套列宽（.sort-grid），不然「年」那一格会对不齐表头的「年」。
+ * 移动/复制两枚走 .btn-toggle（与工具栏其它即时开关同一个手感）。
+ * ========================================================================== */
+
+/* 源目录搬到规则区：路径独占一整行，小号字把常见长路径整条显示出来 */
+.sort-src-input {
+  width: 100%;
+  min-width: 0;
+  font-size: 11.5px;
+}
+
+.sort-src-acts {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.sort-plan-name {
+  width: 120px;
+}
+
+.sort-body {
+  /* .panel-body 已是横向 flex；这里只给两侧留出各自的滚动条 */
+  min-height: 0;
+}
+
+.sort-config {
+  flex: 0 0 460px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 14px;
+  overflow: auto;
+  min-width: 0;
+  border-right: 1px solid var(--border);
+  background: var(--bg-panel);
+}
+
+.sort-block-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.sort-block-head b {
+  font-size: 13px;
+  color: var(--text);
+}
+
+/* 自动分夹开关 + 复制到每个夹的关键词 */
+.sort-auto-row {
+  margin: 8px 0 2px;
+}
+.sort-auto {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  color: var(--text);
+  cursor: pointer;
+}
+.sort-auto input {
+  accent-color: var(--accent);
+}
+
+/* 表头与每一行规则共用同一套列：改一处列宽两边跟着走。
+   年月日起止四列已拆（规则只认格式+名称），剩下：格式 / 名称 / 目标 / 动作 / 删 */
+.sort-rule-head,
+.sort-rule {
+  display: grid;
+  grid-template-columns: 1fr 1.6fr 1.4fr 82px 22px;
+  gap: 6px;
+  align-items: center;
+}
+
+.sort-rule-head {
+  font-size: 11px;
+  color: var(--text-dim);
+  padding: 0 2px;
+}
+
+.sort-rules {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.sort-rule .input {
+  min-width: 0;
+  width: 100%;
+  padding: 4px 6px;
+  font-size: 12px;
+}
+
+/* 动作下拉和同行输入框等高齐宽；不约束 min-width 的话 flex/grid 里会被内容撑歪 */
+.sort-rule .sort-action {
+  min-width: 0;
+  width: 100%;
+  padding: 3px 4px;
+  font-size: 12px;
+}
+
+.sort-rule .sort-del {
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+}
+
+.sort-rule .sort-del:hover {
+  color: #e5656b;
+}
+
+.sort-preview {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+.sort-preview-head {
+  flex: 0 0 auto;
+  padding: 10px 14px;
+  font-size: 12px;
+  color: var(--text-dim);
+  border-bottom: 1px solid var(--border);
+  white-space: pre-wrap;
+}
+
+.sort-preview-list {
+  flex: 1 1 auto;
+  overflow: auto;
+  min-height: 0;
+  padding: 6px 0;
+}
+
+.sort-grp {
+  padding: 6px 14px 2px;
+  font-size: 12px;
+  color: var(--accent);
+  font-weight: 600;
+  /* 分组标题粘在滚动容器顶部，翻到底也知道这一段是哪个夹 */
+  position: sticky;
+  top: 0;
+  background: var(--bg);
+}
+
+.sort-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 3px 14px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.sort-row:hover {
+  background: #262a32;
+}
+
+.sort-row .sort-file {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+
+.sort-row .sort-to {
+  flex: 0 0 auto;
+  color: var(--text-dim);
+}
+
+.sort-badge {
+  flex: 0 0 auto;
+  padding: 0 6px;
+  border-radius: 8px;
+  font-size: 10px;
+  line-height: 16px;
+}
+
+.sort-badge.move {
+  background: #2f3846;
+  color: #9fc1ff;
+}
+
+.sort-badge.copy {
+  background: #2c3a2e;
+  color: #98d69b;
+}
+
+.sort-badge.skip {
+  background: #33373f;
+  color: var(--text-dim);
+}
+
+.sort-badge.hold {
+  background: transparent;
+  color: #6b7280;
+  border: 1px dashed var(--border);
+}
+
+/* 被手动排除的行淡一档，一眼看出它不参与本次执行 */
+.sort-row.is-hold .sort-file,
+.sort-row.is-hold .sort-to {
+  opacity: 0.45;
+}
+
+/* 从未命中任何规则的行：没有目标夹，不可点击参与（否则会拿空落点去执行） */
+.sort-row.is-fixed {
+  cursor: default;
 }

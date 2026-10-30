@@ -9,34 +9,16 @@ mod clip;
 mod favorites;
 mod history;
 mod http;
+mod lib_cmds;
 mod net;
 mod pair;
 mod prefs;
+mod sort;
 mod store;
 
-/// 图片扩展名表：对话框过滤、目录浏览、mime 判定三处共用这一份。
-/// 加新格式必须一次改齐（漏一处的表现是「侧栏列得出来、read_image 却回
-/// application/octet-stream」，前端只报「解码失败」，排查成本极高）
-const IMAGE_EXTS: &[&str] = &[
-    "png", "jpg", "jpeg", "webp", "gif", "bmp", "avif", "svg", "tif", "tiff",
-];
-
-/// 浏览列表里一个目录最多列多少张（一个目录上千张图时不指望把列表铺完）
-const FOLDER_MAX_ITEMS: usize = 2000;
-
-fn is_image_ext(path: &std::path::Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| {
-            // 先看是不是原样就在表里，只在大小写不一致时才去 lower（多数路径不用分配）
-            if IMAGE_EXTS.contains(&e) {
-                return true;
-            }
-            let lower = e.to_ascii_lowercase();
-            IMAGE_EXTS.contains(&lower.as_str())
-        })
-        .unwrap_or(false)
-}
+// 「什么算图片」的口径搬到 lib_cmds.rs：sort.rs 也要用同一份，两个模块各自
+// import 一个叶子模块，比一个模块去拿另一个模块的私有 const 干净
+use lib_cmds::{is_image_ext, IMAGE_EXTS};
 
 /// 图片文件选择，最多返回 4 个路径，按选择顺序依次填入图窗。
 /// 必须走 Rust：WKWebView 的 input[type=file] 递出的 File 是 0 字节（只能拿到名字/类型），
@@ -155,7 +137,7 @@ fn folder_images(file: &std::path::Path) -> Result<FolderImages, String> {
         if !p.is_file() || !is_image_ext(&p) {
             continue; // 子目录与非图片都不进列表
         }
-        if items.len() >= FOLDER_MAX_ITEMS {
+        if items.len() >= lib_cmds::FOLDER_MAX_ITEMS {
             truncated = true;
             break;
         }
@@ -368,6 +350,10 @@ pub fn run() {
             history::get_history,
             history::record_view,
             history::clear_history,
+            sort::scan_sort_dir,
+            sort::preview_sort,
+            sort::apply_sort,
+            sort::undo_sort,
             prefs::get_prefs,
             prefs::set_prefs
         ])

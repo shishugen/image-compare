@@ -24,6 +24,9 @@
         <button class="nav-btn" data-goto="fav" title="文字收藏（⌘3）">
           <span class="nav-ico">☆</span><span class="nav-txt">收藏</span>
         </button>
+        <button class="nav-btn" data-goto="sort" title="图片归类（⌘4）：按规则把图分到子文件夹">
+          <span class="nav-ico">▤</span><span class="nav-txt">归类</span>
+        </button>
       </nav>
 
       <div class="workspace">
@@ -510,9 +513,81 @@
               </aside>
             </div>
           </section>
+
+          <!-- ================= 视图四：图片归类 =================
+               三段式：选源目录 → 配规则预演（preview_sort 零副作用）→ 才真动文件（apply_sort）。
+               左边配规则、右边摆预览结果，跟收藏视图一样左右分栏（.panel-body 本来就是横向） -->
+          <section class="view view-sort" id="view-sort">
+            <header class="toolbar">
+              <div class="tb-group">
+                <button id="btn-sort-preview" class="btn" disabled title="先看清每张图会去哪，这一步不动文件">预览</button>
+                <button id="btn-sort-apply" class="btn" disabled title="照预览结果真正执行；移动档需再点一次确认">执行</button>
+                <button id="btn-sort-undo" class="btn btn-ghost" disabled title="撤销上一次执行：移走的移回原位、复制出来的副本删掉">撤销上一步</button>
+              </div>
+
+              <div class="tb-sep"></div>
+
+              <!-- 移动与复制不是一类东西（一个移走源件、一个留着），做成互斥的翻转按钮而非开关 -->
+              <div class="tb-group" role="group" aria-label="执行方式">
+                <button id="btn-sort-mode-move" class="btn btn-toggle is-active" title="尊重每条规则自己的动作：移动档会把标「移动」的源真收进夹里（默认）">移动</button>
+                <button id="btn-sort-mode-copy" class="btn btn-toggle" title="保险档：本批一个源都不动，规则里的「移动」也改走复制">复制</button>
+              </div>
+
+              <div class="tb-spacer"></div>
+
+              <div class="tb-group">
+                <input id="inp-sort-plan-name" class="input sort-plan-name" placeholder="方案名" title="给当前这套规则起个名" />
+                <select id="sel-sort-plan" class="select" title="已保存的归类方案"></select>
+                <button id="btn-sort-save-plan" class="btn btn-ghost" title="把当前规则、目标与源目录存成方案（同名则覆盖）">存方案</button>
+                <button id="btn-sort-new-plan" class="btn btn-ghost" title="清空规则，起一套新方案">新建</button>
+                <button id="btn-sort-del-plan" class="btn btn-ghost danger" title="删除当前选中的方案">删方案</button>
+              </div>
+            </header>
+
+            <div class="panel-body sort-body">
+              <div class="sort-config">
+                <div class="sort-block-head">
+                  <b>规则</b>
+                  <button id="btn-sort-add-rule" class="btn btn-ghost">＋加一条</button>
+                </div>
+                <div class="sort-rule-head">
+                  <span>格式（可选）</span><span>名称关键词</span><span>目标子文件夹</span><span>动作</span><span></span>
+                </div>
+                <div id="sort-rules" class="sort-rules"></div>
+                <div class="sort-auto-row">
+                  <label class="sort-auto" title="按文件名里的颜色/名称自动建夹并移进去，不用逐条写规则"><input type="checkbox" id="chk-sort-auto" checked /> 自动按文件名分夹</label>
+                </div>
+                <label class="field" title="命中这些关键词的图会复制进本次创建的每个夹，不单独建夹"><span>复制到每个夹的关键词</span>
+                  <input id="inp-sort-spread-kw" class="input" value="细节,尺寸" placeholder="细节,尺寸" /></label>
+
+                <div class="sort-block-head sort-src-head">
+                  <b>源目录</b>
+                  <span class="sort-src-acts">
+                    <label class="switch" title="连子目录一起扫；已经归好的目标夹不会被重复扫进来">
+                      <input id="chk-sort-rec" type="checkbox" />
+                      <span class="switch-track"><span class="switch-thumb"></span></span>
+                      <span class="switch-text">含子目录</span>
+                    </label>
+                    <button id="btn-sort-pick" class="btn btn-primary" title="选一个目录来归类（也可以直接把文件夹拖进来）">选择目录</button>
+                  </span>
+                </div>
+                <input id="inp-sort-src" class="input sort-src-input" spellcheck="false" placeholder="/Users/…/图片所在目录" title="图片所在目录的绝对路径" />
+
+                <label class="field" title="留空 = 在源目录里建子夹"><span>目标根目录</span>
+                  <input id="inp-sort-target" class="input" placeholder="留空 = 在源目录里建子夹" /></label>
+                <label class="field" title="没命中任何规则的图收进这里；清空 = 不动它们"><span>兜底文件夹</span>
+                  <input id="inp-sort-fall" class="input" value="其他" placeholder="其他" /></label>
+              </div>
+
+              <div class="sort-preview">
+                <div class="sort-preview-head" id="sort-summary">还没有预览。选好目录、配好规则，点「预览」。</div>
+                <div class="sort-preview-list" id="sort-preview-list"></div>
+              </div>
+            </div>
+          </section>
         </div>
 
-        <!-- 状态栏：三个视图共用，按当前视图切换内容 -->
+        <!-- 状态栏：四个视图共用，按当前视图切换内容 -->
         <footer class="statusbar">
           <span class="st-only" data-for="compare">
             <span id="st-zoom" class="st-item">100%</span>

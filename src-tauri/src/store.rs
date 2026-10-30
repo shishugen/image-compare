@@ -498,6 +498,12 @@ pub struct Preferences {
     /// 老 prefs.json 没这一项时补 `HEARTBEAT_DEFAULT`（= 改这功能之前的写死值）
     #[serde(default = "default_heartbeat")]
     pub heartbeat_ms: u64,
+    /// 图片归类的方案列表（`sort::SortPlan` 的 JSON 原文）。存成 `Value` 而非强类型：
+    /// 这一层只管「整份读出/写回」，不解释规则结构，规则形态还在长（EXIF、分辨率
+    /// 都还没接）——存原文就不会因为 SortRule 加字段而让老配置读不出来。
+    /// 老 prefs.json 没这一项时 `#[serde(default)]` 补成空表，不报错
+    #[serde(default)]
+    pub sort_plans: Vec<serde_json::Value>,
 }
 
 fn default_sync() -> bool {
@@ -541,6 +547,7 @@ impl Default for Preferences {
             inbox: String::new(),
             inbox_layout: INBOX_LAYOUT_DEFAULT.into(),
             heartbeat_ms: HEARTBEAT_DEFAULT,
+            sort_plans: Vec::new(),
         }
     }
 }
@@ -644,6 +651,47 @@ impl HistoryFile {
         let seen = if seen > floor { seen } else { floor + 1 };
         self.items.insert(0, HistoryItem { path: path.to_string(), seen });
         self.items.truncate(HISTORY_MAX);
+    }
+
+    /// 原地把一批「旧路径 → 新路径」换掉，只改 path 不动 seen（不置顶、不重排）。
+    ///
+    /// 图片归类把文件移动后，查看历史里那些旧路径就会指空。这里把它们就地换成新路径：
+    /// 换完仍按新路径去重（如果同一张既在历史里、新路径也已在历史里，留 seen 大的那条并
+    /// 保持原来的位置顺序，避免历史里多出重复行）。归类不改变「看过」这个事实，
+    /// 所以不该因为移动就把它顶到最前 —— 那是「又看了一次」才有的待遇。
+    pub fn rename_paths(&mut self, pairs: &[(String, String)]) {
+        if pairs.is_empty() {
+            return;
+        }
+        for it in self.items.iter_mut() {
+            if let Some((_, to)) = pairs.iter().find(|(from, _)| *from == it.path) {
+                it.path = to.clone();
+            }
+        }
+        // 换完可能与已有的新路径重复（那张图本来就在历史里、又被移到了那个位置）：
+        // 按 path 去重，留 seen 大的那条，位置保持既有顺序（第一个出现处）
+        let mut seen_map: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        for it in &self.items {
+            let e = seen_map.entry(it.path.clone()).or_insert(0);
+            if it.seen > *e {
+                *e = it.seen;
+            }
+        }
+        let mut done: std::collections::HashSet<String> = std::collections::HashSet::new();
+        self.items.retain(|it| {
+            if done.contains(&it.path) {
+                false
+            } else {
+                done.insert(it.path.clone());
+                true
+            }
+        });
+        // 去重后回填可能的更大 seen（同名两条留大值那条的时刻）
+        for it in self.items.iter_mut() {
+            if let Some(s) = seen_map.get(&it.path) {
+                it.seen = (*s).max(it.seen);
+            }
+        }
     }
 }
 
@@ -1393,6 +1441,31 @@ mod tests {
         // 整份被改坏也不能报错，回出厂态（偏好读不出来不值得挂掉界面初始化）
         std::fs::write(s.file("prefs.json"), "不是 JSON").unwrap();
         assert_eq!(s.load_prefs(), Preferences::default());
+        let _ = std::fs::remove_dir_all(&s.dir);
+    }
+
+    #[test]
+    fn 归类方案字段缺时为空且能往返不炸老配置() {
+        let s = 临时存储("sort-plans");
+        std::fs::create_dir_all(&s.dir).unwrap();
+        // 上一版 prefs.json 里根本没有 sort_plans：缺字段就是空表，不报错
+        std::fs::write(s.file("prefs.json"), r#"{ "layout": "2" }"#).unwrap();
+        assert!(s.load_prefs().sort_plans.is_empty(), "缺 sort_plans 字段必须回空表");
+
+        // 存一套方案（不透明 JSON 原文）后能原样读回
+        let 方案 = vec![serde_json::json!({
+            "id": "p1", "name": "按年月", "rules": [{"exts": ["png"], "folder": "{yyyy}-{MM}"}], "target_root": ""
+        })];
+        s.save_prefs(&Preferences {
+            sort_plans: 方案.clone(),
+            ..Preferences::default()
+        })
+        .unwrap();
+        let back = s.load_prefs().sort_plans;
+        assert_eq!(back.len(), 1, "方案要活过重启");
+        assert_eq!(back[0]["name"], "按年月");
+        // 缺这一项也不能把别的字段带坏（整份仍能正常解）
+        assert_eq!(s.load_prefs().layout, "2");
         let _ = std::fs::remove_dir_all(&s.dir);
     }
 

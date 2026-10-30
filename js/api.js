@@ -64,7 +64,7 @@ export function assetSrc(path) {
 /* --------------------------------------------------------------------------
  * 视图切换：body[data-view] 决定哪个视图可见，也决定拖拽落到哪里
  * ------------------------------------------------------------------------ */
-export const VIEWS = ["compare", "transfer", "fav"];
+export const VIEWS = ["compare", "transfer", "fav", "sort"];
 const viewListeners = [];
 const dropHandlers = {}; // 视图名 -> (paths) => void
 const hoverHandlers = {}; // 视图名 -> (phase) => void，拖拽悬停阶段 enter/over/leave/drop

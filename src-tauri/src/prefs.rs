@@ -53,6 +53,7 @@ pub fn set_prefs(
     inbox: Option<String>,
     inbox_layout: Option<String>,
     heartbeat_ms: Option<u64>,
+    sort_plans: Option<Vec<Value>>,
 ) -> Result<Value, String> {
     let mut p = store.load_prefs();
     if let Some(l) = layout {
@@ -87,6 +88,12 @@ pub fn set_prefs(
             return Err(format!("不支持的探测间隔: {h} 毫秒"));
         }
         p.heartbeat_ms = h;
+    }
+    // 归类方案：整份覆盖（前端把当前全部方案发来），只在传了的时候动。
+    // 不逐项校验结构：SortRule 形态还在长，这一层只当不透明 JSON 存；
+    // 真正解析发生在 preview_sort（`as_rules`），存坏了到那时才报，读不炸界面
+    if let Some(plans) = sort_plans {
+        p.sort_plans = plans;
     }
     // normalize 会静默把脏值改回默认，这里先显式拦住：设置点了没反应还不出错，
     // 是最难归因的一种失败

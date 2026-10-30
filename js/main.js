@@ -4,7 +4,7 @@
  * 三个视图各自成模块，靠 api.js 里的视图状态与拖拽路由互相解耦：
  * 对比视图注册 compare 的落点处理，传输/收藏视图注册自己的处理，
  * 原生拖拽进来时由当前 data-view 决定交给谁，不会再出现「拖文件进收藏结果变了图」。
- * 这里额外负责导航、⌘1/⌘2/⌘3、平台文案与全局异常兜底。
+ * 这里额外负责导航、⌘1/⌘2/⌘3/⌘4、平台文案与全局异常兜底。
  * ========================================================================== */
 
 import { VIEWS, currentView, el, installPasteListener, setView, setStatus } from "./api.js";
@@ -13,6 +13,7 @@ import { VIEWS, currentView, el, installPasteListener, setView, setStatus } from
 import "./view-compare.js";
 import "./view-transfer.js";
 import "./view-favorites.js";
+import "./view-sort.js";
 
 /* --------------------------------------------------------------------------
  * 左侧导航
@@ -33,7 +34,7 @@ window.addEventListener(
   "keydown",
   (ev) => {
     if (!(ev.metaKey || ev.ctrlKey) || ev.altKey || ev.shiftKey) return;
-    const idx = ["1", "2", "3"].indexOf(ev.key);
+    const idx = ["1", "2", "3", "4"].indexOf(ev.key);
     if (idx < 0) return;
     ev.preventDefault();
     setView(VIEWS[idx]);
