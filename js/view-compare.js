@@ -268,11 +268,15 @@ class Pane {
     const { w: vw, h: vh } = this.size;
     if (!vw || !vh) return; // 视图被隐藏时尺寸为 0，此时不能重算，否则图会缩成 0
     const fit = Math.min(vw / this.natural.w, vh / this.natural.h);
-    const scale = clamp(fit, MIN_SCALE, MAX_SCALE);
+    // 适应窗口不能被 MIN_SCALE 卡住下限：高分辨率图要 fit 到 0.1 甚至更小才塞得进窗，
+    // 强收进 0.25 就会比窗还大、看着像没自适应（只留 MAX_SCALE 上限，小图不无限放大）。
+    // floor 记下这个 fit 倍率，后续手动缩放以它为下限，不会一下子跳回 0.25
+    const scale = Math.min(fit, MAX_SCALE);
     this.st = {
       scale,
       x: Math.round((vw - this.natural.w * scale) / 2),
       y: Math.round((vh - this.natural.h * scale) / 2),
+      floor: Math.min(MIN_SCALE, scale),
     };
     this.apply();
     if (broadcast && isSync()) syncFrom(this);
@@ -316,9 +320,11 @@ class Pane {
   }
 }
 
-/** 缩放算法：保持锚点处的图像内容不动 */
+/** 缩放算法：保持锚点处的图像内容不动。
+ *  下限优先取这一份视图自带的 floor（自适应高分辨率图时会低于 MIN_SCALE），没有才退回 MIN_SCALE */
 function applyZoom(st, factor, anchor) {
-  const target = clamp(st.scale * factor, MIN_SCALE, MAX_SCALE);
+  const min = st.floor != null ? st.floor : MIN_SCALE;
+  const target = clamp(st.scale * factor, min, MAX_SCALE);
   const k = target / st.scale;
   st.x = anchor.x - (anchor.x - st.x) * k;
   st.y = anchor.y - (anchor.y - st.y) * k;
@@ -2200,16 +2206,17 @@ function tvApply() {
   if (ui.tvZoom) ui.tvZoom.textContent = `${Math.round(tv.st.scale * 100)}%`;
 }
 
-/** 适应窗口：与图窗那套同一口径（min(窗/图) 再收进 25%~800%） */
+/** 适应窗口：与图窗那套同一口径（min(窗/图) 只留上限，下限随 fit 倍率走，大图才塞得进） */
 function tvFit() {
   const vw = window.innerWidth || 0;
   const vh = window.innerHeight || 0;
   if (!vw || !vh || !tv.w || !tv.h) return;
-  const scale = clamp(Math.min(vw / tv.w, vh / tv.h), MIN_SCALE, MAX_SCALE);
+  const scale = Math.min(Math.min(vw / tv.w, vh / tv.h), MAX_SCALE);
   tv.st = {
     scale,
     x: Math.round((vw - tv.w * scale) / 2),
     y: Math.round((vh - tv.h * scale) / 2),
+    floor: Math.min(MIN_SCALE, scale),
   };
   tvApply();
 }

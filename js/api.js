@@ -61,6 +61,19 @@ export function assetSrc(path) {
   }
 }
 
+/**
+ * read_image 结果缓存：path -> { data_url, size }，聊天气泡缩略图与放大层共用，一张图只读一次盘。
+ * 只按路径缓存、发过之后永远不会主动重读同一个路径，所以这里必须留出失效入口：
+ * 同一路径被删掉又存了新内容（同名重发）时，不失效就会拿旧图画新气泡——
+ * 对方收的却是磁盘上那份新的，两边不一致
+ */
+export const imgCache = new Map();
+
+/** 让这批路径的预览缓存失效：发送前调一句，新气泡才会现读一次盘 */
+export function invalidateImgCache(paths) {
+  for (const p of paths || []) imgCache.delete(p);
+}
+
 /* --------------------------------------------------------------------------
  * 视图切换：body[data-view] 决定哪个视图可见，也决定拖拽落到哪里
  * ------------------------------------------------------------------------ */
@@ -273,6 +286,8 @@ export async function sendTextToPeer(text) {
 /** 把文件/文件夹交给传输通道（同上，发给当前会话；文件夹由 Rust 侧递归逐文件发送） */
 export async function sendPathsToPeer(paths) {
   if (!paths || !paths.length) return false;
+  // 发送会按路径重新读盘：缓存里那份预览可能早就不是现在这个文件了，先失效再发
+  invalidateImgCache(paths);
   try {
     await invoke("send_paths", { paths });
     toast(`已发送 ${paths.length} 项到当前会话`);

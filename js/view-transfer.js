@@ -21,6 +21,8 @@ import {
   fmtSize,
   fmtTime,
   IMAGE_EXT,
+  imgCache,
+  invalidateImgCache,
   invoke,
   isTauriRuntime,
   listen,
@@ -277,8 +279,7 @@ const ARCHIVE_EXT = /\.(zip|rar|7z|tar|gz|tgz|bz2|xz|zst|jar|apk|iso)$/i;
 const PREVIEW_AUTO_MAX = 4 * 1024 * 1024;
 /** 硬上限：再大就不在聊天里解图，引导用「在对比中打开」（对比视图本来就是为大图设计的） */
 const PREVIEW_HARD_MAX = 40 * 1024 * 1024;
-/** path -> data URL，缩略图与放大层共用同一份，一张图只读一次盘 */
-const imgCache = new Map();
+// path -> { data_url, size } 的预览缓存住在 api.js（发送入口在那边也要失效它），这里只用
 
 /* --------------------------------------------------------------------------
  * 连接状态
@@ -1093,6 +1094,8 @@ async function doForward(s) {
   try {
     let res;
     if (t.hasFile && t.path) {
+      // 转发也是重新读盘发出去：缓存里那份旧预览不能拿去画新气泡（和上面「发送」同一处坑）
+      invalidateImgCache([t.path]);
       res = await invoke("send_paths", { paths: [t.path], to: s.id });
     } else {
       res = await invoke("send_text", { text: String(t.m.text || ""), to: s.id });
@@ -1896,15 +1899,17 @@ async function loadThumb(rec, force = false) {
     return;
   }
   const cached = imgCache.get(rec.path);
-  if (cached) {
-    paintThumb(rec, cached);
+  // 尺寸对不上就当成过期：消息里的 size 是发送/落盘那一刻从磁盘取的，
+  // 同名新图多半换了字节数；换得一模一样那档兜不住，靠发送入口的失效兼顾
+  if (cached && (!rec.size || cached.size === rec.size)) {
+    paintThumb(rec, cached.data_url);
     return;
   }
   rec.thumbBox.className = "thumb-box thumb-loading";
   rec.thumbBox.textContent = "读取中…";
   try {
     const payload = await invoke("read_image", { path: rec.path });
-    imgCache.set(payload.path || rec.path, payload.data_url);
+    imgCache.set(payload.path || rec.path, { data_url: payload.data_url, size: Number(payload.size) || 0 });
     paintThumb(rec, payload.data_url);
   } catch (err) {
     // 文件被移走 / 解码失败都很常见，不能把整条消息弄成坏的
@@ -1923,7 +1928,13 @@ function paintThumb(rec, dataUrl) {
   img.src = dataUrl;
   img.alt = rec.name;
   img.title = "点击放大（滚轮缩放、拖拽平移）";
+  // 图片真正撑开高度要等解码完：撑开这一刻若还贴底，把新出现的高度顶回去，
+  // 否则最新那条会被后来才加载的图挤出视口（点开对话不在最下面的真因）
+  const settle = () => keepBottomIfStuck();
+  if (img.complete) settle();
+  else img.addEventListener("load", settle, { once: true });
   rec.thumbBox.appendChild(img);
+  settle();
   rec.thumbBox.addEventListener("click", () => openLightbox(dataUrl, rec.name, rec.path));
 }
 
@@ -2411,8 +2422,19 @@ function isNearBottom() {
   return s.scrollHeight - s.scrollTop - s.clientHeight < 80;
 }
 
+/** 是否「贴底」：进会话/发消息/手动滚到底时置真，用户往上翻看历史时置假。
+ *  缩略图是异步读盘的，加载完会把最近几条顶高 —— 贴底时要跟着重新压到底，
+ *  否则「点开对话看到的不是最下面那条」（图片越多、跳得越明显） */
+let stickBottom = false;
+
 function scrollBottom() {
+  stickBottom = true;
   ui.stream.scrollTop = ui.stream.scrollHeight;
+}
+
+/** 异步内容（缩略图）把高度撑起来后，仍贴底就再压一次底；用户已往上翻则不动 */
+function keepBottomIfStuck() {
+  if (stickBottom) ui.stream.scrollTop = ui.stream.scrollHeight;
 }
 
 async function loadHistory() {
@@ -2653,7 +2675,7 @@ async function addAttach(paths, opts = {}) {
   }
   // 命令没回数组（旧版后端 / 桩环境）也走退路：待发送区不能因为一个查询失败就空着
   if (!Array.isArray(metas)) {
-    metas = fresh.map((p) => ({ path: p, name: baseName(p), size: 0, isDir: false, missing: false }));
+    metas = fresh.map((p) => ({ path: p, name: baseName(p), size: 0, mtime: 0, isDir: false, missing: false }));
   }
 
   const room = ATTACH_LIMIT - state.attach.length;
@@ -2663,6 +2685,8 @@ async function addAttach(paths, opts = {}) {
       path: m.path,
       name: m.name || baseName(m.path),
       size: Number(m.size) || 0,
+      // mtime 供待发送缩略图给 asset:// 地址当缓存失效的 nonce：同名新内容才能绕开 WebView 缓存
+      mtime: Number(m.mtime) || 0,
       isDir: !!m.isDir,
       missing: !!m.missing,
     });
@@ -2694,7 +2718,10 @@ function attachChip(a) {
   chip.title = a.missing ? `${a.path}\n这个路径已经找不到了` : a.path;
 
   if (isImage) {
-    const src = a.missing ? null : assetSrc(a.path);
+    // asset:// 地址会被 WebView 按 URL 缓存：同一路径 = 同一个 URL，同名文件换了内容也拿旧图。
+    // 拿 mtime 当 nonce 拼个查询串，内容一变 URL 就变，缓存自动失效（asset 协议只认路径、忽略查询）
+    const base = a.missing ? null : assetSrc(a.path);
+    const src = base && a.mtime ? `${base}${base.includes("?") ? "&" : "?"}v=${a.mtime}` : base;
     if (src) {
       const img = document.createElement("img");
       img.alt = a.name;
@@ -2797,6 +2824,14 @@ async function sendComposer() {
   }
 
   const paths = state.attach.map((a) => a.path);
+  // 发送这一步会按路径重新读盘，缓存里那份预览可能早就不是现在这个文件了
+  // （删掉 1.png 又存了个同名新图，重发后气泡还显示旧图——对方收的却是新的）。
+  // 先失效这批路径，新气泡才会现读一次，和对方收到的那张严格同一份字节
+  invalidateImgCache(paths);
+  // 点发送就当场清空待发送区：发出去的东西已经进气泡了，浏览区该立刻消失，
+  // 不能干等网络往返那几百毫秒还占着（回滚靠下面的 snapshot：真没发出去才原样摆回去）
+  const snapshot = state.attach.slice();
+  clearAttach();
   let sentPaths = false;
   let sentText = false;
   let queued = false;
@@ -2818,8 +2853,12 @@ async function sendComposer() {
     return out;
   });
 
-  // 成功的部分才从输入区拿掉；失败就留着，省得用户从头再选一遍
-  if (sentPaths) clearAttach();
+  // 附件是点发送就清空的；只有「一个都没发出去」（send_paths 抛错，sentPaths 还是 false）
+  // 才把这一批原样摆回待发送区，免得用户从头再选一遍
+  if (paths.length && !sentPaths) {
+    state.attach = snapshot;
+    renderAttach();
+  }
   if (sentText) {
     ui.input.value = "";
     ui.input.style.height = "";
@@ -3592,8 +3631,11 @@ listen("xfer-progress", (p) => {
 });
 listen("xfer-done", (payload) => routeMessage(payload?.message, "xfer-done"));
 
-/* 往前翻页：滚到顶自动补一页，内容不够一屏（滚不动）时靠顶栏点一下 */
+/* 往前翻页：滚到顶自动补一页，内容不够一屏（滚不动）时靠顶栏点一下。
+ * 顺手记下贴底态：用户往上翻看历史就松开贴底（后续图片加载不再顶到底），
+ * 滚回底部则重新贴上 */
 ui.stream.addEventListener("scroll", () => {
+  stickBottom = isNearBottom();
   if (ui.stream.scrollTop < 30) loadOlder();
 });
 if (ui.older) ui.older.addEventListener("click", loadOlder);

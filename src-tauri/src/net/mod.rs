@@ -1810,6 +1810,9 @@ pub struct PathMeta {
     pub path: String,
     pub name: String,
     pub size: u64,
+    /// 最后修改时间（Unix 毫秒，取不到给 0）：前端给 asset:// 地址当缓存失效的 nonce。
+    /// 同名文件被删掉又存了新内容时，路径不变但 mtime 变了 —— 换 URL 才能绕过 WebView 对 asset 图的缓存
+    pub mtime: u64,
     pub is_dir: bool,
     /// 路径已经不在了（拖进来之后被移走/删掉）：仍然留在待发送区，
     /// 但给前端一个明确标记，发出去之前就能提示，而不是等 Rust 侧报错
@@ -1829,8 +1832,16 @@ pub async fn stat_paths(paths: Vec<String>) -> Vec<PathMeta> {
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| p.clone());
             match std::fs::metadata(&path) {
-                Ok(md) => PathMeta { path: p, name, size: md.len(), is_dir: md.is_dir(), missing: false },
-                Err(_) => PathMeta { path: p, name, size: 0, is_dir: false, missing: true },
+                Ok(md) => {
+                    let mtime = md
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    PathMeta { path: p, name, size: md.len(), mtime, is_dir: md.is_dir(), missing: false }
+                }
+                Err(_) => PathMeta { path: p, name, size: 0, mtime: 0, is_dir: false, missing: true },
             }
         })
         .collect()

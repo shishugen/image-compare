@@ -1891,7 +1891,8 @@ textarea,
 }
 
 .file-name {
-  max-width: 360px;
+  /* 名字别撑太长：超了就省略号截断，宽度与缩小后的缩略图对齐，气泡才不会横向过宽 */
+  max-width: 140px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -2281,8 +2282,9 @@ textarea,
 
 .thumb {
   display: block;
-  max-width: 260px;
-  max-height: 260px;
+  /* 聊天里的缩略图：260 偏大，缩到约 2/3（想看大图点一下走放大层） */
+  max-width: 173px;
+  max-height: 173px;
   border-radius: var(--radius);
   background: var(--bg-pane);
 }
