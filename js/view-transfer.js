@@ -2374,6 +2374,7 @@ function routeMessage(m, kind) {
   if (row && (m.ts || 0) >= (row.last || 0)) {
     row.last = m.ts;
     row.summary = summarize(m);
+    sortSessionRows();
     renderSessionRail();
   }
   return true;
@@ -2404,7 +2405,17 @@ function bumpRail(m, sid, kind) {
   if (m.dir === "in" && (kind === "msg-in" || kind === "xfer-done")) {
     row.unread = (row.unread || 0) + 1;
   }
+  sortSessionRows();
   renderSessionRail();
+}
+
+/** 本地重排的口径与 Rust sort_session_rows() 完全一致：置顶永远在前，
+ *  组内按最后一条时间倒序。bumpRail / routeMessage 只改行上的 last 不重拉列表，
+ *  不在这里排一下，收到消息的那一行就待在原地浮不上去 */
+function sortSessionRows() {
+  state.sessionList.sort(
+    (a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0) || (b.last || 0) - (a.last || 0)
+  );
 }
 
 /** 会话栏摘要的口径与后端 session_stats() 一致，改这一行时要同时改那边 */
