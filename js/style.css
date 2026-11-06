@@ -2593,6 +2593,31 @@ textarea,
   display: none;
 }
 
+/* 屏幕正中的一次性提示（复制成功这类）：比状态栏显眼得多，浮一下就走。
+   压在放大层(900)与右键菜单(950)之上：从放大层菜单点复制时菜单刚收起、放大层还在。
+   不加 display 属性：hidden 靠 UA 那条 display:none 生效（同页自定义项的坑只针对
+   display:block 的写法）；pointer-events:none 让它永远不挡点击 */
+.center-tip {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 970;
+  padding: 10px 22px;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.78);
+  color: #fff;
+  font-size: 15px;
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.18s ease;
+}
+
+.center-tip.is-show {
+  opacity: 1;
+}
+
 
 /* ==========================================================================
  * 视图四：图片归类

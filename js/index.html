@@ -728,6 +728,10 @@
       <div class="find-list" id="xfer-find-list"></div>
     </div>
 
+    <!-- 屏幕正中的一次性提示（复制成功这类）：状态栏太不起眼，这个在对话中间浮一下、一闪就自动消失，
+         pointer-events 关掉不挡任何点击 -->
+    <div class="center-tip" id="center-tip" hidden></div>
+
     <!-- module 作用域：顶层声明不再落到 window，避免与 Tauri 注入的全局（isTauri 等）撞名 -->
     <script type="module" src="main.js"></script>
   </body>

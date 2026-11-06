@@ -8,6 +8,7 @@
  * ========================================================================== */
 
 import {
+  appTip,
   copyText,
   el,
   errText,
@@ -323,7 +324,7 @@ async function armDelete(btn, node) {
   }
   try {
     const n = await invoke("fav_delete", { id: node.id });
-    toast(`已删除 ${n} 个节点`);
+    appTip(`已删除 ${n} 个节点`);
     if (state.editing?.id === node.id) closeEditor();
     await load();
   } catch (err) {
@@ -416,7 +417,7 @@ async function saveEditor() {
         body: ui.body.value,
       },
     });
-    toast(node ? "已保存" : "已新建");
+    appTip(node ? "已保存" : "已新建");
     if (parent) state.expanded.add(parent);
     state.selected = node?.kind === "cat" ? node.id : parent;
     closeEditor();
@@ -439,7 +440,7 @@ ui.btnDelete.addEventListener("click", async () => {
   if (ui.btnDelete.dataset.armed !== "1") return setDeleteLabel(true);
   try {
     const n = await invoke("fav_delete", { id: state.editing.id });
-    toast(`已删除 ${n} 个节点`);
+    appTip(`已删除 ${n} 个节点`);
     closeEditor();
     await load();
   } catch (err) {

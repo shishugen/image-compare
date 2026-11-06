@@ -215,6 +215,25 @@ export function toast(text, kind) {
   }, kind === "error" ? 6000 : 2600);
 }
 
+let tipTimer = null;
+
+/** 屏幕正中的一闪式提示：复制成功这类即时反馈用，比状态栏显眼，不挡点击，1.2 秒自动收起 */
+export function appTip(text) {
+  const node = el("center-tip");
+  if (!node || !text) return;
+  node.textContent = text;
+  node.hidden = false;
+  // 先收掉再压上去：连点两次复制时旧的那段 transition 不会把新的吞掉
+  node.classList.remove("is-show");
+  void node.offsetWidth;
+  node.classList.add("is-show");
+  clearTimeout(tipTimer);
+  tipTimer = setTimeout(() => {
+    node.classList.remove("is-show");
+    node.hidden = true;
+  }, 1200);
+}
+
 /* --------------------------------------------------------------------------
  * 跨视图复用的小能力：复制、发送、错误文案
  * ------------------------------------------------------------------------ */
@@ -234,7 +253,7 @@ export async function copyText(text) {
   if (!text) return false;
   try {
     await navigator.clipboard.writeText(text);
-    toast("已复制到剪贴板");
+    appTip("已复制到剪贴板");
     return true;
   } catch (err) {
     console.warn("[clip] navigator.clipboard 不可用，改用 execCommand:", err);
@@ -253,12 +272,12 @@ export async function copyText(text) {
   }
   ta.remove();
   if (ok) {
-    toast("已复制到剪贴板（兜底路径）");
+    appTip("已复制到剪贴板（兜底路径）");
     return true;
   }
   try {
     await invoke("copy_text", { text });
-    toast("已复制到剪贴板（Rust 兜底）");
+    appTip("已复制到剪贴板（Rust 兜底）");
     return true;
   } catch (err) {
     console.error("[clip] copy_text 也失败:", err);
@@ -313,7 +332,7 @@ export async function copyPathAsFile(paths) {
   }
   try {
     await invoke("copy_as_file", { paths: list });
-    toast(
+    appTip(
       list.length > 1
         ? `已复制 ${list.length} 项文件，可直接粘`
         : "已复制，粘进微信 / Word 就是图片，粘进 Finder 是文件"
