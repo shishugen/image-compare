@@ -244,6 +244,19 @@ export function errText(err) {
 }
 
 /**
+ * 复制成功的一声反馈。声音必须在 Rust 侧播（WKWebView 会拦下无用户手势的 new Audio），
+ * 而且走独立的 play_copy_sound 命令 —— 同步命令跑在主 UI 线程，Windows 的
+ * MessageBeep 是异步播放，只有那条线程长驻才播得完（跟设置页「试听」同一条路）。
+ *
+ * 故意不 await：响不响都不该拖住复制；放不出声也只留一行日志，不弹错误打扰用户。
+ */
+function playCopyFeedback() {
+  invoke("play_copy_sound").catch((err) =>
+    console.warn("[sound] 复制反馈没响:", errText(err))
+  );
+}
+
+/**
  * 复制到系统剪贴板，依次退让：
  *   navigator.clipboard（要安全上下文，WKWebView 常直接拒）
  *   → execCommand('copy')（对隐藏 textarea 选中后复制，多数 WebView 可用）
@@ -254,6 +267,7 @@ export async function copyText(text) {
   try {
     await navigator.clipboard.writeText(text);
     appTip("已复制到剪贴板");
+    playCopyFeedback();
     return true;
   } catch (err) {
     console.warn("[clip] navigator.clipboard 不可用，改用 execCommand:", err);
@@ -273,11 +287,13 @@ export async function copyText(text) {
   ta.remove();
   if (ok) {
     appTip("已复制到剪贴板（兜底路径）");
+    playCopyFeedback();
     return true;
   }
   try {
     await invoke("copy_text", { text });
     appTip("已复制到剪贴板（Rust 兜底）");
+    playCopyFeedback();
     return true;
   } catch (err) {
     console.error("[clip] copy_text 也失败:", err);
@@ -337,6 +353,7 @@ export async function copyPathAsFile(paths) {
         ? `已复制 ${list.length} 项文件，可直接粘`
         : "已复制，粘进微信 / Word 就是图片，粘进 Finder 是文件"
     );
+    playCopyFeedback();
     return true;
   } catch (err) {
     toast(errText(err), "error");

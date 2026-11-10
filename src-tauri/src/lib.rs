@@ -333,6 +333,7 @@ pub fn run() {
             net::storage_stats,
             net::inbox_cleanup,
             net::play_notify_sound,
+            net::play_copy_sound,
             net::save_path_as,
             net::pick_folder,
             net::pick_send_files,

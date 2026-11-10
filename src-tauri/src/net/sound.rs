@@ -1,4 +1,4 @@
-//! 收到对端消息时的那一声「叮」。
+//! 系统提示音那一声「叮」：收到对端消息、设置页「试听」、以及复制成功的反馈，三处共用。
 //!
 //! 必须在 Rust 侧播，不能交给前端 `new Audio()`：
 //! ① WKWebView 的 `mediaTypesRequiringUserActionForPlayback` 默认要求用户手势才播音视频，
@@ -8,7 +8,8 @@
 //!
 //! 两处都不引新依赖：mac 起一个 `afplay` 子进程（与 `reveal_in_folder` 里 `open` / `explorer`
 //! 同一套打法），Windows 用系统提示音 `MessageBeep`。后一条是异步播放，调用线程得活着，
-//! 所以收消息那一路统一由 `Hub::notify_arrived` 投到主 UI 线程再播（见那里与 play 里的注释）。
+//! 所以收消息那一路统一由 `Hub::notify_arrived` 投到主 UI 线程再播；「试听」与「复制反馈」
+//! 是两个 Tauri 同步命令，本来就跑在主 UI 线程，不需要额外投递。
 
 /// mac 上的候选音效，按优先级排。精简过的系统可能没有 Tink，所以留两级兜底
 ///
@@ -62,7 +63,7 @@ pub fn play(id: &str) {
         //
         // ⚠ 它返回得快是因为**异步播放**：调用它的线程必须活着、且最好带消息循环，
         // 否则声音还没播完就被掐断。接收服务是一个请求一个临时线程，所以 Hub::notify_arrived
-        // 会把这一声投递到主 UI 线程；「试听」本来就跑在主线程，这正是两者先前行为不同的原因。
+        // 会把这一声投递到主 UI 线程；试听与复制反馈本就在主线程，不用投递。
         use windows::Win32::System::Diagnostics::Debug::MessageBeep;
         use windows::Win32::UI::WindowsAndMessaging::MB_ICONASTERISK;
         // 响不了不影响任何后续动作：系统禁了提示音不能当成传输失败

@@ -589,8 +589,9 @@ impl Hub {
     /// Windows 必须跳主线程：`MessageBeep` 是异步播放（跟 PlaySound 的 SND_ASYNC 一套），
     /// 而调用方是接收服务「一个请求一个临时线程」，answer() 一返回线程就结束，声音还没
     /// 播完就被掐断。「试听」是 Tauri 同步命令、跑在主 UI 线程（长驻 + 有消息循环）所以能响；
-    /// mac 起的是 afplay 子进程，与调用线程生死无关 —— 三件事凑一起就是
-    /// 「Windows 收消息没声、试听有声、mac 一切正常」。主线程播放让两条路径环境一致。
+    /// mac 起的是 afplay 子进程，与调用线程生死无关。主线程播放让两条路径环境一致，
+    /// 免得 Windows 上「消息到了却没声」。这是后台线程路径自身的代码隐患，与设置页
+    /// 「试听」能否发声、以及复制按钮有没有反馈音，是三件独立的事，别互相反推。
     pub fn notify_arrived(&self, id: &str) {
         let enabled = self.store.load_prefs().notify;
         let last = self.last_notify.lock().expect("last_notify 锁中毒").clone();
@@ -1684,6 +1685,20 @@ pub fn inbox_cleanup(hub: State<'_, Arc<Hub>>, before_ts: i64) -> Result<Value, 
 pub fn play_notify_sound() {
     eprintln!("[sound] 试听");
     sound::play("audition");
+}
+
+/// 「复制成功」的一声反馈，跟试听用同一个系统音效。
+///
+/// 不归收消息那个开关管：设置页的文案是「收到消息时 响一声」，管的是新消息，
+/// 不是用户主动点按钮的即时反馈；也不参与 msg_id 去重，点一次就该响一次。
+///
+/// ⚠ 必须是独立的 Tauri 同步命令 —— 它跑在主 UI 线程，Windows 的 MessageBeep（异步播放）
+/// 才播得完。千万别把这一声塞进 `clip::copy_as_file` 里：那个命令走 spawn_blocking，
+/// 临时线程一返回声音就会被掐断，重演「试听有声、复制没声」。
+#[tauri::command]
+pub fn play_copy_sound() {
+    eprintln!("[sound] 复制反馈");
+    sound::play("copy");
 }
 
 /// 打开收件箱目录（在系统文件管理器里定位到具体文件）

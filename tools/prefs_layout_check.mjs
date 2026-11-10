@@ -1214,6 +1214,8 @@ function ctxMenuOn(node, x, y) {
   return ev;
 }
 const lastCmd = () => calls.cmd[calls.cmd.length - 1] || { cmd: "", args: {} };
+/** 按命令名找最后一次：复制成功后还会补一声 play_copy_sound，它才是「最后一次命令」 */
+const lastOf = (cmd) => [...calls.cmd].reverse().find((c) => c.cmd === cmd) || { cmd: "", args: {} };
 /** window 上的 pointerdown（外壳关菜单那条路）：桩里要手动把监听器跑一遍 */
 function pointerDownOn(node) {
   const ev = { type: "pointerdown", target: node, button: 0, clientX: 0, clientY: 0, preventDefault() {}, stopPropagation() {} };
@@ -1270,8 +1272,18 @@ check(
 await settle();
 check(
   "复制完菜单自己收起，命令与路径都对",
-  menuNode.hidden && lastCmd().cmd === "copy_text" && lastCmd().args.text === rowPath,
-  `${lastCmd().cmd} ${lastCmd().args.text}`
+  menuNode.hidden && lastOf("copy_text").args.text === rowPath,
+  `${lastOf("copy_text").cmd} ${lastOf("copy_text").args.text}`
+);
+check(
+  "复制成功才补一声反馈：play_copy_sound 紧跟在复制命令之后",
+  (() => {
+    const cmds = calls.cmd.map((c) => c.cmd);
+    const i = cmds.lastIndexOf("copy_text");
+    const j = cmds.lastIndexOf("play_copy_sound");
+    return i >= 0 && j > i;
+  })(),
+  `末尾两条: ${calls.cmd.slice(-2).map((c) => c.cmd).join(" → ")}`
 );
 check(
   "「复制图片」走 copy_as_file，带的是图窗里那张图（与传输视图同一个命令，粘到微信就是图）",
@@ -1284,8 +1296,8 @@ check(
 await settle();
 check(
   "复制图片的参数就是 A 窗的 path",
-  lastCmd().cmd === "copy_as_file" && lastCmd().args.paths.length === 1 && lastCmd().args.paths[0] === pathA,
-  JSON.stringify(lastCmd().args)
+  lastOf("copy_as_file").args.paths?.length === 1 && lastOf("copy_as_file").args.paths[0] === pathA,
+  JSON.stringify(lastOf("copy_as_file").args)
 );
 check(
   "贴着窗口右下角右键：菜单翻到鼠标左上方，不留半截在屏外",
