@@ -586,18 +586,39 @@ impl Hub {
 
     /// 落库一条新的入向消息后响一声。开关与去重都在这里，调用点只管说「到了一条」。
     ///
-    /// 与角标不同，这里不需要跳主线程：`afplay` 是起子进程，`MessageBeep` 是线程安全的
-    /// Win32 调用，在接收服务那个后台线程上直接播就行。窗口关着也响 —— 发声的是进程，不是页面。
+    /// Windows 必须跳主线程：`MessageBeep` 是异步播放（跟 PlaySound 的 SND_ASYNC 一套），
+    /// 而调用方是接收服务「一个请求一个临时线程」，answer() 一返回线程就结束，声音还没
+    /// 播完就被掐断。「试听」是 Tauri 同步命令、跑在主 UI 线程（长驻 + 有消息循环）所以能响；
+    /// mac 起的是 afplay 子进程，与调用线程生死无关 —— 三件事凑一起就是
+    /// 「Windows 收消息没声、试听有声、mac 一切正常」。主线程播放让两条路径环境一致。
     pub fn notify_arrived(&self, id: &str) {
         let enabled = self.store.load_prefs().notify;
         let last = self.last_notify.lock().expect("last_notify 锁中毒").clone();
         if !sound::should_play(enabled, &last, id) {
+            // 实机排查时先分清「没响」是开关、重投还是播不出，别只留一句「没声」
+            eprintln!("[sound] 跳过 {id}：开关={enabled}，上一条={last}");
             return;
         }
         *self.last_notify.lock().expect("last_notify 锁中毒") = id.to_string();
         // 日志与声音一对一对得上，出问题时才能分清「没响」是没消息、被关了、还是播不出
         eprintln!("[sound] 叮 {id}");
-        sound::play(id);
+        #[cfg(target_os = "windows")]
+        {
+            let app = self.app.clone();
+            let sound_id = id.to_string();
+            if let Err(e) = app.run_on_main_thread(move || {
+                eprintln!("[sound] 主线程播放 {sound_id}");
+                sound::play(&sound_id);
+            }) {
+                // 窗口关掉 / 消息队列没了时别把这一声直接吞掉，退回当场播一次
+                eprintln!("[sound] 主线程排队失败: {e}，退回当场播");
+                sound::play(id);
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            sound::play(id);
+        }
     }
 
     /// 会话列表：每个框自己的未读数、最后一条时间与摘要，加上所属那台的在线态。

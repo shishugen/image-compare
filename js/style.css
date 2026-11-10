@@ -1600,6 +1600,10 @@ textarea,
   flex-direction: column;
   gap: 10px;
   overflow: auto;
+  /* 往上补一页时由脚本手动把 scrollTop 补回锚点。WebView2(Chromium) 默认还开着
+     scroll anchoring，会自动再补一次，两次叠加就把视口甩到中间甚至底部（mac 上看不见）。
+     关掉自动锚定，让「保持视口」只剩脚本这一份口径。 */
+  overflow-anchor: none;
   padding: 14px 16px;
 }
 

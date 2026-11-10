@@ -2438,14 +2438,27 @@ function isNearBottom() {
  *  否则「点开对话看到的不是最下面那条」（图片越多、跳得越明显） */
 let stickBottom = false;
 
+/**
+ * 脚本自己改 scrollTop，浏览器照样会派发一次 scroll 事件（WebView2/Chromium 尤其准时）。
+ * 那一击不能当成用户翻页，否则「往上补一页 → 把位置接回去」会被判成又一次滚到顶，
+ * 接着再补一页，直到把历史拉空；视口也会跟着反复弹到底部，看着就像记录循环显示。
+ * 给程序性滚动留一小段静默期，期间 scroll 监听既不改贴底态也不翻页。
+ * WKWebView 派发时机与 Chromium 不同，所以同一个毛病在 mac 上看不见、win 上看得见。
+ */
+let scrollGuardUntil = 0;
+function setStreamScrollTop(px) {
+  scrollGuardUntil = Date.now() + 150;
+  ui.stream.scrollTop = px;
+}
+
 function scrollBottom() {
   stickBottom = true;
-  ui.stream.scrollTop = ui.stream.scrollHeight;
+  setStreamScrollTop(ui.stream.scrollHeight);
 }
 
 /** 异步内容（缩略图）把高度撑起来后，仍贴底就再压一次底；用户已往上翻则不动 */
 function keepBottomIfStuck() {
-  if (stickBottom) ui.stream.scrollTop = ui.stream.scrollHeight;
+  if (stickBottom) setStreamScrollTop(ui.stream.scrollHeight);
 }
 
 async function loadHistory() {
@@ -2491,6 +2504,8 @@ async function loadOlder() {
   if (!isTauriRuntime || state.cur === null || s.loadingOlder || !s.hasMore || !s.oldestId) return;
   const id = state.cur;
   s.loadingOlder = true;
+  // 用户正在往上翻历史：后面缩略图异步撑高时不能把视口又拽回底部
+  stickBottom = false;
   setOlderBarText("正在加载更早的消息…");
   const h0 = ui.stream.scrollHeight;
   const t0 = ui.stream.scrollTop;
@@ -2503,15 +2518,17 @@ async function loadOlder() {
     }
     // 当前最老那条气泡（用 .msg 而不是 firstElementChild：前者天然跳过日期线与占位句）
     const anchor = ui.stream.querySelector(".msg");
-    for (const m of list) {
-      upsertMessage(m, anchor);
-      s.oldestId = m.id; // 列表旧的在前，最后一条就是新的最老游标
-    }
+    for (const m of list) upsertMessage(m, anchor);
+    // msg_history 回的是按时间升序（旧 → 新）的一页，最老那条是第一条。
+    // 以前在循环里逐条覆盖，最后留下的是这一页「最新」的那条 —— 游标只往前挪一个，
+    // 滚到顶就会反复拉回同一批，看着像记录循环显示；搜索拉齐也拉不动。
+    s.oldestId = list[0].id;
     s.hasMore = list.length >= PAGE;
-    applyFilter();
+    // 只重新打筛选标记，不能顺手滚到底：那会正好把「翻历史」变成「弹回最新一条」
+    applyFilter({ scroll: false });
     reconcileDividers();
     // 往上加了内容，得把多出来的高度补回 scrollTop，视口才能停在原来那几条上
-    ui.stream.scrollTop = ui.stream.scrollHeight - h0 + t0;
+    setStreamScrollTop(ui.stream.scrollHeight - h0 + t0);
   } catch (err) {
     console.error("[xfer] 加载更早的消息失败:", err);
     setStatus("加载更早的消息失败: " + errText(err));
@@ -2586,8 +2603,9 @@ function matches(rec) {
   return hay.includes(f.q);
 }
 
-/** 全量过一遍：切类型、改关键词、以及筛选中来了新消息时调用 */
-function applyFilter() {
+/** 全量过一遍：切类型、改关键词、以及筛选中来了新消息时调用。
+ *  `scroll: false` 给「往上补一页」用：那时候只重打标记，滚到底会把人从历史里弹出去 */
+function applyFilter({ scroll = true } = {}) {
   const s = cur();
   // 筛的是当前会话的整份历史，不是已铺出来的那一页 —— 先把早期的拉齐再筛
   if (filterActive() && s.hasMore && !s.loadingOlder) loadAllForSearch();
@@ -2602,7 +2620,7 @@ function applyFilter() {
   renderFilterCount(hit);
   renderFilterEmpty(hit);
   // 筛完剩下的往往都在上面，不滚一次的话视口会停在刚被藏起来的那片空白里
-  if (hit) scrollBottom();
+  if (scroll && hit) scrollBottom();
 }
 
 function renderFilterCount(hit) {
@@ -3646,6 +3664,8 @@ listen("xfer-done", (payload) => routeMessage(payload?.message, "xfer-done"));
  * 顺手记下贴底态：用户往上翻看历史就松开贴底（后续图片加载不再顶到底），
  * 滚回底部则重新贴上 */
 ui.stream.addEventListener("scroll", () => {
+  // 程序自己压到底 / 接回锚点也会派发 scroll，那一击不算用户翻页（见 setStreamScrollTop）
+  if (Date.now() < scrollGuardUntil) return;
   stickBottom = isNearBottom();
   if (ui.stream.scrollTop < 30) loadOlder();
 });

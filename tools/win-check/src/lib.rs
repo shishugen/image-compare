@@ -12,3 +12,19 @@ mod sound;
 
 #[path = "../../../src-tauri/src/net/badge.rs"]
 mod badge;
+
+/// net/mod.rs 里 `Hub::notify_arrived` 的 Windows 分支没法整文件 include（它得拉进整个
+/// Hub/Store），但那一段正是「win 收消息不响、试听能响」修的关键，得让 windows 目标
+/// 真编一遍：闭包捕获 String 满不满足 FnOnce + Send + 'static、返回的是不是 Result、
+/// 兜底那次播放还拿不拿得到 id —— 都由这一段钉住。逻辑与正式工程那段保持同款。
+#[cfg(target_os = "windows")]
+fn notify_on_main_thread(app: tauri::AppHandle, id: String) {
+    let fallback = id.clone();
+    if let Err(e) = app.run_on_main_thread(move || {
+        eprintln!("[sound] 主线程播放 {id}");
+        crate::sound::play(&id);
+    }) {
+        eprintln!("[sound] 主线程排队失败: {e}，退回当场播");
+        crate::sound::play(&fallback);
+    }
+}
