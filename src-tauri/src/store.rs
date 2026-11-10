@@ -467,8 +467,8 @@ pub fn fav_depth(nodes: &[FavNode], id: &str) -> usize {
 /// 用户选的默认值：布局与 1:1 这些是工具栏上的即时开关，每次改动顺手落盘，
 /// 下次启动就是它 —— 所以这里只有几项，不做会话快照。
 ///
-/// 后两项属于传输视图的「本机接收」，存在同一份 prefs.json 里：读写通路
-/// （`set_prefs` 的局部更新 + normalize + 原子写）是现成的，为两个字段再开
+/// 后几项属于传输视图的「本机接收」，存在同一份 prefs.json 里：读写通路
+/// （`set_prefs` 的局部更新 + normalize + 原子写）是现成的，为几个字段再开
 /// 第三份配置文件与第三套 CRUD 不值得。代价是两个抽屉共享一份数据，
 /// 靠「只传自己关心的字段」互不覆盖。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -485,6 +485,10 @@ pub struct Preferences {
     /// 收到对端消息时是否响一声
     #[serde(default = "default_notify")]
     pub notify: bool,
+    /// 复制成功时是否响一声。跟 notify 分开：一个是被动通知，一个是主动操作的即时反馈，
+    /// 有人只想留一个。老 prefs.json 没这一项时补 true —— 这项功能出厂就带着声音
+    #[serde(default = "default_copy_sound")]
+    pub copy_sound: bool,
     /// 收件目录，空串 = 用 `<数据目录>/inbox`。存绝对路径原文（不 canonicalize，
     /// 免得把一个合法的软链目录换成它指向的地方，用户看到的路径就变了）
     #[serde(default)]
@@ -518,6 +522,10 @@ fn default_notify() -> bool {
     true
 }
 
+fn default_copy_sound() -> bool {
+    true
+}
+
 /// 收件箱内部的摆放方式（prefs.json 的 `inbox_layout`）
 pub const INBOX_LAYOUTS: [&str; 3] = ["day", "month", "flat"];
 /// 出厂：一天一个文件夹。按天分的层次最浅、找“昨天那批”最快；量大的时候
@@ -536,7 +544,7 @@ fn default_heartbeat() -> u64 {
 }
 
 impl Default for Preferences {
-    /// 出厂态就是前端 HTML 里写死的那一份（两图 + 同步开 + 滚轮缩放 + 响一声 +
+    /// 出厂态就是前端 HTML 里写死的那一份（两图 + 同步开 + 滚轮缩放 + 两处响一声 +
     /// 默认收件目录），两边不一致会让「读到空」与「读到默认」表现出差别，没必要
     fn default() -> Self {
         Self {
@@ -544,6 +552,7 @@ impl Default for Preferences {
             sync: true,
             wheel: default_wheel(),
             notify: default_notify(),
+            copy_sound: default_copy_sound(),
             inbox: String::new(),
             inbox_layout: INBOX_LAYOUT_DEFAULT.into(),
             heartbeat_ms: HEARTBEAT_DEFAULT,
@@ -1425,8 +1434,9 @@ mod tests {
         assert_eq!(p.layout, "4");
         assert!(p.sync, "缺 sync 字段应该按出厂态给开");
         assert_eq!(p.wheel, "zoom");
-        // 上一版 prefs.json 里根本没有这两项：缺字段就当出厂态（响一声 + 默认收件目录）
+        // 上一版 prefs.json 里根本没有这几项：缺字段就当出厂态（两处响一声 + 默认收件目录）
         assert!(p.notify, "缺 notify 字段不能变成静默");
+        assert!(p.copy_sound, "缺 copy_sound 字段不能把刚加的复制反馈音变成静默");
         assert!(p.inbox.is_empty(), "缺 inbox 字段就是默认收件目录");
         assert_eq!(p.heartbeat_ms, HEARTBEAT_DEFAULT, "缺 heartbeat_ms 就是原来的写死节拍");
 

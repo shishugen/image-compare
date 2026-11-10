@@ -247,6 +247,7 @@ export function errText(err) {
  * 复制成功的一声反馈。声音必须在 Rust 侧播（WKWebView 会拦下无用户手势的 new Audio），
  * 而且走独立的 play_copy_sound 命令 —— 同步命令跑在主 UI 线程，Windows 的
  * MessageBeep 是异步播放，只有那条线程长驻才播得完（跟设置页「试听」同一条路）。
+ * 要不要响由 Rust 侧读磁盘上的 copy_sound 开关决定，前端不用缓存状态。
  *
  * 故意不 await：响不响都不该拖住复制；放不出声也只留一行日志，不弹错误打扰用户。
  */

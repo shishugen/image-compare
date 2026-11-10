@@ -1689,14 +1689,20 @@ pub fn play_notify_sound() {
 
 /// 「复制成功」的一声反馈，跟试听用同一个系统音效。
 ///
-/// 不归收消息那个开关管：设置页的文案是「收到消息时 响一声」，管的是新消息，
-/// 不是用户主动点按钮的即时反馈；也不参与 msg_id 去重，点一次就该响一次。
+/// 归设置页「复制成功时 响一声」那个开关管（prefs.copy_sound），与「收到消息时」的
+/// notify 各管各的：一个是被动通知，一个是主动操作的即时反馈。不参与 msg_id 去重，
+/// 点一次就该响一次。开关在 Rust 侧读磁盘那份，前端不用自己缓存状态，别的抽屉改了
+/// 同一份 prefs.json 也能立刻生效；「试听」仍无视两个开关。
 ///
 /// ⚠ 必须是独立的 Tauri 同步命令 —— 它跑在主 UI 线程，Windows 的 MessageBeep（异步播放）
 /// 才播得完。千万别把这一声塞进 `clip::copy_as_file` 里：那个命令走 spawn_blocking，
 /// 临时线程一返回声音就会被掐断，重演「试听有声、复制没声」。
 #[tauri::command]
-pub fn play_copy_sound() {
+pub fn play_copy_sound(store: State<'_, Arc<Store>>) {
+    if !store.load_prefs().copy_sound {
+        eprintln!("[sound] 跳过复制反馈：开关关了");
+        return;
+    }
     eprintln!("[sound] 复制反馈");
     sound::play("copy");
 }

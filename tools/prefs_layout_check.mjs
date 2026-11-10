@@ -1593,6 +1593,18 @@ check(
     /notify: default_notify\(\),/.test(storeRs)
 );
 check(
+  "复制音开关跟收消息开关同款：两个节点齐、checkbox 出厂 checked（跟 Rust 的 default_copy_sound 对上）",
+  ['chk-copy-sound', 'sw-copy-text'].every((id) => html.includes(`id="${id}"`)) &&
+    /<input id="chk-copy-sound" type="checkbox" checked \/>/.test(html) &&
+    /<span>复制成功时<\/span>/.test(html)
+);
+check(
+  "Preferences.copy_sound 带 serde default，Default impl 用的是同一个函数（老 prefs.json 缺字段要当「开」，不能变成静默）",
+  /#\[serde\(default = "default_copy_sound"\)\]\s*pub copy_sound: bool,/.test(storeRs) &&
+    /fn default_copy_sound\(\) -> bool \{\s*true\s*\}/.test(storeRs) &&
+    /copy_sound: default_copy_sound\(\),/.test(storeRs)
+);
+check(
   "normalize 会把相对路径的 inbox 清掉（相对路径会被当成相对于进程当前目录去建，从 Finder 与从 cargo 启动不是一个地方）",
   /if !self\.inbox\.is_empty\(\) && !Path::new\(&self\.inbox\)\.is_absolute\(\) \{\s*self\.inbox\.clear\(\);/.test(storeRs)
 );
@@ -1600,11 +1612,14 @@ check(
   "inbox_dir() 从 prefs 取，空串回落 <数据目录>/inbox（两处反了就是「改了没用」或「默认也没了」）",
   /pub fn inbox_dir\(&self\) -> PathBuf \{[\s\S]{0,200}?let d = self\.load_prefs\(\)\.inbox;[\s\S]{0,120}?self\.dir\.join\("inbox"\)/.test(storeRs)
 );
-/* 参数名一律单词是 prefs.rs 自己立下的约束（多一个字母都不会报错，只会安静地不生效） */
+/* 参数名是 prefs.rs 自己立下的约束（多一个字母都不会报错，只会安静地不生效）。
+ * 多词参数按 Tauri 走 camelCase：Rust 侧 copy_sound，前端写 copySound */
 check(
-  "set_prefs 的参数名是单词 notify / inbox，前端传的键也是这两个（写成 inboxDir / notifySound 就永远对不上）",
-  /notify: Option<bool>,\s*inbox: Option<String>,/.test(prefsRs) &&
+  "set_prefs 三个开关/目录参数名对得上前端传的键：notify / copy_sound(copySound) / inbox（写成 inboxDir / notifySound 就永远对不上）",
+  /notify: Option<bool>,\s*copy_sound: Option<bool>,\s*inbox: Option<String>,/.test(prefsRs) &&
+    /if let Some\(c\) = copy_sound \{\s*p\.copy_sound = c;\s*\}/.test(prefsRs) &&
     /saveRecvPrefs\(\{ notify: on \}\)/.test(xferJs) &&
+    /saveRecvPrefs\(\{ copySound: on \}\)/.test(xferJs) &&
     /saveRecvPrefs\(\s*\{ inbox: picked \}/.test(xferJs) &&
     /saveRecvPrefs\(\{ inbox: "" \}/.test(xferJs) &&
     !/invoke\("set_prefs"[\s\S]{0,80}?(inboxDir|notifySound)/.test(xferJs)
@@ -1758,6 +1773,18 @@ check(
     /#\[tauri::command\]\npub fn play_notify_sound\(\) \{\s*eprintln!\("\[sound\] 试听"\);\s*sound::play\("audition"\);/.test(netMod)
 );
 check(
+  "复制反馈音归自己的 copy_sound 开关管：Rust 侧读磁盘那份，关了直接跳过；试听仍无视两个开关",
+  /net::play_copy_sound,/.test(libRs) &&
+    /pub fn play_copy_sound\(store: State<'_, Arc<Store>>\) \{[\s\S]{0,240}?if !store\.load_prefs\(\)\.copy_sound[\s\S]{0,120}?return;/.test(netMod) &&
+    /sound::play\("copy"\)/.test(netMod)
+);
+check(
+  "复制音开关前端三件事齐：独立 paint、读回 get_prefs 的 copy_sound（下划线）、写 set_prefs 的 copySound（camelCase）",
+  /function paintCopySoundSwitch\(on\)/.test(xferJs) &&
+    /typeof p\.copy_sound === "boolean"\) paintCopySoundSwitch\(p\.copy_sound\)/.test(xferJs) &&
+    /saveRecvPrefs\(\{ copySound: on \}\)/.test(xferJs)
+);
+check(
   "选收件目录复用 pick_folder（只多一个 title 参数），而且前端真的传了那句标题；取消时直接 return 不写盘",
   /pub async fn pick_folder\(app: AppHandle, title: Option<String>\)/.test(netMod) &&
     /set_title\(title\.unwrap_or_else\(\|\| "选择要发送的文件夹"\.into\(\)\)\)/.test(netMod) &&
@@ -1827,7 +1854,7 @@ const setPrefsSig = prefsRs.slice(
   prefsRs.indexOf(") -> Result<Value, String>", prefsRs.indexOf("pub fn set_prefs(")) + 20
 );
 check(
-  "源选择不进 prefs.json：set_prefs 的参数表里只有 layout/sync/wheel/notify/inbox，没有任何 history/source 字样（钉住「侧栏开合与源都是单次会话自己的事」这条既有口径）",
+  "源选择不进 prefs.json：set_prefs 的参数表里没有任何 history/source 字样（钉住「侧栏开合与源都是单次会话自己的事」这条既有口径）",
   setPrefsSig.includes("layout: Option<String>") &&
     setPrefsSig.includes("inbox: Option<String>") &&
     !/history|source|strip/i.test(setPrefsSig) &&

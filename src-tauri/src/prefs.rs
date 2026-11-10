@@ -1,5 +1,5 @@
 //! 用户偏好的读写命令：布局（1/2/4 图）、同步开关、滚轮行为，
-//! 以及传输视图的「本机接收」（提示音开关、收件目录、收件目录的摆放）
+//! 以及传输视图的「本机接收」（收到消息提示音、复制反馈音、收件目录、收件目录的摆放）
 //! 与「在线探测」（心跳节拍）。
 //!
 //! 只有两条命令，因为这份数据很小：前端启动时读一次，之后每次改动整体回写
@@ -42,7 +42,7 @@ fn check_inbox(v: &str) -> Result<String, String> {
 ///
 /// 值必须在 Rust 侧就验一遍 —— 前端拿不到一个它不认的布局，否则切到一个
 /// 没有 CSS 的布局会让四个窗都不显示，比「设置没生效」难查得多。多词参数
-/// （`inbox_layout`）按 Tauri 默认走 camelCase，前端传的是 `inboxLayout`。
+/// 按 Tauri 默认走 camelCase：前端传 `inboxLayout` / `heartbeatMs` / `copySound`。
 #[tauri::command]
 pub fn set_prefs(
     store: State<'_, Arc<Store>>,
@@ -50,6 +50,7 @@ pub fn set_prefs(
     sync: Option<bool>,
     wheel: Option<String>,
     notify: Option<bool>,
+    copy_sound: Option<bool>,
     inbox: Option<String>,
     inbox_layout: Option<String>,
     heartbeat_ms: Option<u64>,
@@ -67,6 +68,9 @@ pub fn set_prefs(
     }
     if let Some(n) = notify {
         p.notify = n;
+    }
+    if let Some(c) = copy_sound {
+        p.copy_sound = c;
     }
     // 验不过就直接 Err 返回，磁盘上的旧值原封不动：半途改坏收件目录
     // 比拒绝这次修改危险得多

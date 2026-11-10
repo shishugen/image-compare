@@ -380,7 +380,7 @@
 
                     <!-- 第二页：本机偏好，全存在同一份 prefs.json 里 -->
                     <div class="set-page" id="xfer-page-prefs" hidden>
-                      <!-- 本机接收：这三项与对比视图那几项存在同一份 prefs.json 里，
+                      <!-- 本机接收：这几项与对比视图那几项存在同一份 prefs.json 里，
                            各自只传自己关心的字段（set_prefs 是局部更新），不会互相盖掉 -->
                       <div class="set-sub">本机接收</div>
                       <label class="field">
@@ -391,10 +391,18 @@
                           <span class="switch-text" id="sw-notify-text">响一声</span>
                         </label>
                       </label>
+                      <label class="field">
+                        <span>复制成功时</span>
+                        <label class="switch">
+                          <input id="chk-copy-sound" type="checkbox" checked />
+                          <span class="switch-track"><span class="switch-thumb"></span></span>
+                          <span class="switch-text" id="sw-copy-text">响一声</span>
+                        </label>
+                      </label>
                       <div class="drawer-acts">
-                        <button id="btn-notify-audition" class="btn btn-ghost" title="无视开关直接响一声，用来确认这台机器放不放得出声">试听</button>
+                        <button id="btn-notify-audition" class="btn btn-ghost" title="无视两个开关直接响一声，用来确认这台机器放不放得出声">试听</button>
                       </div>
-                      <p class="hint">响的是本进程，窗口关着也响；一整个文件夹收完只响一声，同一条消息重发不重响。</p>
+                      <p class="hint">声音都是本进程发的，窗口关着收到消息也响；一整个文件夹收完只响一声，同一条消息重发不重响。复制成功另响一声，两个开关各管各的；「试听」无视开关直接响。</p>
 
                       <label class="field">
                         <span>收件目录（新收到的文件落这里）</span>

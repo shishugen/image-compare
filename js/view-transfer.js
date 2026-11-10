@@ -62,9 +62,11 @@ const ui = {
   pagePair: el("xfer-page-pair"),
   pagePrefs: el("xfer-page-prefs"),
   setTitle: el("xfer-settings-title"),
-  // 本机接收（提示音 / 收件目录 / 收件目录里的摆放）
+  // 本机接收（两处提示音 / 收件目录 / 收件目录里的摆放）
   notifyChk: el("chk-notify-sound"),
   notifyText: el("sw-notify-text"),
+  copySoundChk: el("chk-copy-sound"),
+  copySoundText: el("sw-copy-text"),
   btnAudition: el("btn-notify-audition"),
   inboxValue: el("inbox-dir-value"),
   btnInboxChoose: el("btn-inbox-choose"),
@@ -2963,18 +2965,25 @@ async function savePairConfig() {
 }
 
 /* --------------------------------------------------------------------------
- * 本机接收：提示音与收件目录
+ * 本机接收：两处提示音与收件目录
  *
  * 这几项都存在 prefs.json，与对比视图那份是同一个文件、同一对命令（get_prefs / set_prefs）。
- * set_prefs 是局部更新：这里只传 notify / inbox，不会把用户选的布局冲掉，反之也一样。
+ * set_prefs 是局部更新：这里只传 notify / copySound / inbox / inboxLayout / heartbeatMs，
+ * 不会把用户选的布局冲掉，反之也一样。
  * 声音本身在 Rust 侧播（js 里 new Audio() 会被 WKWebView 的自动播放策略拦下，
- * 而且窗口关掉后根本没人在场），这里只负责那个开关。
+ * 而且窗口关掉后根本没人在场），这里只负责两个开关的外观与存盘。
  * ------------------------------------------------------------------------ */
 
 /** 开关那颗是真 input 藏在 label 里、靠 CSS 画的，关着时从外观上看不出区别，所以文案跟着状态走 */
+function paintSoundSwitch(chk, textNode, on) {
+  if (chk) chk.checked = on;
+  if (textNode) textNode.textContent = on ? "响一声" : "不响";
+}
 function paintNotifySwitch(on) {
-  if (ui.notifyChk) ui.notifyChk.checked = on;
-  if (ui.notifyText) ui.notifyText.textContent = on ? "响一声" : "不响";
+  paintSoundSwitch(ui.notifyChk, ui.notifyText, on);
+}
+function paintCopySoundSwitch(on) {
+  paintSoundSwitch(ui.copySoundChk, ui.copySoundText, on);
 }
 
 function paintInboxDir(path, custom) {
@@ -3029,10 +3038,12 @@ function paintInboxLayout(layout) {
 async function refreshRecvPrefs() {
   try {
     const p = await invoke("get_prefs");
-    // 老 prefs.json 里没这两项时 Rust 已按出厂态补齐，这里只兜「命令整个没回」
+    // 老 prefs.json 里没这几项时 Rust 已按出厂态补齐，这里只兜「命令整个没回」。
+    // get_prefs 回的是 Rust 结构体原样序列化（copy_sound / heartbeat_ms，下划线）；
+    // 只有传进去的调用参数才走 Tauri 的 camelCase（copySound / heartbeatMs），
+    // 两边拿同一个名字去读写会永远对不上
     if (p && typeof p.notify === "boolean") paintNotifySwitch(p.notify);
-    // 心跳节拍。键名就是 heartbeat_ms：get_prefs 回的是 Rust 结构体原样序列化（下划线），
-    // 只有传进去的调用参数才走 Tauri 的 camelCase，两边拿同一个名字去读会永远读不到
+    if (p && typeof p.copy_sound === "boolean") paintCopySoundSwitch(p.copy_sound);
     if (p && typeof p.heartbeat_ms === "number") paintHeartbeat(p.heartbeat_ms);
   } catch (_) {
     /* 非 Tauri 环境（自检桩）保持 HTML 初始态 */
@@ -3544,7 +3555,7 @@ ui.btnSettings.addEventListener("click", () => {
   }
 });
 
-/* 本机接收那一段：开关即时存，失败就退回磁盘上那份 */
+/* 本机接收那一段：两个开关即时存，失败就退回磁盘上那份 */
 if (ui.notifyChk) {
   ui.notifyChk.addEventListener("change", async () => {
     const on = ui.notifyChk.checked;
@@ -3552,8 +3563,16 @@ if (ui.notifyChk) {
     if (!(await saveRecvPrefs({ notify: on }))) await refreshRecvPrefs();
   });
 }
+if (ui.copySoundChk) {
+  ui.copySoundChk.addEventListener("change", async () => {
+    const on = ui.copySoundChk.checked;
+    paintCopySoundSwitch(on);
+    // 写进去是 camelCase：Rust 侧参数叫 copy_sound，Tauri 会转成 copySound
+    if (!(await saveRecvPrefs({ copySound: on }))) await refreshRecvPrefs();
+  });
+}
 if (ui.btnAudition) {
-  // 试听无视开关直接响（这一声就是用来分清「没消息」与「这台机器放不出声」的）
+  // 试听无视两个开关直接响（这一声就是用来分清「开关关了」与「这台机器放不出声」的）
   ui.btnAudition.addEventListener("click", () => {
     invoke("play_notify_sound").catch((err) => toast(errText(err), "error"));
   });
