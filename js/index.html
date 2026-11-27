@@ -340,6 +340,10 @@
                   <div class="drawer-body">
                     <!-- 第一页：设备身份与对端 -->
                     <div class="set-page" id="xfer-page-pair">
+                      <!-- 配对是双向的：这台的地址要给对端抄。端口 status 里本来就有，
+                           IP 由 Rust 按路由表取出口网卡那个，不用用户去系统设置里翻 -->
+                      <div class="set-sub">本机地址（告诉对端）</div>
+                      <p class="hint" id="xfer-local-addr">读取中…</p>
                       <label class="field">
                         <span>本机设备名</span>
                         <input id="inp-device-name" class="input" placeholder="对端看到的名字" />
@@ -375,7 +379,7 @@
                       <div class="drawer-acts">
                         <button id="btn-reprobe" class="btn btn-ghost">重新探测在线</button>
                       </div>
-                      <p class="hint">「重新探测在线」ping 的是当前正在聊的那台，也就是上面列表里高亮的那一行。Windows 首次监听会弹防火墙提示，必须勾「允许访问（私有网络）」。</p>
+                      <p class="hint">「重新探测在线」优先探测当前正在聊的那台（没选会话就用列表第一台），并且先试 mDNS 扫到的新地址 —— 对端换了 IP 也能找回来。Windows 首次监听会弹防火墙提示，必须勾「允许访问（私有网络）」。</p>
                     </div>
 
                     <!-- 第二页：本机偏好，全存在同一份 prefs.json 里 -->
@@ -630,8 +634,15 @@
         <button class="btn btn-icon" id="tv-in" title="放大（+）">+</button>
         <button class="btn lb-txt" id="tv-fit" title="适应窗口（0）">适应</button>
         <button class="btn lb-txt" id="tv-one" title="原始像素 1:1（1），看接缝最准">1:1</button>
+        <button class="btn lb-txt" id="tv-lines" title="显示/隐藏平铺的接缝参考线（默认隐藏）">线</button>
       </div>
       <canvas class="tv-canvas" id="tv-canvas"></canvas>
+      <!-- 接缝参考线不画进画布：画布缩到适应窗口那一档时线会细到看不见。
+           这里用固定 1px 的覆盖层，与聊天放大层那套线同一个口径 -->
+      <div class="tv-guides" id="tv-guides" hidden>
+        <i class="tv-guides-v" id="tv-guides-v"></i>
+        <i class="tv-guides-h" id="tv-guides-h"></i>
+      </div>
       <div class="lb-cap" id="tv-cap"></div>
     </div>
 
@@ -647,6 +658,7 @@
         <button class="btn lb-txt" id="lightbox-fit" title="适应窗口（0）">适应</button>
         <button class="btn lb-txt" id="lightbox-one" title="原始像素 1:1（1）">1:1</button>
         <button class="btn lb-txt" id="lightbox-tile" title="田字平铺（T）：同一张图按当前尺寸铺四份，中间十字就是接缝检验处；再按回单张">田</button>
+        <button class="btn lb-txt" id="lightbox-lines" title="显示/隐藏平铺的接缝参考线（默认隐藏）">线</button>
       </div>
       <img id="lightbox-img" alt="" />
       <!-- 田字平铺的画布：用 background repeat 而不是四个 img 拼，因为四个 img 在非整数倍

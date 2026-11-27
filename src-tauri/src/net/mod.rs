@@ -838,6 +838,27 @@ impl Hub {
         }
     }
 
+    /// 本机在局域网里的出口 IP。UDP connect 只查路由表、不发一个包，
+    /// 拿到的是这台机器连对端时真正会用的那个网卡地址（多网卡时比遍历接口靠谱）。
+    /// 没网/只有回环时返回空串，前端显示「没取到」而不是编一个 127.0.0.1 骗人
+    pub(crate) fn local_ip() -> String {
+        use std::net::UdpSocket;
+        let Ok(sock) = UdpSocket::bind("0.0.0.0:0") else {
+            return String::new();
+        };
+        if sock.connect("8.8.8.8:80").is_err() {
+            return String::new();
+        }
+        let Ok(addr) = sock.local_addr() else {
+            return String::new();
+        };
+        let ip = addr.ip();
+        if ip.is_unspecified() || ip.is_loopback() {
+            return String::new();
+        }
+        ip.to_string()
+    }
+
     /// 前端只监听这一个事件即可刷新连接面板；载荷与 net_status 完全一致
     pub fn emit_peers_changed(&self) {
         self.emit("peers-changed", self.status_json());
@@ -851,6 +872,8 @@ impl Hub {
             "passphrase_set": !d.passphrase.is_empty(),
             "port": self.port_snapshot(),
             "default_port": DEFAULT_PORT,
+            // 配对页要把「本机 IP:端口」给对端抄；端口本来就有，IP 在这里补上
+            "local_ip": Self::local_ip(),
             // 单台时期的 "peer" 单对象没了：多台之后不存在「唯一那个对端」，
             // 留个兼容字段只会让前端忘记自己读的是哪一台
             "peers": self.peers_snapshot(),

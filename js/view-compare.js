@@ -51,6 +51,10 @@ const ui = {
   tvCanvas: el("tv-canvas"),
   tvZoom: el("tv-zoom"),
   tvCap: el("tv-cap"),
+  tvLines: el("tv-lines"),
+  tvGuides: el("tv-guides"),
+  tvGuidesV: el("tv-guides-v"),
+  tvGuidesH: el("tv-guides-h"),
   splitter: el("splitter"),
   zoomSlider: el("zoom-slider"),
   zoomLabel: el("zoom-label"),
@@ -189,6 +193,14 @@ window.addEventListener("pointerdown", (ev) => {
 // 滚轮一动菜单也会错位（它是 fixed 定位），直接收掉
 window.addEventListener("wheel", () => closeImgMenu(), { passive: true });
 
+/** 图窗标签上的名字：长名字只留前 5 后 10，中间一个省略号；全名仍写进 title。
+ *  用 Array.from 按 Unicode 码点切，中文一个字一份、emoji 也不会被切半截 */
+function shortTagName(name) {
+  const chars = Array.from(name || "");
+  if (chars.length <= 15) return name || "";
+  return chars.slice(0, 5).join("") + "…" + chars.slice(-10).join("");
+}
+
 /* --------------------------------------------------------------------------
  * Pane：一个图窗（视口 + 图片层 + 视图状态）
  * ------------------------------------------------------------------------ */
@@ -235,7 +247,7 @@ class Pane {
     this.meta = { name, size, path };
     this.loaded = true;
     this.root.classList.add("has-image");
-    this.tagName.textContent = name || this.key.toUpperCase();
+    this.tagName.textContent = shortTagName(name) || this.key.toUpperCase();
     this.tagName.title = name || "";
     // 同步模式下已有其它图载入：直接沿用它的视图，各窗立刻看到同一区域
     const ref = referencePane(this);
@@ -1869,6 +1881,9 @@ function handleExternalPaths(paths) {
   });
   if (!fresh.length) return;
   console.log("[open] 外部打开:", fresh);
+  // 从传输/收藏/排序视图里双击图片时，图会落进隐藏的对比图窗，
+  // 不先切视图的话用户根本看不到图 —— 外部打开一律先回到「图片对比」
+  setView("compare");
   fillPanes(fresh); // 不指定目标窗：按空窗优先分配
 }
 
@@ -2162,7 +2177,14 @@ function copyTargets() {
  * （落点由 tile.js 的 tilePlacements 算，都是整像素），视觉缩放全部交给这张画布的 transform：
  * 画布内相邻两次绘制之间没有半像素透明缝，看得见的缝才是真缝。
  * ---------------------------------------------------------------------- */
-const tv = { open: false, st: { scale: 1, x: 0, y: 0 }, w: 0, h: 0, drag: null };
+const tv = {
+  open: false,
+  st: { scale: 1, x: 0, y: 0 },
+  w: 0,
+  h: 0,
+  drag: null,
+  lines: false, // 接缝参考线默认关：开着会盖住要判的那条真缝
+};
 
 /** 切的是「当前活动窗」那张图（与 ⌘C 取同一窗）；那一窗没图就没得切 */
 const tvPane = () => (activePane && activePane.loaded ? activePane : null);
@@ -2202,6 +2224,13 @@ function tvApply() {
   const { scale, x, y } = tv.st;
   if (ui.tvCanvas && ui.tvCanvas.style) {
     ui.tvCanvas.style.transform = `translate(${x}px, ${y}px) scale(${scale})`;
+  }
+  // 参考线的交点 = 四份图的十字（画布半宽/半高）换算到视口；线宽固定 1px 不缩放
+  if (ui.tvGuides && !ui.tvGuides.hidden && tv.w && tv.h) {
+    const gx = Math.round(x + (tv.w / 2) * scale);
+    const gy = Math.round(y + (tv.h / 2) * scale);
+    if (ui.tvGuidesV) ui.tvGuidesV.style.left = `${gx}px`;
+    if (ui.tvGuidesH) ui.tvGuidesH.style.top = `${gy}px`;
   }
   if (ui.tvZoom) ui.tvZoom.textContent = `${Math.round(tv.st.scale * 100)}%`;
 }
@@ -2243,6 +2272,7 @@ function tvZoom(factor, anchor) {
 
 function tvShow(pane) {
   tv.open = true;
+  if (ui.tvGuides) ui.tvGuides.hidden = !tv.lines;
   if (ui.tvRoot) {
     ui.tvRoot.hidden = false;
     ui.tvRoot.classList.remove("is-dragging");
@@ -2280,6 +2310,7 @@ function tvClose() {
   if (!tv.open) return;
   tv.open = false;
   tv.drag = null;
+  if (ui.tvGuides) ui.tvGuides.hidden = true;
   tv.st = { scale: 1, x: 0, y: 0 };
   if (ui.tvRoot) {
     ui.tvRoot.hidden = true;
@@ -2295,9 +2326,19 @@ function tvClose() {
   tv.h = 0;
 }
 
+/** 接缝参考线开关：只切覆盖层的显隐，不动画布倍率/平移，也不重新读盘 */
+function tvToggleLines() {
+  if (!tv.open) return;
+  tv.lines = !tv.lines;
+  if (ui.tvGuides) ui.tvGuides.hidden = !tv.lines;
+  tvApply();
+  if (ui.tvLines) ui.tvLines.classList.toggle("is-active", tv.lines);
+}
+
 if (ui.btnTile) ui.btnTile.addEventListener("click", () => (tv.open ? tvClose() : tvOpen()));
 for (const [id, fn] of [
   ["tv-close", tvClose],
+  ["tv-lines", tvToggleLines],
   ["tv-fit", tvFit],
   ["tv-one", tvActual],
   ["tv-in", () => tvZoom(1.25)],
@@ -2314,7 +2355,8 @@ if (ui.tvRoot) {
     (ev) => {
       if (!tv.open) return;
       ev.preventDefault();
-      tvZoom(ev.deltaY < 0 ? 1.1 : 1 / 1.1, { x: ev.clientX || 0, y: ev.clientY || 0 });
+      // 与图窗浏览、聊天放大层同一口径：按 deltaY 指数缩放，触控板小步长才不会一下跳很远
+      tvZoom(Math.exp(-ev.deltaY * 0.0018), { x: ev.clientX || 0, y: ev.clientY || 0 });
     },
     { passive: false }
   );
@@ -2356,6 +2398,7 @@ if (ui.tvRoot) {
 }
 
 tvRefreshBtn();
+if (ui.tvLines) ui.tvLines.classList.toggle("is-active", tv.lines);
 
 window.addEventListener("keydown", (ev) => {
   if (currentView() !== "compare") return;

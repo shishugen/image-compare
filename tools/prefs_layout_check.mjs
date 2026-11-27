@@ -2003,6 +2003,42 @@ check(
   tvHtml ? tvHtml.slice(0, 100) : "没找到 #cmp-tileview"
 );
 
+const extOpenFrom = cmpJs.indexOf("function handleExternalPaths(");
+const extOpenBody = cmpJs.slice(
+  extOpenFrom,
+  cmpJs.indexOf("if (isTauriRuntime) {", extOpenFrom)
+);
+check(
+  "系统「打开方式」送来的图先切回对比视图再落窗：停在传输/收藏视图时只 fillPanes 会把图塞进藏起来的窗格，人看不到",
+  extOpenBody.includes('setView("compare")') &&
+    extOpenBody.indexOf('setView("compare")') < extOpenBody.indexOf("fillPanes("),
+  extOpenBody.slice(0, 160)
+);
+check(
+  "田字查看的线是固定 1px 覆盖层（不随画布缩小变细），开关不重绘画布；滚轮口径与图窗浏览一致",
+  html.includes('id="tv-lines"') &&
+    html.includes('id="tv-guides"') &&
+    /\.tv-guides-v \{[^}]*width: 1px/.test(css) &&
+    /lines: false/.test(cmpJs) &&
+    /function tvToggleLines\(\)[\s\S]{0,200}?ui\.tvGuides\.hidden = !tv\.lines/.test(cmpJs) &&
+    /Math\.exp\(-ev\.deltaY \* 0\.0018\)/.test(cmpJs)
+);
+
+check(
+  "图窗标签上的长文件名单行省略、不撑破标签遮住图；全名留在 title 里",
+  /\.pane-tag \{[\s\S]{0,300}?max-width: calc\(100% - 16px\)/.test(css) &&
+    /\.tag-name \{[\s\S]{0,300}?text-overflow: ellipsis/.test(css) &&
+    /\.tag-name \{[\s\S]{0,300}?white-space: nowrap/.test(css) &&
+    cmpJs.includes('this.tagName.title = name || ""')
+);
+check(
+  "图窗标签长名字只留前 5 后 10、中间省略号；15 字及以内原样显示",
+  /function shortTagName\([\s\S]{0,240}?chars\.slice\(0, 5\)/.test(cmpJs) &&
+    /chars\.length <= 15/.test(cmpJs) &&
+    /chars\.slice\(-10\)/.test(cmpJs) &&
+    cmpJs.includes('this.tagName.textContent = shortTagName(name) || this.key.toUpperCase()')
+);
+
 const setImgBody = cmpJs.slice(cmpJs.indexOf("async setImage("), cmpJs.indexOf("  clear() {"));
 const clearBody = cmpJs.slice(cmpJs.indexOf("  clear() {"), cmpJs.indexOf("/** 适应本窗"));
 check(

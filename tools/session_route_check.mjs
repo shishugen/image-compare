@@ -2347,7 +2347,37 @@ world.hidden = world.hidden.filter((x) => x !== "");
 // 静态合约：菜单三项是中文、没有英文原生项；前后端各自的入口都在
 const html = readFileSync(join(here, "..", "js", "index.html"), "utf8");
 const xferJs = readFileSync(join(here, "..", "js", "view-transfer.js"), "utf8");
+check(
+  "放大层田字平铺的接缝线开关：默认关、单张态灰掉、开时两条渐变与图片层同尺寸同位置",
+  html.includes('id="lightbox-lines"') &&
+    /lines: false/.test(xferJs) &&
+    xferJs.includes('lightboxLines.addEventListener("click"') &&
+    /ui\.lightboxLines\.disabled = !lb\.tiled/.test(xferJs) &&
+    /lb\.lines \? `\$\{size\}, \$\{size\}, \$\{size\}` : size/.test(xferJs)
+);
+check(
+  "聊天里的图片 10MB 以内自动显示缩略图，40MB 硬上限不变",
+  /const PREVIEW_AUTO_MAX = 10 \* 1024 \* 1024/.test(xferJs) &&
+    /const PREVIEW_HARD_MAX = 40 \* 1024 \* 1024/.test(xferJs)
+);
 const rustNet = readFileSync(join(here, "..", "src-tauri", "src", "net", "mod.rs"), "utf8");
+const apiJs = readFileSync(join(here, "..", "js", "api.js"), "utf8");
+const rustPair = readFileSync(join(here, "..", "src-tauri", "src", "pair.rs"), "utf8");
+check(
+  "图片预览缓存有 LRU 上限 30 张 / 128MB，淘汰后仍能重新加进来",
+  /const IMG_CACHE_MAX_ENTRIES = 30/.test(apiJs) &&
+    /const IMG_CACHE_MAX_BYTES = 128 \* 1024 \* 1024/.test(apiJs) &&
+    /imgCache\.keys\(\)\.next\(\)\.value/.test(apiJs) &&
+    xferJs.includes("cacheImgData(payload.path || rec.path")
+);
+check(
+  "配对页显示本机 IP:端口；重新探测先试 mDNS 新地址，没选会话也能点",
+  html.includes('id="xfer-local-addr"') &&
+    /ui\.localAddr\.textContent/.test(xferJs) &&
+    /peerId = sess\?\.peer \|\| \(state\.status\?\.peers \|\| \[\]\)\[0\]\?\.id/.test(xferJs) &&
+    /"local_ip": Self::local_ip\(\)/.test(rustNet) &&
+    /discovered_snapshot\(\)/.test(rustPair)
+);
 const rustStore = readFileSync(join(here, "..", "src-tauri", "src", "store.rs"), "utf8");
 // 只看菜单那一块：index.html 里的注释也写着「Reload / Inspect Element」为何被替掉，不能一刀切
 // （聊天气泡那份菜单的注释里也有这两个字，窗口开宽了会把那边一块扫进来）

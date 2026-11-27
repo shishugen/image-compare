@@ -609,6 +609,8 @@ body.is-strip-drag {
   display: none;
   align-items: center;
   gap: 6px;
+  /* 长文件名（比如一整段提示词当名字）不能把标签撑满整窗、甚至换行盖住图 */
+  max-width: calc(100% - 16px);
   height: 22px;
   padding: 0 4px 0 8px;
   border-radius: 11px;
@@ -630,6 +632,10 @@ body.is-strip-drag {
   line-height: 19px;
   padding: 0 8px;
   font-size: 11px;
+  /* 信息行同样单行省略（title 里留着全名），长名字不撑破窗宽 */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   color: var(--text-dim);
   background: var(--bg-panel);
   border-top: 1px solid var(--border);
@@ -648,9 +654,17 @@ body.is-strip-drag {
 
 .tag-name {
   font-weight: 600;
+  /* flex 子项默认 min-width:auto，长名字会撑破 max-width；收掉后单行省略，
+     全名仍在 title 里，鼠标悬停可看（setImage 时写进去的） */
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .tag-close {
+  /* 名字再长也不挤掉关闭键 */
+  flex: 0 0 auto;
   width: 16px;
   height: 16px;
   border: 0;
@@ -2452,6 +2466,34 @@ textarea,
   left: 0;
   transform-origin: 0 0;
   will-change: transform;
+}
+
+/* 接缝参考线：固定 1 屏幕像素，不跟着画布缩放 —— 适应窗口那一档倍率很小，
+   画进画布的线会细到看不见（聊天放大层本来就是固定 1px，两边现在同口径）。
+   位置由 tvApply() 按画布的 translate/scale 换算，pointer-events 收掉，不挡拖拽 */
+.tv-guides {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+}
+
+.tv-guides i {
+  position: absolute;
+  display: block;
+  background: rgba(255, 90, 90, 0.92);
+}
+
+.tv-guides-v {
+  top: 0;
+  bottom: 0;
+  width: 1px;
+}
+
+.tv-guides-h {
+  left: 0;
+  right: 0;
+  height: 1px;
 }
 
 /* pointer-events: none 是必须的——遮罩一旦吃掉鼠标事件，Tauri 的原生拖拽就收不到 drop 了 */

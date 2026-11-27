@@ -21,6 +21,7 @@ import {
   fmtSize,
   fmtTime,
   IMAGE_EXT,
+  cacheImgData,
   imgCache,
   invalidateImgCache,
   invoke,
@@ -50,6 +51,7 @@ const ui = {
   manualAlias: el("inp-manual-alias"),
   btnManual: el("btn-bind-addr"),
   btnReprobe: el("btn-reprobe"),
+  localAddr: el("xfer-local-addr"),
   candidates: el("xfer-candidates"),
   // 已添加的对端：一台一行，改备注 / 打开对话 / 解绑都在行上
   peerList: el("xfer-peer-list"),
@@ -150,6 +152,7 @@ const ui = {
   lightboxZoom: el("lightbox-zoom"),
   lightboxTile: el("lightbox-tile"),
   lightboxTileStage: el("lightbox-tile-stage"),
+  lightboxLines: el("lightbox-lines"),
 };
 
 /** 「未标记」那一行的会话 ID 与对端 ID 都是空串：老历史里 peer 缺失的那些消息进这里。
@@ -277,8 +280,9 @@ const RECALL_SUMMARY = "撤回了一条消息";
 const PAGE = 10;
 /** 压缩包单独一类：收发列表里它们和文档最容易混，按微信的习惯也是分开显示的 */
 const ARCHIVE_EXT = /\.(zip|rar|7z|tar|gz|tgz|bz2|xz|zst|jar|apk|iso)$/i;
-/** 缩略图自动读盘的上限：超过它就先占位，点一下才走 IPC，铺历史时不会一次拽几十张图 */
-const PREVIEW_AUTO_MAX = 4 * 1024 * 1024;
+/** 缩略图自动读盘的上限：10MB 以内的图在聊天里直接显示，超过才占位、点一下再走 IPC。
+ *  铺历史时不会一次拽几十张图；更大的仍交给 40MB 硬上限那句引导 */
+const PREVIEW_AUTO_MAX = 10 * 1024 * 1024;
 /** 硬上限：再大就不在聊天里解图，引导用「在对比中打开」（对比视图本来就是为大图设计的） */
 const PREVIEW_HARD_MAX = 40 * 1024 * 1024;
 // path -> { data_url, size } 的预览缓存住在 api.js（发送入口在那边也要失效它），这里只用
@@ -290,6 +294,17 @@ function renderStatus(s) {
   state.status = s;
   if (!s) return;
   const peers = s.peers || [];
+
+  // 配对页顶部那行「本机地址」是给对端抄的；取不到 IP 就直说，别拿 127.0.0.1 骗人
+  if (ui.localAddr) {
+    const ip = s.local_ip || "";
+    const port = s.server_ok ? s.port : 0;
+    ui.localAddr.textContent = ip && port
+      ? `${ip}:${port} —— 把这一串告诉对端，填到它那边的「对端 IP:端口」`
+      : ip
+        ? `本机 IP ${ip}，但接收服务还没起来（端口 0）`
+        : "没取到局域网 IP（可能只有回环网卡）；让对端用手动 IP 连你";
+  }
 
   // 本机端口 + 防火墙提示（Windows 首次监听一定要允许）
   const portText = s.server_ok ? `本机接收端口 ${s.port}` : "接收服务未启动";
@@ -373,7 +388,9 @@ function renderPeerHead() {
     }</span>`;
   }
   ui.btnSend.disabled = !canSend || state.sending;
-  ui.btnReprobe.disabled = !(sess && peer);
+  // 配对页里未必选着会话，但有已登记对端就该能探测：优先当前那台，否则列表第一台
+  const probeId = sess?.peer || (state.status?.peers || [])[0]?.id;
+  ui.btnReprobe.disabled = !state.status?.passphrase_set || !probeId;
   // 备注与解绑不再看「当前这台」的脸色：它们长在列表每一行上（见 renderPeerList）
   // 多台之后手动添加不再受「已绑定」限制：每台都值得一行地址
   ui.btnManual.disabled = !state.status?.passphrase_set;
@@ -1911,7 +1928,10 @@ async function loadThumb(rec, force = false) {
   rec.thumbBox.textContent = "读取中…";
   try {
     const payload = await invoke("read_image", { path: rec.path });
-    imgCache.set(payload.path || rec.path, { data_url: payload.data_url, size: Number(payload.size) || 0 });
+    cacheImgData(payload.path || rec.path, {
+      data_url: payload.data_url,
+      size: Number(payload.size) || 0,
+    });
     paintThumb(rec, payload.data_url);
   } catch (err) {
     // 文件被移走 / 解码失败都很常见，不能把整条消息弄成坏的
@@ -2004,7 +2024,21 @@ const clampLb = (v) => Math.min(LB_MAX, Math.max(LB_MIN, v));
 /** zoom = 渲染/原始；fit = 被 CSS 装进屏幕那一档对应的 zoom（图比屏幕小就是 1，
  *  CSS 不会把图放大）；box = 打开那一刻量到的**未变换**布局盒，变换不改布局，
  *  所以整层开着期间都拿它当基准（窗口变宽了会重新量，见 resize） */
-const lb = { zoom: 1, fit: 1, x: 0, y: 0, natural: 0, box: { left: 0, top: 0, w: 0, h: 0 }, drag: null, moved: false, touched: false, tiled: false, bgSrc: null };
+const lb = {
+  zoom: 1,
+  fit: 1,
+  x: 0,
+  y: 0,
+  natural: 0,
+  box: { left: 0, top: 0, w: 0, h: 0 },
+  drag: null,
+  moved: false,
+  touched: false,
+  tiled: false,
+  bgSrc: null,
+  lines: false, // 接缝参考线默认关，免得盖住要判的那条真缝
+  bgLines: false,
+};
 
 /** CSS 已经把图装进屏幕了，transform 只负责在它之上再放大多少 */
 const lbScale = () => lb.zoom / (lb.fit || 1);
@@ -2058,6 +2092,8 @@ function lbRender() {
     ui.lightbox.classList.toggle("is-tiled", lb.tiled);
     if (!draggable) ui.lightbox.classList.remove("is-dragging");
   }
+  // 线只在平铺时才有东西可画，单张态灰掉按钮，免得点了以为没反应
+  if (ui.lightboxLines) ui.lightboxLines.disabled = !lb.tiled;
   if (lb.tiled) lbRenderTiles(s);
 }
 
@@ -2067,21 +2103,39 @@ function lbRender() {
 function lbRenderTiles(s) {
   const st = ui.lightboxTileStage;
   if (!st || !st.style) return;
-  // background-image 只在换图时写一次：那串 base64 可以很大，每一帧重拼字符串会卡
-  if (lb.bgSrc !== lightboxSrc) {
+  // background-image 只在换图或切参考线时写一次：那串 base64 可以很大，每一帧重拼字符串会卡
+  if (lb.bgSrc !== lightboxSrc || lb.bgLines !== lb.lines) {
     lb.bgSrc = lightboxSrc || null;
-    st.style.backgroundImage = lightboxSrc ? `url("${lightboxSrc}")` : "none";
+    lb.bgLines = lb.lines;
+    const layers = [];
+    if (lb.lines) {
+      // 两条 1px 渐变就是格线：与图片层同尺寸同位置，跟着背景一起 repeat
+      layers.push("linear-gradient(to right, rgba(255,90,90,.85) 1px, transparent 1px)");
+      layers.push("linear-gradient(to bottom, rgba(255,90,90,.85) 1px, transparent 1px)");
+    }
+    if (lightboxSrc) layers.push(`url("${lightboxSrc}")`);
+    st.style.backgroundImage = layers.length ? layers.join(", ") : "none";
   }
   const tw = Math.max(1, lb.box.w * s);
   const th = Math.max(1, lb.box.h * s);
-  st.style.backgroundSize = `${tw}px ${th}px`;
-  st.style.backgroundPosition = `${lb.box.left + lb.box.w / 2 + lb.x}px ${lb.box.top + lb.box.h / 2 + lb.y}px`;
+  const size = `${tw}px ${th}px`;
+  const pos = `${lb.box.left + lb.box.w / 2 + lb.x}px ${lb.box.top + lb.box.h / 2 + lb.y}px`;
+  st.style.backgroundSize = lb.lines ? `${size}, ${size}, ${size}` : size;
+  st.style.backgroundPosition = lb.lines ? `${pos}, ${pos}, ${pos}` : pos;
 }
 
 /** 田字开关：倍率与平移量原样带过去，单张与平铺是同一套状态的两种画法 */
 function lbSetTiled(on) {
   lb.tiled = on === undefined ? !lb.tiled : !!on;
   lbRender();
+}
+
+/** 平铺接缝参考线开关：只换背景层，倍率/平移原样带过去 */
+function lbSetLines() {
+  if (!lb.tiled) return;
+  lb.lines = !lb.lines;
+  lbRender();
+  if (ui.lightboxLines) ui.lightboxLines.classList.toggle("is-active", lb.lines);
 }
 
 /** 当前这张渲染后图的中心，换算成「相对未变换盒左上」的锚点（按钮与键盘走这里，
@@ -3443,6 +3497,7 @@ if (ui.lightbox && ui.lightboxClose) {
   if (ui.lightboxFit) ui.lightboxFit.addEventListener("click", lbToFit);
   if (ui.lightboxOne) ui.lightboxOne.addEventListener("click", lbToOne);
   if (ui.lightboxTile) ui.lightboxTile.addEventListener("click", () => lbSetTiled());
+  if (ui.lightboxLines) ui.lightboxLines.addEventListener("click", () => lbSetLines());
   window.addEventListener("keydown", (ev) => {
     if (ev.key === "Escape") closeLightbox();
     // 放大状态下 ⌘C 等于「把这张图当文件复制」，不另设按钮
@@ -3501,10 +3556,11 @@ ui.manualAlias?.addEventListener("keydown", (ev) => {
 });
 ui.btnReprobe.addEventListener("click", async () => {
   const sess = sessionRowOf(state.cur);
-  if (!sess) return;
+  const peerId = sess?.peer || (state.status?.peers || [])[0]?.id;
+  if (!peerId) return;
   ui.btnReprobe.disabled = true;
   try {
-    await invoke("reprobe_peer", { peer: sess.peer });
+    await invoke("reprobe_peer", { peer: peerId });
     toast("对端在线");
   } catch (err) {
     toast(errText(err), "error");

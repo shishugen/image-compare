@@ -69,6 +69,31 @@ export function assetSrc(path) {
  */
 export const imgCache = new Map();
 
+/** 缓存上限：30 张或 128MB，先到哪道就按哪道淘汰。base64 data URL 是 ASCII，
+ *  在 JS 里按 UTF-16 算就是每个字符 2 字节，所以长度 ×2 才是真实占内存的量级 */
+const IMG_CACHE_MAX_ENTRIES = 30;
+const IMG_CACHE_MAX_BYTES = 128 * 1024 * 1024;
+
+function imgCacheBytes() {
+  let n = 0;
+  for (const v of imgCache.values()) n += (v?.data_url?.length || 0) * 2;
+  return n;
+}
+
+/** 统一写入口：先删后插 = 命中时自动挪到队尾（LRU）；超上限从队头淘汰。
+ *  淘汰只是从 Map 里拿掉，下次再看那张会重新 read_image 放回来 —— 不影响功能，
+ *  只是那一张多读一次盘（比一直占着几百 MB 划算） */
+export function cacheImgData(path, entry) {
+  if (!path || !entry) return;
+  imgCache.delete(path);
+  imgCache.set(path, entry);
+  while (imgCache.size > IMG_CACHE_MAX_ENTRIES || imgCacheBytes() > IMG_CACHE_MAX_BYTES) {
+    const oldest = imgCache.keys().next().value;
+    if (oldest === undefined) break;
+    imgCache.delete(oldest);
+  }
+}
+
 /** 让这批路径的预览缓存失效：发送前调一句，新气泡才会现读一次盘 */
 export function invalidateImgCache(paths) {
   for (const p of paths || []) imgCache.delete(p);

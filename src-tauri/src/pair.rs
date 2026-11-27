@@ -125,27 +125,46 @@ pub fn set_peer_alias(
     Ok(hub.status_json())
 }
 
-/// 重新探测一台已登记设备的地址。失败只把它标离线，不删：
-/// 离线不等于解绑，否则对端重启一次就要重新配一次
+/// 重新探测一台已登记设备。先试 mDNS 当前扫到的同一台的新地址：对端换了 IP 时
+/// 旧地址怎么 ping 都不通，光 ping 登记时的老地址就会表现为「点了没反应」。
+/// 新地址也不通再退回旧地址；全失败只标离线不删（离线不等于解绑）。
 #[tauri::command]
 pub async fn reprobe_peer(hub: State<'_, Arc<Hub>>, peer: String) -> Result<Value, String> {
     let hub = hub.inner().clone();
     let target = hub
         .peer_by_id(&peer)
         .ok_or_else(|| "还没有登记这台对端".to_string())?;
-    tauri::async_runtime::spawn_blocking(move || match client::ping(&hub, &target.host, target.port) {
-        Ok(fresh) => {
-            let p = Peer {
-                online: true,
-                ..fresh.clone()
-            };
-            hub.bind_peer(p.clone());
-            Ok(json!({ "peer": p, "online": true }))
+    let discovered = hub
+        .discovered_snapshot()
+        .into_iter()
+        .find(|d| d.id == target.id)
+        .map(|d| (d.host, d.port));
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut candidates: Vec<(String, u16)> = Vec::new();
+        // 与旧地址相同就不重复 ping，省掉白白一等的 3 秒
+        if let Some(addr) = discovered {
+            if addr.0 != target.host || addr.1 != target.port {
+                candidates.push(addr);
+            }
         }
-        Err(e) => {
-            hub.set_peer_online(&target.id, false);
-            Err(e)
+        candidates.push((target.host.clone(), target.port));
+        let mut last_err = String::from("没有可试的地址");
+        for (host, port) in candidates {
+            match client::ping(&hub, &host, port) {
+                Ok(fresh) => {
+                    // bind_peer 按设备 ID 插入，新地址会盖掉旧的；备注会由它从老记录搬过来
+                    let p = Peer {
+                        online: true,
+                        ..fresh
+                    };
+                    hub.bind_peer(p.clone());
+                    return Ok(json!({ "peer": p, "online": true }));
+                }
+                Err(e) => last_err = e,
+            }
         }
+        hub.set_peer_online(&target.id, false);
+        Err(last_err)
     })
     .await
     .map_err(|e| format!("探测任务被中断: {e}"))?
